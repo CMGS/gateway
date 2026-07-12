@@ -57,7 +57,7 @@ models:
 ```yaml
 providers:
   - name: openai
-    kind: openai              # openai | anthropic | gemini
+    kind: openai              # openai | anthropic | gemini | deepseek | openrouter
     api_key_env: OPENAI_API_KEY
     # endpoint / timeout_seconds / connect_retries may be set here too and
     # are inherited by the synthesized account

@@ -20,7 +20,9 @@ pub enum ConfigError {
     UnknownProtocol { account: String, wire: String },
     #[error("model `{model}` references unknown protocol `{wire}`")]
     UnknownModelMapping { model: String, wire: String },
-    #[error("provider `{provider}` has unknown kind `{kind}` (known: openai, anthropic, gemini)")]
+    #[error(
+        "provider `{provider}` has unknown kind `{kind}` (known: openai, anthropic, gemini, deepseek, openrouter)"
+    )]
     UnknownProviderKind { provider: String, kind: String },
     #[error("model `{model}` references unknown provider `{provider}`")]
     UnknownProvider { model: String, provider: String },
@@ -228,6 +230,17 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
             wires: &["gemini"],
             default_model_wire: "gemini",
         },
+        // OpenAI-protocol vendors: same wire shape, different base URL.
+        "deepseek" => ProviderPreset {
+            endpoint: "https://api.deepseek.com",
+            wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "openrouter" => ProviderPreset {
+            endpoint: "https://openrouter.ai/api",
+            wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
         _ => return None,
     })
 }
@@ -423,6 +436,32 @@ models:
   - {name: claude-x, provider: anthropic}
   - {name: gemini-x, provider: gemini, protocol: gemini}
 "#;
+
+    #[test]
+    fn openai_protocol_vendors_expand() {
+        let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+providers:
+  - {name: deepseek, kind: deepseek, api_key_env: DEEPSEEK_KEY}
+  - {name: openrouter, kind: openrouter, api_key_env: OPENROUTER_KEY}
+models:
+  - {name: deepseek-chat, provider: deepseek}
+  - {name: some-model, provider: openrouter}
+"#;
+        let cfg = GatewayConfig::from_yaml(yaml).unwrap();
+        assert_eq!(
+            cfg.find_model("deepseek-chat").unwrap().protocol(),
+            Some(Protocol::OpenaiChat)
+        );
+        let ds = cfg.accounts.iter().find(|a| a.name == "deepseek").unwrap();
+        assert_eq!(ds.endpoint, "https://api.deepseek.com");
+        let orr = cfg
+            .accounts
+            .iter()
+            .find(|a| a.name == "openrouter")
+            .unwrap();
+        assert_eq!(orr.endpoint, "https://openrouter.ai/api");
+    }
 
     #[test]
     fn provider_presets_expand_to_accounts_and_model_defaults() {

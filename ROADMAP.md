@@ -52,8 +52,8 @@ open-source impl now, alternatives pluggable":
       across vendors
 - [ ] Provider auth: bearer (OpenAI), x-api-key + anthropic-version
       (Anthropic), OAuth/API key (Gemini)
-- [ ] Long-tail OpenAI-compatible vendors served by a generic
-      openai-compatible provider entry (base_url + key)
+- [x] OpenAI-protocol vendors as provider kinds (deepseek, openrouter);
+      any other is `kind: openai` + an `endpoint:` override
 
 ## M3 — Streaming and resilience hardening
 
@@ -90,8 +90,9 @@ open-source impl now, alternatives pluggable":
 
 ## M6 — Long tail
 
-- [ ] Realtime WebSocket bridging to real upstreams
-- [ ] Batch workflow (files → batch → poll → results) against real
-      providers
-- [ ] Additional providers: DeepSeek, Qwen, OpenRouter, local runtimes
-      (Ollama/vLLM)
+- [ ] Realtime WebSocket bridging to real upstreams (blocked externally:
+      needs a realtime-capable upstream to test against)
+- [x] Batch workflow (files → batch → poll → results) verified against a
+      real provider (upload JSONL → create → poll → both items completed)
+- [x] DeepSeek and OpenRouter provider presets; other OpenAI-protocol
+      vendors (Qwen/Ollama/vLLM) via `kind: openai` + `endpoint:`
