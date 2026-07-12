@@ -82,9 +82,11 @@ open-source impl now, alternatives pluggable":
 
 ## M5 — Persistence backends
 
-- [ ] SQLite `Store` shipping as the packaged default
-- [ ] Optional Redis backend for distributed rate limiting / quotas
-      (multi-replica deployments)
+- [x] SQLite `Store` shipping as the packaged default
+- [x] `Governance` trait: `MemoryGovernance` default, `RedisGovernance`
+      (INCR+PEXPIRE windows, shared quota counters) for multi-replica
+      deployments — selected by `storage.redis_url`, verified against a
+      live Redis (qps limit enforced across the shared counter)
 
 ## M6 — Long tail
 
