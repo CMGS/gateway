@@ -32,6 +32,15 @@ pub enum ConfigError {
     DuplicateName { kind: &'static str, name: String },
 }
 
+/// Build a name → slot-index map for O(1) lookups.
+fn index_by<T>(items: &[T], key: impl Fn(&T) -> &str) -> std::collections::HashMap<String, usize> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, x)| (key(x).to_owned(), i))
+        .collect()
+}
+
 /// Reject duplicate names — name lookups are last-wins, so a duplicate is an
 /// ambiguous config that should fail at load, not silently pick one entry.
 fn check_unique<'a>(
@@ -307,24 +316,9 @@ impl GatewayConfig {
     }
 
     fn build_indices(&mut self) {
-        self.model_idx = self
-            .models
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (m.name.clone(), i))
-            .collect();
-        self.ak_idx = self
-            .access_keys
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (a.ak.clone(), i))
-            .collect();
-        self.product_idx = self
-            .products
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (p.name.clone(), i))
-            .collect();
+        self.model_idx = index_by(&self.models, |m| &m.name);
+        self.ak_idx = index_by(&self.access_keys, |a| &a.ak);
+        self.product_idx = index_by(&self.products, |p| &p.name);
     }
 
     /// Expand provider presets: fill each model's default wire type and
