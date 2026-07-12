@@ -249,6 +249,13 @@ pub struct GatewayConfig {
     /// First-class provider presets; each expands into an upstream account.
     #[serde(default)]
     pub providers: Vec<ProviderConf>,
+    /// name → index lookups, built once after parse to avoid per-request scans.
+    #[serde(skip)]
+    model_idx: std::collections::HashMap<String, usize>,
+    #[serde(skip)]
+    ak_idx: std::collections::HashMap<String, usize>,
+    #[serde(skip)]
+    product_idx: std::collections::HashMap<String, usize>,
 }
 
 /// The repo's default config, embedded so tests and `cargo run` work with zero setup.
@@ -259,7 +266,29 @@ impl GatewayConfig {
         let mut cfg: GatewayConfig = serde_yaml::from_str(yaml)?;
         cfg.normalize()?;
         cfg.validate()?;
+        cfg.build_indices();
         Ok(cfg)
+    }
+
+    fn build_indices(&mut self) {
+        self.model_idx = self
+            .models
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.name.clone(), i))
+            .collect();
+        self.ak_idx = self
+            .access_keys
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.ak.clone(), i))
+            .collect();
+        self.product_idx = self
+            .products
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.name.clone(), i))
+            .collect();
     }
 
     /// Expand provider presets: fill each model's default wire type and
@@ -356,16 +385,16 @@ impl GatewayConfig {
     }
 
     pub fn find_product(&self, name: &str) -> Option<&ProductConfEntry> {
-        self.products.iter().find(|p| p.name == name)
+        self.products.get(*self.product_idx.get(name)?)
     }
 
     pub fn find_ak(&self, ak: &str) -> Option<&AkConf> {
-        self.access_keys.iter().find(|a| a.ak == ak)
+        self.access_keys.get(*self.ak_idx.get(ak)?)
     }
 
     /// Look up a public model name (e.g. "gpt-4o").
     pub fn find_model(&self, name: &str) -> Option<&ModelConf> {
-        self.models.iter().find(|m| m.name == name)
+        self.models.get(*self.model_idx.get(name)?)
     }
 
     /// Pricing for a public model name; zero if unlisted.
