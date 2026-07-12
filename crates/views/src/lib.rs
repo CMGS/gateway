@@ -51,6 +51,8 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use serde_json::{Value, json};
 
+const LEDGER_PAGE_DEFAULT: usize = 100;
+
 #[derive(Clone)]
 pub struct AppState {
     pub handler: OnlineHandler,
@@ -253,6 +255,18 @@ fn log_access(surface: &str, ctx: &DagContext, status: u16, started: Instant) {
             )
         })
         .unwrap_or_default();
+    let latency = started.elapsed();
+    metrics::counter!(
+        "gateway_requests_total",
+        "surface" => surface.to_owned(),
+        "protocol" => mt.to_owned(),
+        "status" => status.to_string(),
+    )
+    .increment(1);
+    metrics::histogram!("gateway_request_duration_seconds", "surface" => surface.to_owned())
+        .record(latency.as_secs_f64());
+    metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(pt.max(0) as u64);
+    metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ct.max(0) as u64);
     tracing::info!(
         target: "access",
         surface,
@@ -265,7 +279,7 @@ fn log_access(surface: &str, ctx: &DagContext, status: u16, started: Instant) {
         prompt_tokens = pt,
         completion_tokens = ct,
         total_tokens = tt,
-        latency_ms = started.elapsed().as_millis() as u64,
+        latency_ms = latency.as_millis() as u64,
         "request served"
     );
 }
@@ -295,9 +309,16 @@ async fn list_models(State(s): State<AppState>) -> Json<Value> {
 }
 
 /// Local billing ledger snapshot.
-async fn ledger(State(s): State<AppState>) -> Response {
-    match s.handler.state.store.ledger_snapshot().await {
-        Ok(records) => Json(json!({ "count": records.len(), "records": records })).into_response(),
+async fn ledger(
+    State(s): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(LEDGER_PAGE_DEFAULT);
+    match s.handler.state.store.ledger_snapshot(limit).await {
+        Ok((count, records)) => Json(json!({ "count": count, "records": records })).into_response(),
         Err(e) => gateway_error(e),
     }
 }

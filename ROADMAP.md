@@ -65,12 +65,14 @@ open-source impl now, alternatives pluggable":
 
 ## M4 — Observability
 
-- [ ] `metrics` facade with a Prometheus `/metrics` exporter (optional
-      feature)
-- [ ] Request access log fields finalized; latency breakdown per pipeline
-      stage
-- [ ] Ledger snapshot pagination + retention policy (unbounded growth once
-      the SQLite store persists across restarts)
+- [x] `metrics` facade with a Prometheus `/metrics` endpoint: request
+      counters (surface/protocol/status), token counters, request duration,
+      per-pipeline-node latency, cache hits, ledger write failures
+- [x] Access log finalized (ak/product/model/protocol/account/status/
+      tokens/latency)
+- [x] Ledger snapshot pagination (`?limit=`, count stays the total);
+      retention policy still open
+- [ ] Ledger retention policy
 
 ## M5 — Persistence backends
 

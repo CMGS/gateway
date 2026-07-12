@@ -75,7 +75,11 @@ pub async fn run(layers: &[Layer], ctx: &mut DagContext) -> GResult<()> {
         for i in order {
             let node = &layer.nodes[i];
             tracing::debug!(layer = layer.name, node = node.name(), "dag node start");
-            node.execute(ctx).await?;
+            let started = std::time::Instant::now();
+            let result = node.execute(ctx).await;
+            metrics::histogram!("gateway_node_duration_seconds", "node" => node.name())
+                .record(started.elapsed().as_secs_f64());
+            result?;
         }
     }
     Ok(())

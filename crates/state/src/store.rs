@@ -93,7 +93,9 @@ pub struct StoredFile {
 #[async_trait::async_trait]
 pub trait Store: Send + Sync + std::fmt::Debug {
     async fn ledger_add(&self, r: BillingRecord) -> GResult<()>;
-    async fn ledger_snapshot(&self) -> GResult<Vec<BillingRecord>>;
+    /// Total record count plus the most recent `limit` records in
+    /// chronological order.
+    async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)>;
 
     /// Store `content` under a fresh id; returns the file metadata.
     async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile>;
@@ -124,12 +126,14 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn ledger_snapshot(&self) -> GResult<Vec<BillingRecord>> {
-        Ok(self
+    async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)> {
+        let records = self
             .records
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total = records.len();
+        let page = records[total.saturating_sub(limit)..].to_vec();
+        Ok((total, page))
     }
 
     async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -265,30 +269,38 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    async fn ledger_snapshot(&self) -> GResult<Vec<BillingRecord>> {
-        let rows = sqlx::query(
+    async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM billing")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| store_err("count billing records", e))?;
+        let mut rows = sqlx::query(
             "SELECT ak, product, model, protocol, account, prompt_tokens,
              completion_tokens, total_tokens, cost_micros, ptu_spillover
-             FROM billing ORDER BY n",
+             FROM billing ORDER BY n DESC LIMIT ?",
         )
+        .bind(limit.min(i64::MAX as usize) as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| store_err("read billing records", e))?;
-        Ok(rows
-            .iter()
-            .map(|row| BillingRecord {
-                ak: row.get(0),
-                product: row.get(1),
-                model: row.get(2),
-                protocol: row.get(3),
-                account: row.get(4),
-                prompt_tokens: row.get(5),
-                completion_tokens: row.get(6),
-                total_tokens: row.get(7),
-                cost_micros: row.get(8),
-                ptu_spillover: row.get(9),
-            })
-            .collect())
+        rows.reverse();
+        Ok((
+            total as usize,
+            rows.iter()
+                .map(|row| BillingRecord {
+                    ak: row.get(0),
+                    product: row.get(1),
+                    model: row.get(2),
+                    protocol: row.get(3),
+                    account: row.get(4),
+                    prompt_tokens: row.get(5),
+                    completion_tokens: row.get(6),
+                    total_tokens: row.get(7),
+                    cost_micros: row.get(8),
+                    ptu_spillover: row.get(9),
+                })
+                .collect(),
+        ))
     }
 
     async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -438,10 +450,15 @@ mod tests {
     async fn exercise(store: &dyn Store) {
         store.ledger_add(record("m1")).await.unwrap();
         store.ledger_add(record("m2")).await.unwrap();
-        let snap = store.ledger_snapshot().await.unwrap();
-        assert_eq!(snap.len(), 2);
+        let (total, snap) = store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(total, 2);
         assert_eq!(snap[0].model, "m1");
         assert_eq!(snap[1].total_tokens, 8);
+        // pagination: latest record only, total still reports everything
+        let (total, page) = store.ledger_snapshot(1).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].model, "m2");
 
         let f = store
             .file_put("batch", "line1\nline2".into())
@@ -546,7 +563,7 @@ mod tests {
         }
         // reopen: records survive the process (unlike MemoryStore)
         let store = SqliteStore::open(path).await.unwrap();
-        assert_eq!(store.ledger_snapshot().await.unwrap().len(), 2);
+        assert_eq!(store.ledger_snapshot(usize::MAX).await.unwrap().0, 2);
         let job = store.batch_get("batch-1").await.unwrap().unwrap();
         assert_eq!(job.status, BatchStatus::Completed);
     }

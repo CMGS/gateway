@@ -95,6 +95,7 @@ impl DagNode for CacheLookup {
         };
         if let Some(cached) = ctx.state.cache.get(&key) {
             ctx.decide("cache_lookup", format!("hit ttl={ttl}s"));
+            metrics::counter!("gateway_cache_hits_total").increment(1);
             ctx.cache_hit = true;
             ctx.outcome = Some(ap_engines::EngineOutcome::ok(cached));
         } else {
@@ -486,6 +487,7 @@ impl DagNode for CostCalc {
         // A ledger write failure must not fail a response that already succeeded
         // upstream (quota/tpm are already consumed); log and continue.
         if let Err(e) = ctx.state.store.ledger_add(record).await {
+            metrics::counter!("gateway_ledger_write_failures_total").increment(1);
             tracing::error!(error = %e, "billing ledger write failed");
         }
         ctx.decide("cost_calc", format!("tokens={total} cost_micros={cost}"));

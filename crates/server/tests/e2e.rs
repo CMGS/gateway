@@ -1376,3 +1376,62 @@ models:
     let j = body_json(resp).await;
     assert_eq!(j["role"], "assistant");
 }
+
+#[tokio::test]
+async fn metrics_endpoint_exposes_request_counters() {
+    // mirrors the server wiring: global recorder + /metrics on top of the app
+    let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("install recorder");
+    let router = app().route(
+        "/metrics",
+        axum::routing::get(move || {
+            let prometheus = prometheus.clone();
+            async move { prometheus.render() }
+        }),
+    );
+
+    let resp = router
+        .clone()
+        .oneshot(post(
+            "/v1/chat/completions",
+            Some("ak-demo-123"),
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"count me"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = router.oneshot(get("/metrics")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("gateway_requests_total"), "{text}");
+    assert!(text.contains("gateway_node_duration_seconds"), "{text}");
+    assert!(text.contains("gateway_tokens_total"), "{text}");
+}
+
+#[tokio::test]
+async fn ledger_pagination_limits_records_not_count() {
+    let app = app();
+    for i in 0..3 {
+        let body =
+            format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"page {i}"}}]}}"#);
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = app.oneshot(get("/internal/ledger?limit=2")).await.unwrap();
+    let j = body_json(resp).await;
+    assert_eq!(j["count"], 3, "count reports the total");
+    assert_eq!(
+        j["records"].as_array().unwrap().len(),
+        2,
+        "records page is limited"
+    );
+}

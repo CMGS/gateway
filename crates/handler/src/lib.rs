@@ -130,7 +130,7 @@ mod tests {
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.message.contains("you said: hi there"));
         assert!(out.response.common_usage.is_some());
-        let ledger = h.state.store.ledger_snapshot().await.unwrap();
+        let (_, ledger) = h.state.store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.len(), 1);
         assert!(ledger[0].cost_micros > 0);
         assert_eq!(ledger[0].account, "mock-openai-1");
@@ -155,7 +155,15 @@ mod tests {
         let out = ctx.outcome.expect("outcome");
         assert!(out.block.block);
         assert_eq!(out.response.finish_reason, "content_filter");
-        assert!(h.state.store.ledger_snapshot().await.unwrap().is_empty()); // not billed
+        assert!(
+            h.state
+                .store
+                .ledger_snapshot(usize::MAX)
+                .await
+                .unwrap()
+                .1
+                .is_empty()
+        ); // not billed
     }
 
     #[tokio::test]
@@ -185,7 +193,7 @@ mod tests {
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.ptu_spillover);
         assert!(out.response.message.contains("you said: failover please"));
-        let ledger = h.state.store.ledger_snapshot().await.unwrap();
+        let (_, ledger) = h.state.store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.last().unwrap().account, "mock-hunyuan-paygo");
         assert!(ledger.last().unwrap().ptu_spillover);
         assert!(ctx.decisions.iter().any(|d| d.contains("failover")));
@@ -226,6 +234,9 @@ mod tests {
         assert_eq!(j.status, ap_state::BatchStatus::Completed);
         assert_eq!(j.results.len(), 2);
         assert!(j.results.iter().all(|r| r.ok && r.total_tokens > 0));
-        assert_eq!(h.state.store.ledger_snapshot().await.unwrap().len(), 2);
+        assert_eq!(
+            h.state.store.ledger_snapshot(usize::MAX).await.unwrap().0,
+            2
+        );
     }
 }

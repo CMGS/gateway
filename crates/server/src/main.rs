@@ -63,11 +63,20 @@ async fn main() -> anyhow::Result<()> {
     let transport = select_transport()?;
     let app_state = AppState::new(cfg, state, transport);
 
+    let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
+    let router = ap_views::app(app_state).route(
+        "/metrics",
+        axum::routing::get(move || {
+            let prometheus = prometheus.clone();
+            async move { prometheus.render() }
+        }),
+    );
+
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("ap listening on http://{addr}");
 
     // graceful shutdown (drain on SIGINT/SIGTERM)
-    axum::serve(listener, ap_views::app(app_state))
+    axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

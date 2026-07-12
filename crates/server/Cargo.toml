@@ -21,8 +21,10 @@ axum = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 [dev-dependencies]
+metrics-exporter-prometheus = { workspace = true }
 tower = { workspace = true }
 serde_json = { workspace = true }
 ap-protocol = { workspace = true }
