@@ -1,0 +1,29 @@
+[package]
+name = "ap-views"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "HTTP view layer: OpenAI/Anthropic-compatible routes on axum."
+
+[dependencies]
+ap-consts = { workspace = true }
+ap-models = { workspace = true }
+ap-protocol = { workspace = true }
+ap-config = { workspace = true }
+ap-state = { workspace = true }
+ap-engines = { workspace = true }
+ap-handler = { workspace = true }
+ap-dag = { workspace = true }
+axum = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,335 @@
+//! Prompt-token estimation.
+//!
+//! Computes an *estimated* prompt-token count from a chat request. The
+//! authoritative count always comes back from the vendor's usage payload after
+//! the call; this is only the up-front estimate.
+//!
+//! ## Intended use
+//! This estimate feeds **PTU account selection** — sizing a request (prompt
+//! tokens + estimated output) to decide whether it fits a dedicated-PTU
+//! account, gated behind an `accurate_token_enabled` switch and skipped for
+//! multimodal requests. It is NOT the TPM rate limiter, which uses a
+//! Redis-backed statistical average and carries a cloud dependency this
+//! estimate does not need. This crate provides the calculation as a faithful,
+//! tested capability; wiring it into a token-aware PTU selector is deferred
+//! until that capacity-scheduling subsystem is built.
+//!
+//! ## Fidelity
+//! The **structural accounting** follows the standard OpenAI chat-token
+//! accounting formula exactly: per-message overhead, encoded role, encoded
+//! content, tool-call name/arguments, and the trailing reply priming.
+//!
+//! The **text→token encoding** sits behind the [`TokenEncoder`] trait — exactly
+//! like the `Transport` seam. The default ([`default_encoder`]) is real tiktoken
+//! `cl100k_base` BPE ([`TiktokenEncoder`]); [`HeuristicEncoder`] is the
+//! zero-dependency fallback approximation.
+
+use std::sync::LazyLock;
+
+use serde_json::Value;
+
+use crate::request::domain::ChatMsg;
+
+/// Encodes text to an (estimated) token count. The BPE seam — see module docs.
+pub trait TokenEncoder: Send + Sync {
+    fn encode_len(&self, text: &str) -> usize;
+}
+
+/// Real tiktoken `cl100k_base` BPE — the tokenizer OpenAI's models use.
+pub struct TiktokenEncoder {
+    bpe: tiktoken_rs::CoreBPE,
+}
+
+impl TiktokenEncoder {
+    /// Fails only if the embedded vocabulary fails to load.
+    pub fn new() -> Result<Self, String> {
+        let bpe = tiktoken_rs::cl100k_base().map_err(|e| format!("load cl100k_base: {e}"))?;
+        Ok(Self { bpe })
+    }
+}
+
+impl TokenEncoder for TiktokenEncoder {
+    fn encode_len(&self, text: &str) -> usize {
+        self.bpe.encode_ordinary(text).len()
+    }
+}
+
+/// Process-wide default encoder: cl100k BPE, falling back to the heuristic if
+/// the embedded vocabulary cannot be loaded.
+pub fn default_encoder() -> &'static dyn TokenEncoder {
+    static ENC: LazyLock<Box<dyn TokenEncoder>> = LazyLock::new(|| match TiktokenEncoder::new() {
+        Ok(t) => Box::new(t),
+        Err(_) => Box::new(HeuristicEncoder),
+    });
+    &**ENC
+}
+
+/// Documented approximation of cl100k_base token counting. NOT real tiktoken.
+///
+/// Classifies character runs the way cl100k's pre-tokenizer roughly splits
+/// them, which captures the dominant error sources of a naive `bytes/4`
+/// estimate (CJK, digit grouping, punctuation):
+///
+/// - runs of ASCII letters → ~1 token per 4 chars (subword merges)
+/// - runs of digits → cl100k emits ≤3-digit groups → 1 tok / 3
+/// - ASCII punctuation/symbols → ~1 token each
+/// - non-ASCII (CJK etc.) → ~1 token per char (rarely merged)
+///
+/// Whitespace folds into the following word (cl100k's leading-space merge), so
+/// it contributes no standalone tokens.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HeuristicEncoder;
+
+impl HeuristicEncoder {
+    const LETTERS_PER_TOKEN: usize = 4;
+    const DIGITS_PER_TOKEN: usize = 3;
+}
+
+impl TokenEncoder for HeuristicEncoder {
+    fn encode_len(&self, text: &str) -> usize {
+        let mut tokens = 0usize;
+        let mut run = Run::None;
+        for c in text.chars() {
+            if c.is_ascii_alphabetic() {
+                match &mut run {
+                    Run::Letters(n) => *n += 1,
+                    other => {
+                        other.flush(&mut tokens);
+                        run = Run::Letters(1);
+                    }
+                }
+            } else if c.is_ascii_digit() {
+                match &mut run {
+                    Run::Digits(n) => *n += 1,
+                    other => {
+                        other.flush(&mut tokens);
+                        run = Run::Digits(1);
+                    }
+                }
+            } else {
+                run.flush(&mut tokens);
+                if c.is_whitespace() {
+                    // folds into the adjacent word; no standalone token
+                } else {
+                    // ASCII punctuation/symbol OR a non-ASCII char → ~1 token
+                    tokens += 1;
+                }
+            }
+        }
+        run.flush(&mut tokens);
+        tokens
+    }
+}
+
+/// The kind of character run currently being accumulated.
+enum Run {
+    None,
+    Letters(usize),
+    Digits(usize),
+}
+
+impl Run {
+    fn flush(&mut self, tokens: &mut usize) {
+        match self {
+            Run::Letters(n) => {
+                *tokens += n.div_ceil(HeuristicEncoder::LETTERS_PER_TOKEN);
+            }
+            Run::Digits(n) => {
+                *tokens += n.div_ceil(HeuristicEncoder::DIGITS_PER_TOKEN);
+            }
+            Run::None => {}
+        }
+        *self = Run::None;
+    }
+}
+
+/// Per-message structural overhead. gpt-3.5 uses 4, everything modern uses 3.
+fn tokens_per_message(model_name: &str) -> usize {
+    let m = model_name.to_ascii_lowercase();
+    if m.contains("gpt-3.5") || m.contains("gpt-35") || m.contains("gpt3.5") {
+        4
+    } else {
+        3
+    }
+}
+
+/// Extract the text a message contributes. Multimodal `parts` → concatenated
+/// text parts only (image parts add vision tokens the vendor accounts for, not
+/// counted here); otherwise `content`.
+fn message_text(msg: &ChatMsg) -> String {
+    if let Some(Value::Array(parts)) = &msg.parts {
+        let mut out = String::new();
+        for p in parts {
+            if p["type"] == "text"
+                && let Some(t) = p["text"].as_str()
+            {
+                out.push_str(t);
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    msg.content.clone()
+}
+
+/// Estimate the prompt tokens a chat request will cost upstream.
+///
+/// `tools` is the request's tool/function definitions (OpenAI wire shape), if
+/// any; their serialized schema is encoded as text. Follows the standard
+/// accounting exactly; the raw text encoding is [`TokenEncoder`]-approximate
+/// (see module docs).
+pub fn estimate_prompt_tokens(
+    messages: &[ChatMsg],
+    tools: Option<&Value>,
+    model_name: &str,
+    enc: &dyn TokenEncoder,
+) -> i64 {
+    let per_msg = tokens_per_message(model_name);
+    let mut num = 0usize;
+
+    for msg in messages {
+        // storage-role messages are internal bookkeeping, not sent upstream.
+        if msg.role == ap_consts::role::STORAGE {
+            continue;
+        }
+        num += per_msg;
+        num += enc.encode_len(&message_text(msg));
+        num += enc.encode_len(&msg.role);
+        if let Some(id) = &msg.tool_call_id {
+            num += enc.encode_len(id);
+        }
+        // assistant tool_calls: each call adds overhead (+3) plus encoded name and args.
+        if let Some(Value::Array(calls)) = &msg.tool_calls {
+            for call in calls {
+                num += 3;
+                if let Some(name) = call["function"]["name"].as_str() {
+                    num += enc.encode_len(name);
+                }
+                if let Some(args) = call["function"]["arguments"].as_str() {
+                    num += enc.encode_len(args);
+                }
+            }
+        }
+    }
+
+    // tool/function definitions: encode their serialized schema as text.
+    if let Some(t) = tools
+        && !t.is_null()
+    {
+        num += enc.encode_len(&t.to_string());
+    }
+
+    // every reply is primed with <|start|>assistant<|message|> → +3.
+    num += 3;
+
+    num as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn heuristic_classifies_runs() {
+        let e = HeuristicEncoder;
+        // "hello" = 5 letters → ceil(5/4) = 2
+        assert_eq!(e.encode_len("hello"), 2);
+        // pure whitespace → 0 standalone tokens
+        assert_eq!(e.encode_len("   "), 0);
+        // digits group by 3: "12345" → ceil(5/3) = 2
+        assert_eq!(e.encode_len("12345"), 2);
+        // punctuation each ~1 token
+        assert_eq!(e.encode_len("!?."), 3);
+        // CJK ~1 token per char
+        assert_eq!(e.encode_len("你好"), 2);
+        // empty
+        assert_eq!(e.encode_len(""), 0);
+    }
+
+    #[test]
+    fn heuristic_mixed_text() {
+        let e = HeuristicEncoder;
+        // "hi there" → "hi"(1) + "there"(ceil(5/4)=2) = 3; space folds in
+        assert_eq!(e.encode_len("hi there"), 3);
+    }
+
+    #[test]
+    fn tiktoken_matches_known_cl100k_counts() {
+        let e = TiktokenEncoder::new().unwrap();
+        assert_eq!(e.encode_len(""), 0);
+        // canonical cl100k examples (OpenAI cookbook):
+        // "tiktoken is great!" → ["t","ik","token"," is"," great","!"]
+        assert_eq!(e.encode_len("tiktoken is great!"), 6);
+        assert_eq!(e.encode_len("hello world"), 2);
+    }
+
+    #[test]
+    fn default_encoder_is_tiktoken() {
+        assert_eq!(default_encoder().encode_len("tiktoken is great!"), 6);
+    }
+
+    #[test]
+    fn estimate_includes_structural_overhead() {
+        let e = HeuristicEncoder;
+        let msgs = vec![
+            ChatMsg::text("system", "be brief"),
+            ChatMsg::text("user", "hello"),
+        ];
+        let n = estimate_prompt_tokens(&msgs, None, "gpt-4o", &e);
+        // 2 messages × 3 overhead + content/role encodings + 3 priming.
+        // must be strictly greater than a raw content-only count (proves the
+        // per-message + role + priming structure is applied).
+        let content_only = e.encode_len("be brief") + e.encode_len("hello");
+        assert!(
+            n > (content_only as i64) + 6,
+            "estimate {n} should exceed content({content_only}) + 2×3 msg overhead"
+        );
+    }
+
+    #[test]
+    fn gpt35_uses_higher_per_message_overhead() {
+        let e = HeuristicEncoder;
+        let msgs = vec![ChatMsg::text("user", "x")];
+        let modern = estimate_prompt_tokens(&msgs, None, "gpt-4o", &e);
+        let gpt35 = estimate_prompt_tokens(&msgs, None, "gpt-3.5-turbo", &e);
+        // same messages, gpt-3.5 counts 4/message vs 3 → exactly +1 per message.
+        assert_eq!(gpt35 - modern, 1, "gpt-3.5 adds 1 token/message");
+    }
+
+    #[test]
+    fn tools_and_tool_calls_are_counted() {
+        let e = HeuristicEncoder;
+        let plain = vec![ChatMsg::text("user", "hi")];
+        let base = estimate_prompt_tokens(&plain, None, "gpt-4o", &e);
+        // adding tool definitions must raise the estimate.
+        let tools = json!([{"type":"function","function":{"name":"get_weather","parameters":{}}}]);
+        let with_tools = estimate_prompt_tokens(&plain, Some(&tools), "gpt-4o", &e);
+        assert!(with_tools > base, "tool defs must add tokens");
+
+        // an assistant message carrying a tool_call adds 3 + name + args.
+        let mut asst = ChatMsg::text("assistant", "");
+        asst.tool_calls = Some(json!([
+            {"function":{"name":"get_weather","arguments":"{\"city\":\"NYC\"}"}}
+        ]));
+        let with_call = estimate_prompt_tokens(&[asst], None, "gpt-4o", &e);
+        let empty_asst =
+            estimate_prompt_tokens(&[ChatMsg::text("assistant", "")], None, "gpt-4o", &e);
+        assert!(with_call >= empty_asst + 3, "tool_call adds ≥3 overhead");
+    }
+
+    #[test]
+    fn multimodal_counts_text_parts_only() {
+        let e = HeuristicEncoder;
+        let mut msg = ChatMsg::text("user", "ignored-when-parts-present");
+        msg.parts = Some(json!([
+            {"type":"text","text":"describe"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+        ]));
+        let n = estimate_prompt_tokens(&[msg], None, "gpt-4o", &e);
+        // "describe" (ceil(8/4)=2) + role "user"(1) + 3 msg + 3 priming = 9;
+        // the base64 image URL must NOT be counted as text.
+        assert_eq!(n, 9, "only text parts counted, image excluded");
+    }
+}

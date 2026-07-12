@@ -1,0 +1,14 @@
+[package]
+name = "ap-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "External wire protocols: OpenAI- and Anthropic-compatible types."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,114 @@
+# Configuration
+
+One YAML file configures the gateway. Resolution order:
+
+1. `AP_GATEWAY_CONF=<path>` — explicit config file
+2. otherwise the embedded default (the repo's `conf/gateway.yaml`)
+
+`AP_PORT` overrides `listen.port` at runtime.
+
+## Sections
+
+### `listen`
+
+```yaml
+listen:
+  host: 127.0.0.1
+  port: 8080
+```
+
+### `storage` — durable records backend
+
+```yaml
+storage:
+  sqlite_path: /var/lib/ap/store.db   # empty/absent = in-memory
+```
+
+The billing ledger, uploaded files, and batch jobs live here. In-memory
+by default (lost on restart); a SQLite path makes them durable.
+
+### `access_keys` — client authentication and per-key governance
+
+```yaml
+access_keys:
+  - ak: ak-demo-123          # bearer / x-api-key value clients send
+    product: demo            # product group (for product-level QPM)
+    qps: 100                 # per-key request rate
+    daily_token_quota: 1000000
+    tokens_per_minute: 600   # optional TPM window limit
+```
+
+### `models` — public model names and dispatch
+
+```yaml
+models:
+  - name: gpt-4o                     # name clients request
+    model_type: openai-chat          # engine dispatch type (wire value)
+    input_price_per_1k_micros: 2500  # billing rates (micros per 1k tokens)
+    output_price_per_1k_micros: 10000
+    qpm: 60                          # optional model-level rate limit
+    cache_ttl_seconds: 60            # optional request-level response cache
+```
+
+### `providers` — first-class provider presets
+
+```yaml
+providers:
+  - name: openai
+    kind: openai              # openai | anthropic | gemini
+    api_key_env: OPENAI_API_KEY
+models:
+  - name: gpt-4o
+    provider: openai          # fills model_type with the kind's default
+```
+
+A provider entry expands into an upstream account with the kind's preset
+base URL (overridable via `endpoint:`, e.g. for OpenAI-compatible
+vendors) and served wire types; an explicit account with the same name
+wins. Gemini auth alignment is pending live verification.
+
+### `accounts` — upstream credential slots
+
+```yaml
+accounts:
+  - name: openai-main
+    provider: openai
+    priority: 1                # lower = preferred
+    tier: ptu                  # ptu (provisioned, preferred) | paygo (default)
+    model_types: ["openai-chat", "openai-embeddings"]
+    endpoint: ""               # empty → mock transport; real base URL → real upstream
+    api_key_env: ""            # env var name holding the API key (never the key itself)
+    secret_key_env: ""         # AWS only: env var of the secret key (api_key_env = access key id)
+```
+
+Secrets never live in config files: `api_key_env` names an environment
+variable that is read per request.
+
+### `security`, `stability`, `products`
+
+```yaml
+security:
+  dlp_redact: true             # redact emails/phone numbers before egress
+  blocklist: ["badword"]       # reject requests containing listed terms
+
+stability:
+  failure_threshold: 3         # consecutive failures before an account cools down
+  cooldown_seconds: 300
+
+products:
+  - name: myproduct
+    qpm: 120                   # product-level request rate
+```
+
+## Going live against real upstreams
+
+```bash
+export OPENAI_KEY=sk-...        # your key, in your environment
+# account in YAML: endpoint: "https://api.openai.com", api_key_env: "OPENAI_KEY"
+cargo run -p ap-server
+```
+
+Accounts with an `endpoint` egress to it; accounts without one are served
+by the in-process mock. `AP_TRANSPORT` overrides the routing: `mock`
+forces zero egress (nothing leaves the process), `http` disables the mock
+so misconfigured accounts fail loudly instead of returning fake data.

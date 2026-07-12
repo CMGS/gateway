@@ -1,0 +1,25 @@
+[package]
+name = "ap-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "In-process gateway state: auth, rate limit, quota, account pool, billing ledger — no external storage."
+
+[dependencies]
+ap-consts = { workspace = true }
+ap-models = { workspace = true }
+ap-config = { workspace = true }
+dashmap = { workspace = true }
+moka = { workspace = true }
+governor = { workspace = true }
+sqlx = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "ap-consts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Global constants: error codes, ModelType dispatch enum, mappings."
+
+[dependencies]
+serde = { workspace = true }
+
+[lints]
+workspace = true

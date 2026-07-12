@@ -1,0 +1,25 @@
+[package]
+name = "ap-dag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Layered DAG execution: 4 fixed layers, topo-ordered nodes."
+
+[dependencies]
+ap-consts = { workspace = true }
+ap-models = { workspace = true }
+ap-config = { workspace = true }
+ap-state = { workspace = true }
+ap-engines = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

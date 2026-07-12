@@ -1,0 +1,197 @@
+# ap — local gateway config.
+# Local file only; there is no config center.
+
+listen:
+  host: 127.0.0.1
+  port: 8080
+
+# Durable records (billing ledger, files, batches). Empty/absent = in-memory;
+# set a path to persist across restarts.
+# storage:
+#   sqlite_path: /var/lib/ap/store.db
+
+# AK auth table (local key-table version)
+access_keys:
+  - ak: ak-demo-123
+    product: demo
+    qps: 100
+    daily_token_quota: 1000000
+  - ak: ak-limited # e2e: rate-limit path (qps=1 → second immediate call is limited)
+    product: demo
+    qps: 1
+    daily_token_quota: 1000000
+  - ak: ak-tiny-quota # e2e: quota path (first call consumes it, second is rejected)
+    product: demo
+    qps: 100
+    daily_token_quota: 1
+  - ak: ak-bench # local benchmark: effectively unthrottled
+    product: bench
+    qps: 1000000
+    daily_token_quota: 1000000000
+  - ak: ak-tpm-tiny # e2e: TPM path (first consume succeeds, second is rejected within the window)
+    product: demo
+    qps: 100
+    daily_token_quota: 1000000
+    tokens_per_minute: 10
+  - ak: ak-prod-limited # e2e: product-level QPM (product=qpmprod, 2 per minute)
+    product: qpmprod
+    qps: 100
+    daily_token_quota: 1000000
+
+# Public model name → engine dispatch type (wire value of consts::ModelType),
+# plus demo prices used by the cost node (micros per 1k tokens).
+models:
+  - name: gpt-4o
+    model_type: openai-chat
+    input_price_per_1k_micros: 2500
+    output_price_per_1k_micros: 10000
+  - name: gpt-4o-mini
+    model_type: openai-chat
+    input_price_per_1k_micros: 150
+    output_price_per_1k_micros: 600
+  - name: claude-sonnet
+    model_type: claude
+    input_price_per_1k_micros: 3000
+    output_price_per_1k_micros: 15000
+  - name: gemini-pro
+    model_type: gemini
+    input_price_per_1k_micros: 1250
+    output_price_per_1k_micros: 5000
+  - name: text-embedding-3 # embeddings family
+    model_type: openai-embeddings
+    input_price_per_1k_micros: 20
+    output_price_per_1k_micros: 0
+  - name: dall-e-3 # image family
+    model_type: images/generations
+  - name: tts-1 # audio tts family
+    model_type: openai-tts
+  - name: whisper-1 # audio stt family
+    model_type: audio/transcriptions
+  - name: kling-video # video family
+    model_type: kling
+  - name: brave-search # search family
+    model_type: brave
+  - name: hunyuan-lite # e2e: PTU failover (ptu account down -> paygo spillover)
+    model_type: hunyuan
+    input_price_per_1k_micros: 100
+    output_price_per_1k_micros: 100
+  - name: ernie-4.0 # bespoke wire: Baidu ERNIE
+    model_type: ernie
+    input_price_per_1k_micros: 300
+    output_price_per_1k_micros: 900
+  - name: qpm-mini # e2e: model-level QPM limit (2 per minute)
+    model_type: openai-chat
+    qpm: 2
+  - name: cached-mini # e2e: request-level cache (TTL 60s, hits aren't billed)
+    model_type: openai-chat
+    input_price_per_1k_micros: 150
+    output_price_per_1k_micros: 600
+    cache_ttl_seconds: 60
+  - name: spark-lite # e2e: account cooldown (sole account stays down -> cooldown -> recovers on expiry)
+    model_type: spark
+  - name: erroring-model # e2e: vendor returns an error envelope -> client gets the mapped error status
+    model_type: moonshot
+  - name: qwen-max # bespoke wire: Alibaba DashScope native (not the openai-compatible mode)
+    model_type: ali_qwen
+    input_price_per_1k_micros: 400
+    output_price_per_1k_micros: 1200
+  - name: gpt-5-responses # OpenAI Responses API (/v1/responses, not the chat shape)
+    model_type: responses
+    input_price_per_1k_micros: 1250
+    output_price_per_1k_micros: 10000
+  - name: gpt-3.5-turbo-instruct # legacy text completion (/v1/completions, prompt shape)
+    model_type: openai-completions
+    input_price_per_1k_micros: 1500
+    output_price_per_1k_micros: 2000
+
+# Upstream account slots (mock credentials; set endpoint + api_key_env to go live).
+# tier: ptu = provisioned throughput (preferred), paygo/default = pay-as-you-go. An
+# account whose name contains "down" is simulated by MockTransport as an upstream
+# 503, for failover testing.
+accounts:
+  - name: mock-openai-1
+    provider: openai
+    priority: 1
+    model_types: ["openai-chat", "openai-completions", "chat/completions"]
+  - name: mock-openai-2
+    provider: openai
+    priority: 2
+    model_types: ["openai-chat"]
+  - name: mock-anthropic-1
+    provider: anthropic
+    priority: 1
+    model_types: ["claude"]
+  - name: mock-vertex-1
+    provider: google
+    priority: 1
+    model_types: ["gemini"]
+  - name: mock-embed-1
+    provider: openai
+    priority: 1
+    model_types: ["openai-embeddings"]
+  - name: mock-image-1
+    provider: openai
+    priority: 1
+    model_types: ["images/generations"]
+  - name: mock-audio-1
+    provider: openai
+    priority: 1
+    model_types: ["openai-tts", "audio/transcriptions"]
+  - name: mock-video-1
+    provider: kling
+    priority: 1
+    model_types: ["kling"]
+  - name: mock-search-1
+    provider: brave
+    priority: 1
+    model_types: ["brave"]
+  - name: mock-responses-1 # OpenAI Responses API surface
+    provider: openai
+    priority: 1
+    model_types: ["responses"]
+  - name: mock-realtime-1 # e2e: the account exists but the realtime engine returns 501 by design
+    provider: azure
+    priority: 1
+    model_types: ["glm-realtime"]
+  - name: mock-hunyuan-ptu-down # e2e: PTU account (simulated down)
+    provider: tencent
+    priority: 1
+    tier: ptu
+    model_types: ["hunyuan"]
+  - name: mock-hunyuan-paygo # e2e: paygo fallback account
+    provider: tencent
+    priority: 1
+    tier: paygo
+    model_types: ["hunyuan"]
+  - name: mock-ernie-1 # bespoke wire e2e
+    provider: baidu
+    priority: 1
+    model_types: ["ernie"]
+  - name: mock-spark-down # e2e: sole account stays down -> consecutive failures trigger cooldown
+    provider: iflytek
+    priority: 1
+    model_types: ["spark"]
+  - name: mock-erroring # e2e: vendor error envelope (name containing "erroring" triggers the mock)
+    provider: openai
+    priority: 1
+    model_types: ["moonshot"]
+  - name: mock-dashscope-1 # bespoke wire e2e
+    provider: alibaba
+    priority: 1
+    model_types: ["ali_qwen", "ali_qwen_vl"]
+
+# Local security policy (rule-based; no cloud security service)
+security:
+  dlp_redact: true
+  blocklist:
+    - forbiddenword
+
+# Account stability: 3 consecutive failures enter a 2s cooldown (e2e uses a short cooldown)
+stability:
+  failure_threshold: 3
+  cooldown_seconds: 2
+
+# Product-level governance
+products:
+  - name: qpmprod
+    qpm: 2

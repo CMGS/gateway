@@ -1,0 +1,82 @@
+# Gateway — LLM access point. Workspace manifest.
+[workspace]
+resolver = "2"
+members = [
+    "crates/consts",
+    "crates/utils",
+    "crates/models",
+    "crates/protocol",
+    "crates/config",
+    "crates/state",
+    "crates/engines",
+    "crates/dag",
+    "crates/handler",
+    "crates/task",
+    "crates/views",
+    "crates/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+rust-version = "1.85"
+publish = false
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[workspace.dependencies]
+# --- async runtime ---
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+# --- web (server) ---
+axum = { version = "0.8", features = ["ws"] } # ws: the /v1/realtime session surface
+tower = "0.5"
+# OPTIONAL, behind engines' `http` feature; default builds have zero egress.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# --- serde ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+# --- errors ---
+thiserror = "2"
+anyhow = "1"
+# --- local stdout logging only (no exporters, no reporting) ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# --- misc ---
+bytes = "1"
+dashmap = "6"
+moka = { version = "0.12", features = ["sync"] }
+governor = "0.10"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tempfile = "3"
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- internal crates (path deps) ---
+ap-consts = { path = "crates/consts" }
+ap-utils = { path = "crates/utils" }
+ap-models = { path = "crates/models" }
+ap-protocol = { path = "crates/protocol" }
+ap-config = { path = "crates/config" }
+ap-state = { path = "crates/state" }
+ap-engines = { path = "crates/engines" }
+ap-dag = { path = "crates/dag" }
+ap-handler = { path = "crates/handler" }
+ap-task = { path = "crates/task" }
+ap-views = { path = "crates/views" }
+base64 = "0.22"
+tiktoken-rs = "0.12"
+# pure-compute crypto (SigV4 signing, cache keys) — no network capability
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+
+# Faster iterative builds; keep release optimized.
+[profile.dev]
+opt-level = 0
+debug = 1

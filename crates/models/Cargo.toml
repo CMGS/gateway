@@ -1,0 +1,17 @@
+[package]
+name = "ap-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Core domain models: GatewayRequest/GatewayResponse/CommonUsage + error model."
+
+[dependencies]
+ap-consts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tiktoken-rs = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true

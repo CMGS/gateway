@@ -1,0 +1,18 @@
+[package]
+name = "ap-task"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Local background tasks: daily quota reset."
+
+[dependencies]
+ap-state = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
