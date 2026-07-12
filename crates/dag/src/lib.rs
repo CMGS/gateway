@@ -10,5 +10,5 @@ pub mod executor;
 pub mod nodes;
 
 pub use context::DagContext;
-pub use executor::{DagNode, Layer, run};
+pub use executor::{DagNode, Layer, Plan, run};
 pub use nodes::default_layers;

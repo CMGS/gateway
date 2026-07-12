@@ -25,6 +25,22 @@ pub struct Layer {
     pub nodes: Vec<Box<dyn DagNode>>,
 }
 
+/// Layers plus their precomputed topological order — built once, reused for
+/// every request (the node set and its dependencies are static).
+pub struct Plan {
+    layers: Vec<Layer>,
+    orders: Vec<Vec<usize>>,
+}
+
+impl Plan {
+    /// Precompute each layer's execution order, validating the dependency
+    /// graph up front so a cycle fails at startup, not per request.
+    pub fn build(layers: Vec<Layer>) -> GResult<Self> {
+        let orders = layers.iter().map(topo_order).collect::<GResult<_>>()?;
+        Ok(Self { layers, orders })
+    }
+}
+
 /// Kahn topological order over one layer; stable for ties (declaration order).
 fn topo_order(layer: &Layer) -> GResult<Vec<usize>> {
     let n = layer.nodes.len();
@@ -67,12 +83,11 @@ fn topo_order(layer: &Layer) -> GResult<Vec<usize>> {
     Ok(order)
 }
 
-/// Run all layers in order; a node error aborts the whole run (fail-fast
-/// for online requests).
-pub async fn run(layers: &[Layer], ctx: &mut DagContext) -> GResult<()> {
-    for layer in layers {
-        let order = topo_order(layer)?;
-        for i in order {
+/// Run a precomputed plan; a node error aborts the whole run (fail-fast for
+/// online requests).
+pub async fn run(plan: &Plan, ctx: &mut DagContext) -> GResult<()> {
+    for (layer, order) in plan.layers.iter().zip(&plan.orders) {
+        for &i in order {
             let node = &layer.nodes[i];
             tracing::debug!(layer = layer.name, node = node.name(), "dag node start");
             let started = std::time::Instant::now();
@@ -135,7 +150,8 @@ mod tests {
             ],
         };
         let mut ctx = test_ctx();
-        run(&[layer], &mut ctx).await.unwrap();
+        let plan = Plan::build(vec![layer]).unwrap();
+        run(&plan, &mut ctx).await.unwrap();
         assert_eq!(ctx.decisions, vec!["a: ran", "b: ran", "c: ran"]);
     }
 
@@ -145,7 +161,7 @@ mod tests {
             name: "t",
             nodes: vec![Box::new(Rec("a", &["b"])), Box::new(Rec("b", &["a"]))],
         };
-        let mut ctx = test_ctx();
-        assert!(run(&[layer], &mut ctx).await.is_err());
+        // a cycle fails at plan-build time, not per request
+        assert!(Plan::build(vec![layer]).is_err());
     }
 }

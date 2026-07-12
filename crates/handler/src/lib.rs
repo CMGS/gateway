@@ -24,18 +24,25 @@ pub struct OnlineHandler {
     pub cfg: Arc<GatewayConfig>,
     pub state: Arc<GatewayState>,
     pub transport: SharedTransport,
+    plan: Arc<ap_dag::Plan>,
 }
 
 impl OnlineHandler {
+    /// Panics only if the static DAG topology has a cycle — a build-time bug,
+    /// caught by tests.
     pub fn new(
         cfg: Arc<GatewayConfig>,
         state: Arc<GatewayState>,
         transport: SharedTransport,
     ) -> Self {
+        #[allow(clippy::expect_used)]
+        let plan =
+            Arc::new(ap_dag::Plan::build(ap_dag::default_layers()).expect("static dag topology"));
         Self {
             cfg,
             state,
             transport,
+            plan,
         }
     }
 
@@ -83,8 +90,7 @@ impl OnlineHandler {
             ctx.decide("dlp", format!("redacted {redacted} span(s) inbound"));
         }
 
-        let layers = ap_dag::default_layers();
-        ap_dag::run(&layers, &mut ctx).await?;
+        ap_dag::run(&self.plan, &mut ctx).await?;
 
         // --- plugin post-stage: outbound redaction ---
         if let Some(outcome) = ctx.outcome.as_mut() {
