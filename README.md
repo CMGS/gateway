@@ -13,7 +13,8 @@ key-based auth, quotas, rate limits, failover, and a billing ledger.
 - **Staged request pipeline** — a 4-layer DAG per request: model resolve / quota / cache lookup → account selection (priority, PTU-first, failover) → rate limits + engine call (retry on upstream 5xx) → usage extraction, billing, cache store
 - **Governance built in** — access-key auth, daily token quotas, QPS / QPM / TPM limits at key, product, and model level, request-level TTL cache, account cooldown and recovery, DLP redaction and blocklist plugins
 - **Providers behind traits** — engines talk to upstreams through a `Transport` seam; accounts with a real endpoint go over HTTP (reqwest + rustls), accounts without one are served by a deterministic in-process mock; AWS SigV4 signing included
-- **One binary, one YAML** — no external services required; in-process state, structured logs to stdout, graceful shutdown
+- **Observability built in** — Prometheus `/metrics` (per-route request/status counters, per-pipeline-stage latency, token counters), structured access logs
+- **One binary, one YAML** — no external services required; in-process state, optional SQLite persistence, graceful shutdown
 
 ## Quick Start
 

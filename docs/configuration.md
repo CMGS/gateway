@@ -57,6 +57,8 @@ providers:
   - name: openai
     kind: openai              # openai | anthropic | gemini
     api_key_env: OPENAI_API_KEY
+    # endpoint / timeout_seconds / connect_retries may be set here too and
+    # are inherited by the synthesized account
 models:
   - name: gpt-4o
     provider: openai          # fills the protocol with the kind's default
@@ -102,6 +104,15 @@ products:
   - name: myproduct
     qpm: 120                   # product-level request rate
 ```
+
+## Observability
+
+`GET /metrics` serves the Prometheus registry: `gateway_requests_total`
+(route/status), `gateway_request_duration_seconds`,
+`gateway_node_duration_seconds` (pipeline stage), `gateway_tokens_total`,
+`gateway_cache_hits_total`, `gateway_ledger_write_failures_total`, and
+`gateway_upstream_connect_retries_total` (account). One structured access
+log line per request goes to stdout.
 
 ## Going live against real upstreams
 

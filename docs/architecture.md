@@ -62,8 +62,9 @@ default, so the whole pipeline is testable offline:
 - **`Store`** — durable records (billing ledger, uploaded files, batch
   jobs). `MemoryStore` by default; `SqliteStore` (sqlx) when
   `storage.sqlite_path` is configured, surviving restarts.
-- Planned (see [ROADMAP](../ROADMAP.md)): `Provider` (M2), metrics
-  facade (M4), Redis rate/quota backends (M5).
+- **metrics facade** — `metrics` crate macros throughout; the server
+  installs a Prometheus recorder and serves `/metrics`.
+- Planned (see [ROADMAP](../ROADMAP.md)): Redis rate/quota backends (M5).
 
 ## Testing
 
