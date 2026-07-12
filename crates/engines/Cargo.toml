@@ -21,7 +21,6 @@ bytes = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 # real-socket wire test for HttpTransport (loopback only, never egress)
 axum = { workspace = true }
 

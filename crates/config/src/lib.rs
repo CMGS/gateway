@@ -432,6 +432,25 @@ listen: {host: h, port: 1}";
     }
 
     #[test]
+    fn upstream_policy_fields_parse_and_inherit() {
+        let yaml = r#"
+listen: {host: h, port: 1}
+providers:
+  - {name: openai, kind: openai, timeout_seconds: 30, connect_retries: 3}
+accounts:
+  - {name: slow, provider: x, priority: 1, protocols: ["openai-chat"], timeout_seconds: 120}
+"#;
+        let cfg = GatewayConfig::from_yaml(yaml).unwrap();
+        let slow = cfg.accounts.iter().find(|a| a.name == "slow").unwrap();
+        assert_eq!(slow.timeout_seconds, Some(120));
+        assert_eq!(slow.connect_retries, None);
+        // the synthesized preset account inherits the provider's policy
+        let preset = cfg.accounts.iter().find(|a| a.name == "openai").unwrap();
+        assert_eq!(preset.timeout_seconds, Some(30));
+        assert_eq!(preset.connect_retries, Some(3));
+    }
+
+    #[test]
     fn explicit_account_wins_over_preset() {
         let yaml = r#"
 listen: {host: h, port: 1}

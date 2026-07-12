@@ -14,6 +14,9 @@ use ap_models::{GResult, GatewayError};
 use crate::transport::{MockTransport, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+// A hung connect (black-holed SYN) must surface as a connect error — which the
+// retry predicate covers — instead of burning the whole request timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-account upstream policy: request timeout and how many times a
 /// connect-phase failure is retried (a request that reached the vendor is
@@ -57,6 +60,7 @@ impl HttpTransport {
         per_account: HashMap<String, UpstreamPolicy>,
     ) -> GResult<Self> {
         let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| GatewayError::internal("build http client").with_source(e))?;
         Ok(Self {
@@ -94,7 +98,11 @@ impl Transport for HttpTransport {
                 Ok(resp) => break resp,
                 Err(e) if e.is_connect() && attempt < policy.connect_retries => {
                     attempt += 1;
-                    metrics::counter!("gateway_upstream_connect_retries_total").increment(1);
+                    metrics::counter!(
+                        "gateway_upstream_connect_retries_total",
+                        "account" => req.account.clone(),
+                    )
+                    .increment(1);
                     tokio::time::sleep(RETRY_BACKOFF * attempt).await;
                 }
                 Err(e) => {
