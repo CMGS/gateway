@@ -214,27 +214,37 @@ impl OpenAiEngine {
         let mut dec = SseDecoder::default();
         let mut chunks = Vec::new();
         let mut full = String::new();
+        // Once a byte has reached the client the response is committed:
+        // failover would splice a second generation into the same stream, so a
+        // later error must terminate (499), not fault the account / retry.
+        let mut sent_any = false;
         let mut resp = GatewayResponse {
             http_code: status as i64,
             ..Default::default()
         };
         while let Some(item) = s.next().await {
             let bytes = item.map_err(|e| {
-                GatewayError::new(
-                    ap_consts::ErrCode::FED_RESP_RPC_FAILED,
-                    502,
-                    format!("upstream stream failed: {e}"),
-                )
+                if sent_any {
+                    GatewayError::client_closed(format!("upstream stream failed mid-response: {e}"))
+                } else {
+                    GatewayError::new(
+                        ap_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        502,
+                        format!("upstream stream failed: {e}"),
+                    )
+                }
             })?;
             for data in dec.feed(&bytes) {
                 let v: Value = serde_json::from_str(&data)
                     .map_err(|e| GatewayError::internal("parse openai sse frame").with_source(e))?;
                 for chunk in apply_sse_event(&v, status, &mut resp, &mut full)? {
                     match &tx {
-                        Some(tx) => tx
-                            .send(chunk)
-                            .await
-                            .map_err(|_| GatewayError::internal("client stream closed"))?,
+                        Some(tx) => {
+                            tx.send(chunk)
+                                .await
+                                .map_err(|_| GatewayError::client_closed("client stream closed"))?;
+                            sent_any = true;
+                        }
                         None => chunks.push(chunk),
                     }
                 }

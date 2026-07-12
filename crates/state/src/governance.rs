@@ -104,37 +104,55 @@ impl RedisGovernance {
              if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
              return v",
         );
-        script
+        match script
             .key(key)
             .arg(by)
             .arg(window.as_millis() as i64)
             .invoke_async(&mut conn)
             .await
-            .unwrap_or(0)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // fail open, but loudly — a persistent outage otherwise silently
+                // disables limits with no signal.
+                tracing::warn!(error = %e, key, "redis governance unavailable; limit skipped");
+                0
+            }
+        }
     }
 }
 
 #[async_trait]
 impl Governance for RedisGovernance {
     async fn rate_allow(&self, key: &str, qps: f64) -> bool {
-        // 1s fixed window approximating qps; burst = ceil(qps).
-        let limit = qps.ceil().max(1.0) as i64;
-        self.incr_window(&format!("ap:rate:{key}"), 1, Duration::from_secs(1))
-            .await
-            <= limit
+        if qps <= 0.0 {
+            return false;
+        }
+        // qps >= 1: N permits per 1s. qps < 1: 1 permit per 1/qps seconds,
+        // matching the in-memory backend.
+        let (limit, window) = if qps < 1.0 {
+            (1, Duration::from_secs_f64(1.0 / qps))
+        } else {
+            (qps.ceil() as i64, Duration::from_secs(1))
+        };
+        self.incr_window(&format!("ap:rate:{key}"), 1, window).await <= limit
     }
     async fn quota_check(&self, ak: &str, limit: i64) -> bool {
         self.quota_used(ak).await < limit
     }
     async fn quota_used(&self, ak: &str) -> i64 {
         let mut conn = self.conn.clone();
-        redis::cmd("GET")
+        match redis::cmd("GET")
             .arg(format!("ap:quota:{ak}"))
             .query_async::<Option<i64>>(&mut conn)
             .await
-            .ok()
-            .flatten()
-            .unwrap_or(0)
+        {
+            Ok(v) => v.unwrap_or(0),
+            Err(e) => {
+                tracing::warn!(error = %e, ak, "redis quota read failed; treating as 0");
+                0
+            }
+        }
     }
     async fn quota_consume(&self, ak: &str, tokens: i64) {
         let mut conn = self.conn.clone();
@@ -145,17 +163,30 @@ impl Governance for RedisGovernance {
             .await;
     }
     async fn quota_reset_all(&self) {
+        // SCAN (non-blocking) + UNLINK (async free), unlike KEYS+DEL which
+        // block the single-threaded server on a large keyspace.
         let mut conn = self.conn.clone();
-        if let Ok(keys) = redis::cmd("KEYS")
-            .arg("ap:quota:*")
-            .query_async::<Vec<String>>(&mut conn)
-            .await
-            && !keys.is_empty()
-        {
-            let _ = redis::cmd("DEL")
-                .arg(keys)
-                .query_async::<i64>(&mut conn)
+        let mut cursor = 0u64;
+        loop {
+            let res: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg("ap:quota:*")
+                .arg("COUNT")
+                .arg(512)
+                .query_async(&mut conn)
                 .await;
+            let Ok((next, keys)) = res else { return };
+            if !keys.is_empty() {
+                let _ = redis::cmd("UNLINK")
+                    .arg(keys)
+                    .query_async::<i64>(&mut conn)
+                    .await;
+            }
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
         }
     }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {

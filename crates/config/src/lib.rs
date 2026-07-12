@@ -28,6 +28,26 @@ pub enum ConfigError {
     UnknownProvider { model: String, provider: String },
     #[error("model `{model}` needs either protocol or provider")]
     ModelNeedsDispatch { model: String },
+    #[error("duplicate {kind} name `{name}`")]
+    DuplicateName { kind: &'static str, name: String },
+}
+
+/// Reject duplicate names — name lookups are last-wins, so a duplicate is an
+/// ambiguous config that should fail at load, not silently pick one entry.
+fn check_unique<'a>(
+    kind: &'static str,
+    names: impl Iterator<Item = &'a str>,
+) -> Result<(), ConfigError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(ConfigError::DuplicateName {
+                kind,
+                name: name.to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -397,6 +417,9 @@ impl GatewayConfig {
                 }
             }
         }
+        check_unique("model", self.models.iter().map(|m| m.name.as_str()))?;
+        check_unique("access_key", self.access_keys.iter().map(|a| a.ak.as_str()))?;
+        check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
         Ok(())
     }
 
@@ -481,6 +504,20 @@ models:
         // endpoint override wins over the preset default
         let gem = cfg.accounts.iter().find(|a| a.name == "gemini").unwrap();
         assert_eq!(gem.endpoint, "https://gw.example.com");
+    }
+
+    #[test]
+    fn duplicate_names_are_rejected() {
+        let yaml = r#"
+listen: {host: h, port: 1}
+models:
+  - {name: dup, protocol: openai-chat}
+  - {name: dup, protocol: openai-chat}
+"#;
+        assert!(matches!(
+            GatewayConfig::from_yaml(yaml),
+            Err(ConfigError::DuplicateName { kind: "model", .. })
+        ));
     }
 
     #[test]

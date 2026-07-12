@@ -40,6 +40,12 @@ impl GatewayError {
         Self::new(ErrCode::REQ_PARAM, 400, message)
     }
 
+    /// Client went away mid-stream. Status 499 stays below the 5xx failover
+    /// threshold so a disconnect never re-bills or faults the account.
+    pub fn client_closed(message: impl Into<String>) -> Self {
+        Self::new(ErrCode::SYSTEM_ERROR, 499, message)
+    }
+
     /// Attach an underlying cause.
     pub fn with_source(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Self {
         self.source = Some(Box::new(source));

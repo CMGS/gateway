@@ -238,3 +238,94 @@ async fn per_account_policy_and_connect_retry() {
         started.elapsed()
     );
 }
+
+/// A client that disconnects mid-stream must surface as 499 (below the 5xx
+/// failover threshold) so the DAG never re-bills or faults the account.
+#[tokio::test]
+async fn client_disconnect_midstream_is_499_not_500() {
+    use ap_engines::transport::UpstreamResponse;
+    use futures::StreamExt;
+
+    #[derive(Debug)]
+    struct StreamTransport;
+    #[async_trait::async_trait]
+    impl Transport for StreamTransport {
+        async fn send(&self, _req: UpstreamRequest) -> ap_models::GResult<UpstreamResponse> {
+            let frames = vec![
+                Ok(bytes::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                )),
+                Ok(bytes::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n",
+                )),
+            ];
+            Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::SseStream(futures::stream::iter(frames).boxed()),
+            })
+        }
+    }
+
+    // a stream_tx whose receiver is dropped immediately = a gone client
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    drop(rx);
+    let mut request = GatewayRequest {
+        message: vec![ChatMsg::text("user", "hi")],
+        model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt")),
+        stream: true,
+        ..Default::default()
+    };
+    request.stream_tx = Some(tx);
+
+    let err = OpenAiEngine::new(request, Arc::new(StreamTransport))
+        .run()
+        .await
+        .unwrap_err();
+    assert_eq!(err.http_status, 499, "disconnect must not look like a 5xx");
+}
+
+/// An upstream error AFTER the first chunk reached the client must also be 499
+/// (terminal) so failover never splices a second generation into the stream.
+#[tokio::test]
+async fn midstream_upstream_error_after_send_is_499() {
+    use ap_engines::transport::UpstreamResponse;
+    use futures::StreamExt;
+
+    #[derive(Debug)]
+    struct FlakyStream;
+    #[async_trait::async_trait]
+    impl Transport for FlakyStream {
+        async fn send(&self, _req: UpstreamRequest) -> ap_models::GResult<UpstreamResponse> {
+            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+                Ok(bytes::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                )),
+                Err("connection reset".to_string()),
+            ];
+            Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::SseStream(futures::stream::iter(frames).boxed()),
+            })
+        }
+    }
+
+    // a live receiver that stays open (client still connected)
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let mut request = GatewayRequest {
+        message: vec![ChatMsg::text("user", "hi")],
+        model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt")),
+        stream: true,
+        ..Default::default()
+    };
+    request.stream_tx = Some(tx);
+
+    let err = OpenAiEngine::new(request, Arc::new(FlakyStream))
+        .run()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.http_status, 499,
+        "post-send upstream error must not failover"
+    );
+}
