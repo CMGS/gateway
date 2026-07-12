@@ -42,10 +42,13 @@ open-source impl now, alternatives pluggable":
       models take a `provider:` shorthand
 - [ ] Full config-driven provider + model catalog replacing the hardcoded
       `ModelType` enum
-- [ ] Real HTTP integration per provider, verified against recorded live
-      fixtures (replayable offline)
-- [ ] Streaming fidelity per provider: SSE frame alignment, usage
-      accounting on streamed responses
+- [x] OpenAI-protocol path verified live against an OpenAI-compatible
+      upstream: non-stream + streaming SSE + streamed-usage billing all
+      confirmed end to end (provider preset + `endpoint:` override)
+- [ ] Anthropic / Gemini live verification (pending credentials); recorded
+      live fixtures replayable offline
+- [ ] Streaming fidelity hardening per provider: SSE frame alignment
+      across vendors
 - [ ] Provider auth: bearer (OpenAI), x-api-key + anthropic-version
       (Anthropic), OAuth/API key (Gemini)
 - [ ] Long-tail OpenAI-compatible vendors served by a generic
