@@ -34,6 +34,10 @@ client ──► views (auth, parse, protocol normalize)
        ──► handler (post plugins) ──► views (JSON or SSE re-emit)
 ```
 
+Client disconnects cancel by drop: axum drops the in-flight handler
+future, which aborts the upstream reqwest call. Spawned background work
+(offline batches) deliberately outlives the submitting request.
+
 The DAG executes four fixed layers; nodes within a layer are
 topologically ordered by declared dependencies. `account_select` and
 `model_access` form a retry loop: an upstream 5xx excludes the failed

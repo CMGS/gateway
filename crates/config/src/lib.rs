@@ -96,6 +96,13 @@ pub struct AccountConf {
     /// by this name at request time.
     #[serde(default)]
     pub api_key_env: String,
+    /// Upstream request timeout (seconds); unset = 60.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    /// Connect-phase retries before giving up; unset = 1. A request that
+    /// reached the vendor is never replayed.
+    #[serde(default)]
+    pub connect_retries: Option<u32>,
     /// AWS SigV4 accounts: env var name holding the secret access key (paired with
     /// api_key_env = access key). Leave empty for non-AWS providers.
     #[serde(default)]
@@ -176,6 +183,12 @@ pub struct ProviderConf {
     /// Override the preset base URL (e.g. an OpenAI-compatible vendor).
     #[serde(default)]
     pub endpoint: String,
+    /// Upstream request timeout (seconds); unset = 60.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    /// Connect-phase retries; unset = 1.
+    #[serde(default)]
+    pub connect_retries: Option<u32>,
 }
 
 struct ProviderPreset {
@@ -288,6 +301,8 @@ impl GatewayConfig {
                 provider: p.name.clone(),
                 priority: 1,
                 tier: String::new(),
+                timeout_seconds: p.timeout_seconds,
+                connect_retries: p.connect_retries,
                 endpoint: if p.endpoint.is_empty() {
                     preset.endpoint.to_owned()
                 } else {

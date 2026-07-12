@@ -58,10 +58,15 @@ open-source impl now, alternatives pluggable":
 
 ## M3 — Streaming and resilience hardening
 
-- [ ] SSE passthrough fidelity under real network conditions
-- [ ] Client cancellation propagates to upstream; backpressure
-- [ ] Per-provider timeout/retry policy; circuit breaking on account
-      cooldown
+- [x] Per-account timeout + connect-phase retry policy
+      (`timeout_seconds`/`connect_retries` on accounts and provider
+      presets; a request that reached the vendor is never replayed)
+- [x] Client cancellation propagates to the upstream by drop: axum drops
+      the handler future on disconnect, aborting the reqwest call
+- [x] Circuit breaking via account cooldown (consecutive failures →
+      cooldown → auto-recovery)
+- [ ] Incremental SSE forwarding (upstream frames are still buffered
+      before re-emission) and backpressure
 
 ## M4 — Observability
 

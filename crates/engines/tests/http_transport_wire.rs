@@ -193,3 +193,48 @@ async fn engine_through_real_http_transport_end_to_end() {
     assert_eq!(out.response.message, "srv:over the wire");
     assert_eq!(out.response.total_tokens, 7);
 }
+
+#[tokio::test]
+async fn per_account_policy_and_connect_retry() {
+    use std::collections::HashMap;
+
+    use ap_engines::http_transport::UpstreamPolicy;
+
+    let mut per_account = HashMap::new();
+    per_account.insert(
+        "tight".to_owned(),
+        UpstreamPolicy {
+            timeout: Duration::from_secs(5),
+            connect_retries: 2,
+        },
+    );
+    let transport = HttpTransport::with_policies(UpstreamPolicy::default(), per_account).unwrap();
+    assert_eq!(transport.policy_for("tight").connect_retries, 2);
+    assert_eq!(transport.policy_for("other").connect_retries, 1);
+
+    // grab a port and close it: connect must fail, retry twice (100+200ms
+    // backoff), then surface a 502 — an in-flight request is never replayed.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let started = std::time::Instant::now();
+    let err = transport
+        .send(UpstreamRequest {
+            protocol: Protocol::OpenaiChat,
+            method: "POST".into(),
+            url: format!("http://{closed}/v1/chat/completions"),
+            headers: vec![],
+            body: b"{}".to_vec(),
+            stream: false,
+            account: "tight".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.http_status, 502);
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "two backoffs must have elapsed: {:?}",
+        started.elapsed()
+    );
+}

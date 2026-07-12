@@ -78,6 +78,8 @@ accounts:
     tier: ptu                  # ptu (provisioned, preferred) | paygo (default)
     protocols: ["openai-chat", "embeddings"]
     endpoint: ""               # empty → mock transport; real base URL → real upstream
+    timeout_seconds: 60        # upstream request timeout (default 60)
+    connect_retries: 1         # connect-phase retries; an in-flight request is never replayed
     api_key_env: ""            # env var name holding the API key (never the key itself)
     secret_key_env: ""         # AWS only: env var of the secret key (api_key_env = access key id)
 ```

@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     // Local background task: AK daily quota reset
     let quota_task = ap_task::spawn_quota_reset(state.clone(), ap_task::DAILY);
 
-    let transport = select_transport()?;
+    let transport = select_transport(&cfg)?;
     let app_state = AppState::new(cfg, state, transport);
 
     let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
@@ -88,8 +88,26 @@ async fn main() -> anyhow::Result<()> {
 /// Choose the upstream transport from `AP_TRANSPORT`: `mock` forces zero egress,
 /// `http` forces real HTTP (accounts without an endpoint fail loudly), anything
 /// else routes `mock://` sentinels in-process and real URLs over HTTP.
-fn select_transport() -> anyhow::Result<ap_engines::SharedTransport> {
-    let timeout = std::time::Duration::from_secs(60);
+fn select_transport(cfg: &GatewayConfig) -> anyhow::Result<ap_engines::SharedTransport> {
+    use ap_engines::http_transport::UpstreamPolicy;
+    let default_policy = UpstreamPolicy::default();
+    let per_account: std::collections::HashMap<String, UpstreamPolicy> = cfg
+        .accounts
+        .iter()
+        .filter(|a| a.timeout_seconds.is_some() || a.connect_retries.is_some())
+        .map(|a| {
+            (
+                a.name.clone(),
+                UpstreamPolicy {
+                    timeout: a
+                        .timeout_seconds
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or(default_policy.timeout),
+                    connect_retries: a.connect_retries.unwrap_or(default_policy.connect_retries),
+                },
+            )
+        })
+        .collect();
     Ok(match env::var("AP_TRANSPORT").as_deref() {
         Ok("mock") => {
             tracing::info!("transport = mock (zero egress)");
@@ -97,11 +115,19 @@ fn select_transport() -> anyhow::Result<ap_engines::SharedTransport> {
         }
         Ok("http") => {
             tracing::info!("transport = http (accounts without an endpoint fail)");
-            std::sync::Arc::new(ap_engines::http_transport::HttpTransport::new(timeout)?)
+            std::sync::Arc::new(ap_engines::http_transport::HttpTransport::with_policies(
+                default_policy,
+                per_account,
+            )?)
         }
         _ => {
             tracing::info!("transport = auto (mock:// in-process, real URLs over HTTP)");
-            std::sync::Arc::new(ap_engines::http_transport::DispatchTransport::new(timeout)?)
+            std::sync::Arc::new(
+                ap_engines::http_transport::DispatchTransport::with_policies(
+                    default_policy,
+                    per_account,
+                )?,
+            )
         }
     })
 }

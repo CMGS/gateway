@@ -16,6 +16,9 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
+metrics = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
