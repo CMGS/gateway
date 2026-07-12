@@ -22,5 +22,6 @@ pub use recorder::{Block, Recorder, SimpleRecorder, TimingRecorder};
 pub use request::domain::{Account, ChatMsg, ProductConf, ReqExtraParam, UserConf};
 pub use request::{GatewayRequest, ModelParamV2};
 pub use response::GatewayResponse;
+pub use response::StreamChunk;
 pub use token_estimate::{HeuristicEncoder, TokenEncoder, estimate_prompt_tokens};
 pub use usage::CommonUsage;

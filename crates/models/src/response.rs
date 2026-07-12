@@ -105,3 +105,14 @@ mod tests {
         assert!(j.get("step").is_none());
     }
 }
+
+/// One streamed response fragment, forwarded to the client as it arrives.
+#[derive(Debug, Default, Clone)]
+pub struct StreamChunk {
+    pub delta: String,
+    pub finish_reason: Option<String>,
+    /// final (prompt, completion, total) token counts; sent once at stream end.
+    pub usage_totals: Option<(i64, i64, i64)>,
+    /// set when the pipeline failed mid-stream; views emit it as an error frame.
+    pub error: Option<String>,
+}

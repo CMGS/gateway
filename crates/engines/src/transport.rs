@@ -25,19 +25,51 @@ pub struct UpstreamRequest {
     pub account: String,
 }
 
-/// Body of an upstream response: buffered JSON or buffered SSE bytes.
-/// (True incremental streaming is future work; the SSE bytes still exercise
-/// the real `SseDecoder` end to end.)
-#[derive(Debug, Clone)]
+/// Body of an upstream response: buffered JSON, buffered SSE bytes, or live
+/// SSE bytes yielded as the vendor sends them.
 pub enum UpstreamBody {
     Json(Vec<u8>),
     Sse(Vec<u8>),
+    SseStream(futures::stream::BoxStream<'static, Result<bytes::Bytes, String>>),
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for UpstreamBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpstreamBody::Json(b) => f.debug_tuple("Json").field(&b.len()).finish(),
+            UpstreamBody::Sse(b) => f.debug_tuple("Sse").field(&b.len()).finish(),
+            UpstreamBody::SseStream(_) => f.write_str("SseStream(..)"),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct UpstreamResponse {
     pub status: u16,
     pub body: UpstreamBody,
+}
+
+impl UpstreamResponse {
+    /// Drain a live SSE stream into buffered bytes; Json/Sse pass through.
+    /// Engines that don't forward incrementally call this once up front.
+    pub async fn buffered(mut self) -> GResult<Self> {
+        if let UpstreamBody::SseStream(mut s) = self.body {
+            use futures::StreamExt;
+            let mut buf = Vec::new();
+            while let Some(item) = s.next().await {
+                let bytes = item.map_err(|e| {
+                    GatewayError::new(
+                        ap_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        502,
+                        format!("upstream stream failed: {e}"),
+                    )
+                })?;
+                buf.extend_from_slice(&bytes);
+            }
+            self.body = UpstreamBody::Sse(buf);
+        }
+        Ok(self)
+    }
 }
 
 #[async_trait::async_trait]

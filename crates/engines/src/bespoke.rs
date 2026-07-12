@@ -119,10 +119,12 @@ impl Base {
             stream: false,
             account: self.account(),
         };
-        let reply = self.transport.send(up).await?;
+        let reply = self.transport.send(up).await?.buffered().await?;
         let bytes = match &reply.body {
             UpstreamBody::Json(b) => b,
-            UpstreamBody::Sse(_) => return Err(GatewayError::internal("unexpected sse body")),
+            UpstreamBody::Sse(_) | UpstreamBody::SseStream(_) => {
+                return Err(GatewayError::internal("unexpected sse body"));
+            }
         };
         let v: Value = serde_json::from_slice(bytes)
             .map_err(|e| GatewayError::internal("parse vendor response").with_source(e))?;

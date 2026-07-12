@@ -67,7 +67,7 @@ impl OnlineHandler {
                 response,
                 http_code: 200,
                 block,
-                chunks: vec![],
+                ..Default::default()
             });
             return Ok(ctx);
         }

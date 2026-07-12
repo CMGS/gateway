@@ -65,8 +65,10 @@ open-source impl now, alternatives pluggable":
       the handler future on disconnect, aborting the reqwest call
 - [x] Circuit breaking via account cooldown (consecutive failures →
       cooldown → auto-recovery)
-- [ ] Incremental SSE forwarding (upstream frames are still buffered
-      before re-emission) and backpressure
+- [x] Incremental SSE forwarding: upstream frames flow through a bounded
+      channel to the client as they arrive (openai-chat surface; verified
+      live — 31 frames spread over 0.44s vs a single flush before); the
+      channel bound is the backpressure seam
 
 ## M4 — Observability
 

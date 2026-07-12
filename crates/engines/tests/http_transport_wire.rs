@@ -84,9 +84,8 @@ async fn http_transport_json_over_real_socket() {
     };
     let resp = transport.send(req).await.expect("real http round trip");
     assert_eq!(resp.status, 200);
-    let bytes = match resp.body {
-        UpstreamBody::Json(b) => b,
-        UpstreamBody::Sse(_) => panic!("expected json"),
+    let UpstreamBody::Json(bytes) = resp.body else {
+        panic!("expected json")
     };
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["choices"][0]["message"]["content"], "srv:wire");
@@ -109,14 +108,15 @@ async fn http_transport_sse_over_real_socket() {
     };
     let resp = transport.send(req).await.expect("real http round trip");
     assert_eq!(resp.status, 200);
-    match resp.body {
-        UpstreamBody::Sse(b) => {
-            let text = String::from_utf8(b).unwrap();
-            assert!(text.contains("data: "));
-            assert!(text.contains("[DONE]"));
-        }
-        UpstreamBody::Json(_) => panic!("expected sse (content-type text/event-stream)"),
-    }
+    // live SSE arrives as a stream now; buffering it exercises the drain path
+    assert!(matches!(resp.body, UpstreamBody::SseStream(_)));
+    let resp = resp.buffered().await.expect("drain live sse");
+    let UpstreamBody::Sse(b) = resp.body else {
+        panic!("expected buffered sse")
+    };
+    let text = String::from_utf8(b).unwrap();
+    assert!(text.contains("data: "));
+    assert!(text.contains("[DONE]"));
 }
 
 #[tokio::test]

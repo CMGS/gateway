@@ -18,6 +18,7 @@ hex = { workspace = true }
 reqwest = { workspace = true }
 metrics = { workspace = true }
 bytes = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

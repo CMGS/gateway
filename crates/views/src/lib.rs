@@ -52,6 +52,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 
 const LEDGER_PAGE_DEFAULT: usize = 100;
+const STREAM_CHANNEL_CAP: usize = 64;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -491,6 +492,11 @@ async fn chat_completions(
         ..Default::default()
     };
 
+    if body.stream {
+        let model = body.model.clone();
+        return chat_stream_response(s, request, ak, model, started).into_response();
+    }
+
     let ctx = match s.handler.run(request, ak).await {
         Ok(ctx) => ctx,
         Err(e) => return gateway_error(e),
@@ -507,53 +513,6 @@ async fn chat_completions(
         completion_tokens: outcome.response.completion_tokens,
         total_tokens: outcome.response.total_tokens,
     };
-
-    if body.stream {
-        // buffered upstream chunks re-emitted as OpenAI SSE
-        let model = outcome.response.model.clone();
-        // engines that don't natively stream (Vertex/family/bespoke) return a full
-        // response with empty chunks — synthesize one content chunk + finish so the
-        // client still gets the content instead of an empty stream.
-        let synthesized;
-        let chunks: &[ap_engines::StreamChunk] =
-            if outcome.chunks.is_empty() && !outcome.response.message.is_empty() {
-                synthesized = vec![
-                    ap_engines::StreamChunk {
-                        delta: outcome.response.message.clone(),
-                        finish_reason: None,
-                    },
-                    ap_engines::StreamChunk {
-                        delta: String::new(),
-                        finish_reason: Some(if outcome.response.finish_reason.is_empty() {
-                            "stop".to_owned()
-                        } else {
-                            outcome.response.finish_reason.clone()
-                        }),
-                    },
-                ];
-                &synthesized
-            } else {
-                &outcome.chunks
-            };
-        let mut events: Vec<Event> = Vec::with_capacity(chunks.len() + 2);
-        for c in chunks {
-            let chunk = if let Some(fr) = &c.finish_reason {
-                let mut fin =
-                    ChatCompletionChunk::finish(&id, created, &model, Some(usage.clone()));
-                fin.choices[0].finish_reason = Some(fr.clone());
-                fin
-            } else {
-                ChatCompletionChunk::content(&id, created, &model, c.delta.clone())
-            };
-            match serde_json::to_string(&chunk) {
-                Ok(payload) => events.push(Event::default().data(payload)),
-                Err(e) => return error_response(500, format!("encode chunk: {e}")),
-            }
-        }
-        events.push(Event::default().data("[DONE]"));
-        let stream = futures::stream::iter(events.into_iter().map(Ok::<_, Infallible>));
-        return Sse::new(stream).into_response();
-    }
 
     // tool_calls response: content=null + finish_reason=tool_calls (OpenAI semantics)
     if let Some(tc) = &outcome.response.tool_calls {
@@ -578,6 +537,162 @@ async fn chat_completions(
         usage,
     );
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// Streaming chat: the pipeline runs on its own task and forwards chunks
+/// through a bounded channel — the backpressure seam — while this response
+/// re-emits them as OpenAI SSE. Engines without live streaming yield their
+/// buffered chunks after the run; billing stays in the pipeline tail either way.
+fn chat_stream_response(
+    s: AppState,
+    mut request: GatewayRequest,
+    ak: AkInfo,
+    model: String,
+    started: Instant,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<ap_engines::StreamChunk>(STREAM_CHANNEL_CAP);
+    request.stream_tx = Some(tx.clone());
+    let handler = s.handler.clone();
+    tokio::spawn(async move {
+        match handler.run(request, ak).await {
+            Ok(ctx) => {
+                log_access("chat_completions", &ctx, started);
+                if let Some(outcome) = &ctx.outcome {
+                    let mut tail = if outcome.streamed_live {
+                        Vec::new()
+                    } else {
+                        synth_chunks(outcome)
+                    };
+                    tail.push(ap_engines::StreamChunk {
+                        usage_totals: Some((
+                            outcome.response.prompt_tokens,
+                            outcome.response.completion_tokens,
+                            outcome.response.total_tokens,
+                        )),
+                        ..Default::default()
+                    });
+                    for c in tail {
+                        if tx.send(c).await.is_err() {
+                            break; // client went away; billing already happened
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(ap_engines::StreamChunk {
+                        error: Some(e.to_string()),
+                        ..Default::default()
+                    })
+                    .await;
+            }
+        }
+    });
+
+    struct St {
+        rx: tokio::sync::mpsc::Receiver<ap_engines::StreamChunk>,
+        queue: std::collections::VecDeque<Event>,
+        id: String,
+        created: i64,
+        model: String,
+        pending_finish: Option<String>,
+        ended: bool,
+    }
+    let st = St {
+        rx,
+        queue: std::collections::VecDeque::new(),
+        id: next_id("chatcmpl"),
+        created: chrono_now(),
+        model,
+        pending_finish: None,
+        ended: false,
+    };
+    let stream = futures::stream::unfold(st, |mut st| async move {
+        loop {
+            if let Some(ev) = st.queue.pop_front() {
+                return Some((Ok::<_, Infallible>(ev), st));
+            }
+            if st.ended {
+                return None;
+            }
+            match st.rx.recv().await {
+                Some(c) if c.error.is_some() => {
+                    let msg = c.error.unwrap_or_default();
+                    st.queue.push_back(Event::default().data(
+                        json!({"error": {"message": msg, "type": "gateway_error"}}).to_string(),
+                    ));
+                    st.queue.push_back(Event::default().data("[DONE]"));
+                    st.ended = true;
+                }
+                Some(c) => {
+                    if !c.delta.is_empty() {
+                        let chunk = ChatCompletionChunk::content(
+                            &st.id,
+                            st.created,
+                            &st.model,
+                            c.delta.clone(),
+                        );
+                        if let Ok(payload) = serde_json::to_string(&chunk) {
+                            st.queue.push_back(Event::default().data(payload));
+                        }
+                    }
+                    if let Some(fr) = c.finish_reason {
+                        // held back until usage arrives so the final frame carries both
+                        st.pending_finish = Some(fr);
+                    }
+                    if let Some((pt, ct, tt)) = c.usage_totals {
+                        let usage = Usage {
+                            prompt_tokens: pt,
+                            completion_tokens: ct,
+                            total_tokens: tt,
+                        };
+                        let mut fin =
+                            ChatCompletionChunk::finish(&st.id, st.created, &st.model, Some(usage));
+                        fin.choices[0].finish_reason = Some(
+                            st.pending_finish
+                                .take()
+                                .unwrap_or_else(|| "stop".to_owned()),
+                        );
+                        if let Ok(payload) = serde_json::to_string(&fin) {
+                            st.queue.push_back(Event::default().data(payload));
+                        }
+                        st.queue.push_back(Event::default().data("[DONE]"));
+                        st.ended = true;
+                    }
+                }
+                None => {
+                    // producer gone without a usage chunk — close the stream cleanly
+                    st.queue.push_back(Event::default().data("[DONE]"));
+                    st.ended = true;
+                }
+            }
+        }
+    });
+    Sse::new(stream)
+}
+
+/// Chunks for engines that returned a buffered response: the full message as
+/// one delta plus a finish marker.
+fn synth_chunks(outcome: &ap_engines::EngineOutcome) -> Vec<ap_engines::StreamChunk> {
+    let mut chunks = if outcome.chunks.is_empty() && !outcome.response.message.is_empty() {
+        vec![ap_engines::StreamChunk {
+            delta: outcome.response.message.clone(),
+            ..Default::default()
+        }]
+    } else {
+        outcome.chunks.clone()
+    };
+    if !chunks.iter().any(|c| c.finish_reason.is_some()) {
+        chunks.push(ap_engines::StreamChunk {
+            finish_reason: Some(if outcome.response.finish_reason.is_empty() {
+                "stop".to_owned()
+            } else {
+                outcome.response.finish_reason.clone()
+            }),
+            ..Default::default()
+        });
+    }
+    chunks
 }
 
 /// POST /v1/messages (Anthropic-compatible surface, stream + non-stream)

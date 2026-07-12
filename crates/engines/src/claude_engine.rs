@@ -208,6 +208,7 @@ impl ClaudeEngine {
                         chunks.push(StreamChunk {
                             delta: t.to_owned(),
                             finish_reason: None,
+                            ..Default::default()
                         });
                     }
                 }
@@ -217,6 +218,7 @@ impl ClaudeEngine {
                         chunks.push(StreamChunk {
                             delta: String::new(),
                             finish_reason: Some(sr.to_owned()),
+                            ..Default::default()
                         });
                     }
                     output = v["usage"]["output_tokens"].as_i64().unwrap_or(output);
@@ -244,10 +246,14 @@ impl ClaudeEngine {
 impl ModelEngine for ClaudeEngine {
     async fn run(&self) -> GResult<EngineOutcome> {
         let up = self.build_upstream()?;
-        let reply = self.transport.send(up).await?;
+        let reply = self.transport.send(up).await?.buffered().await?;
         match &reply.body {
             UpstreamBody::Json(b) => self.parse_json(reply.status, b),
             UpstreamBody::Sse(b) => self.parse_sse(reply.status, b),
+            // buffered() above drained any live stream
+            UpstreamBody::SseStream(_) => Err(GatewayError::internal(
+                "unbuffered stream reached claude engine",
+            )),
         }
     }
 

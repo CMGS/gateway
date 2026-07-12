@@ -37,7 +37,7 @@ futures = "0.3"
 axum = { version = "0.8", features = ["ws"] } # ws: the /v1/realtime session surface
 tower = "0.5"
 # OPTIONAL, behind engines' `http` feature; default builds have zero egress.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 # --- serde ---
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

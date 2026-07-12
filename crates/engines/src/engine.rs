@@ -45,9 +45,11 @@ pub struct EngineOutcome {
     pub http_code: u16,
     /// content-safety verdict.
     pub block: Block,
-    /// decoded stream chunks when the request was streaming (buffered for now;
-    /// true incremental forwarding is future work).
+    /// decoded stream chunks when the request was streaming and no live
+    /// channel was attached (chunks were already forwarded otherwise).
     pub chunks: Vec<StreamChunk>,
+    /// chunks were forwarded through the request's `stream_tx` as they arrived.
+    pub streamed_live: bool,
 }
 
 impl EngineOutcome {
@@ -58,6 +60,7 @@ impl EngineOutcome {
             http_code: 200,
             block: Block::allow(),
             chunks: Vec::new(),
+            streamed_live: false,
         }
     }
 }
@@ -77,9 +80,4 @@ pub trait ModelEngine: Send + Sync {
     fn recorder(&self) -> &dyn Recorder;
 }
 
-/// Streaming engines additionally yield chunks.
-#[derive(Debug, Clone, Default)]
-pub struct StreamChunk {
-    pub delta: String,
-    pub finish_reason: Option<String>,
-}
+pub use ap_models::StreamChunk;

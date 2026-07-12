@@ -33,6 +33,10 @@ pub struct GatewayRequest {
     /// metrics tags to attach.
     pub metrics_map: HashMap<String, String>,
     pub realtime_params: RealtimeParam,
+    /// When set, a streaming-capable engine forwards chunks here as they
+    /// arrive from the vendor instead of buffering; the bounded channel is
+    /// the backpressure seam.
+    pub stream_tx: Option<tokio::sync::mpsc::Sender<crate::StreamChunk>>,
 }
 
 impl GatewayRequest {

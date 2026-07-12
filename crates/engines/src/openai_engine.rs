@@ -191,36 +191,7 @@ impl OpenAiEngine {
         for ev in events {
             let v: Value = serde_json::from_slice(ev.as_bytes())
                 .map_err(|e| GatewayError::internal("parse openai sse frame").with_source(e))?;
-            // mid-stream error frame → surface it
-            if let Some(err) = crate::engine::vendor_error(status, &v) {
-                return Err(err);
-            }
-            if resp.model.is_empty() {
-                resp.model = v["model"].as_str().unwrap_or_default().to_owned();
-            }
-            let delta = &v["choices"][0]["delta"];
-            if let Some(text) = delta["content"].as_str()
-                && !text.is_empty()
-            {
-                full.push_str(text);
-                chunks.push(StreamChunk {
-                    delta: text.to_owned(),
-                    finish_reason: None,
-                });
-            }
-            if let Some(tc) = delta.get("tool_calls").filter(|t| !t.is_null()) {
-                resp.tool_calls = Some(tc.clone());
-            }
-            if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
-                resp.finish_reason = fr.to_owned();
-                chunks.push(StreamChunk {
-                    delta: String::new(),
-                    finish_reason: Some(fr.to_owned()),
-                });
-            }
-            if v.get("usage").map(|u| !u.is_null()).unwrap_or(false) {
-                apply_openai_usage(&mut resp, &v["usage"]);
-            }
+            chunks.extend(apply_sse_event(&v, status, &mut resp, &mut full)?);
         }
         resp.message = full;
         Ok(EngineOutcome {
@@ -230,6 +201,101 @@ impl OpenAiEngine {
             ..Default::default()
         })
     }
+
+    /// Incremental variant of `parse_sse`: frames are decoded as vendor bytes
+    /// arrive and forwarded through `stream_tx` when the request carries one.
+    async fn pump_sse(
+        &self,
+        status: u16,
+        mut s: futures::stream::BoxStream<'static, Result<bytes::Bytes, String>>,
+    ) -> GResult<EngineOutcome> {
+        use futures::StreamExt;
+        let tx = self.request.stream_tx.clone();
+        let mut dec = SseDecoder::default();
+        let mut chunks = Vec::new();
+        let mut full = String::new();
+        let mut resp = GatewayResponse {
+            http_code: status as i64,
+            ..Default::default()
+        };
+        while let Some(item) = s.next().await {
+            let bytes = item.map_err(|e| {
+                GatewayError::new(
+                    ap_consts::ErrCode::FED_RESP_RPC_FAILED,
+                    502,
+                    format!("upstream stream failed: {e}"),
+                )
+            })?;
+            for data in dec.feed(&bytes) {
+                let v: Value = serde_json::from_str(&data)
+                    .map_err(|e| GatewayError::internal("parse openai sse frame").with_source(e))?;
+                for chunk in apply_sse_event(&v, status, &mut resp, &mut full)? {
+                    match &tx {
+                        Some(tx) => tx
+                            .send(chunk)
+                            .await
+                            .map_err(|_| GatewayError::internal("client stream closed"))?,
+                        None => chunks.push(chunk),
+                    }
+                }
+            }
+            if dec.is_done() {
+                break;
+            }
+        }
+        resp.message = full;
+        Ok(EngineOutcome {
+            response: resp,
+            http_code: status,
+            chunks,
+            streamed_live: tx.is_some(),
+            ..Default::default()
+        })
+    }
+}
+
+/// Apply one decoded SSE event to the accumulating response; returns the
+/// chunks the event yields.
+fn apply_sse_event(
+    v: &Value,
+    status: u16,
+    resp: &mut GatewayResponse,
+    full: &mut String,
+) -> GResult<Vec<StreamChunk>> {
+    // mid-stream error frame → surface it
+    if let Some(err) = crate::engine::vendor_error(status, v) {
+        return Err(err);
+    }
+    let mut chunks = Vec::new();
+    if resp.model.is_empty() {
+        resp.model = v["model"].as_str().unwrap_or_default().to_owned();
+    }
+    let delta = &v["choices"][0]["delta"];
+    if let Some(text) = delta["content"].as_str()
+        && !text.is_empty()
+    {
+        full.push_str(text);
+        chunks.push(StreamChunk {
+            delta: text.to_owned(),
+            finish_reason: None,
+            ..Default::default()
+        });
+    }
+    if let Some(tc) = delta.get("tool_calls").filter(|t| !t.is_null()) {
+        resp.tool_calls = Some(tc.clone());
+    }
+    if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
+        resp.finish_reason = fr.to_owned();
+        chunks.push(StreamChunk {
+            delta: String::new(),
+            finish_reason: Some(fr.to_owned()),
+            ..Default::default()
+        });
+    }
+    if v.get("usage").map(|u| !u.is_null()).unwrap_or(false) {
+        apply_openai_usage(resp, &v["usage"]);
+    }
+    Ok(chunks)
 }
 
 /// Copy token fields + keep the raw usage subtree bytes for the DAG node.
@@ -247,11 +313,11 @@ fn apply_openai_usage(resp: &mut GatewayResponse, usage: &Value) {
 impl ModelEngine for OpenAiEngine {
     async fn run(&self) -> GResult<EngineOutcome> {
         let up = self.build_upstream()?;
-        let stream = up.stream;
         let reply = self.transport.send(up).await?;
-        match (&reply.body, stream) {
-            (UpstreamBody::Sse(bytes), _) => self.parse_sse(reply.status, bytes),
-            (UpstreamBody::Json(bytes), _) => self.parse_json(reply.status, bytes),
+        match reply.body {
+            UpstreamBody::Sse(bytes) => self.parse_sse(reply.status, &bytes),
+            UpstreamBody::Json(bytes) => self.parse_json(reply.status, &bytes),
+            UpstreamBody::SseStream(s) => self.pump_sse(reply.status, s).await,
         }
     }
 

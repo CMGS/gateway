@@ -19,7 +19,8 @@ use async_trait::async_trait;
 #[derive(Debug)]
 struct FixtureTransport {
     status: u16,
-    body: UpstreamBody,
+    sse: bool,
+    bytes: Vec<u8>,
 }
 
 #[async_trait]
@@ -27,9 +28,10 @@ impl Transport for FixtureTransport {
     async fn send(&self, _req: UpstreamRequest) -> GResult<UpstreamResponse> {
         Ok(UpstreamResponse {
             status: self.status,
-            body: match &self.body {
-                UpstreamBody::Json(b) => UpstreamBody::Json(b.clone()),
-                UpstreamBody::Sse(b) => UpstreamBody::Sse(b.clone()),
+            body: if self.sse {
+                UpstreamBody::Sse(self.bytes.clone())
+            } else {
+                UpstreamBody::Json(self.bytes.clone())
             },
         })
     }
@@ -50,7 +52,8 @@ const GO_OPENAI_CHAT: &str = r#"{"id":"chatcmpl-test","object":"chat.completion"
 async fn openai_chat_matches_go_recorded_response() {
     let transport = Arc::new(FixtureTransport {
         status: 200,
-        body: UpstreamBody::Json(GO_OPENAI_CHAT.as_bytes().to_vec()),
+        sse: false,
+        bytes: GO_OPENAI_CHAT.as_bytes().to_vec(),
     });
     let out = OpenAiEngine::new(openai_req(), transport)
         .run()
@@ -126,7 +129,8 @@ fn claude_req() -> GatewayRequest {
 async fn run_claude(fixture: &str) -> GResult<ap_engines::EngineOutcome> {
     let transport = Arc::new(FixtureTransport {
         status: 200,
-        body: UpstreamBody::Json(fixture.as_bytes().to_vec()),
+        sse: false,
+        bytes: fixture.as_bytes().to_vec(),
     });
     ClaudeEngine::new(claude_req(), transport).run().await
 }
@@ -201,7 +205,8 @@ async fn family_and_bespoke_engines_surface_errors() {
         },
         Arc::new(FixtureTransport {
             status: 200,
-            body: UpstreamBody::Json(err_body.as_bytes().to_vec()),
+            sse: false,
+            bytes: err_body.as_bytes().to_vec(),
         }),
     );
     assert_eq!(expect_err(v).await, 429);
@@ -215,7 +220,8 @@ async fn family_and_bespoke_engines_surface_errors() {
         },
         Arc::new(FixtureTransport {
             status: 200,
-            body: UpstreamBody::Json(err_body.as_bytes().to_vec()),
+            sse: false,
+            bytes: err_body.as_bytes().to_vec(),
         }),
     );
     assert_eq!(expect_err(e).await, 429);
@@ -235,7 +241,8 @@ async fn family_and_bespoke_engines_surface_errors() {
         },
         Arc::new(FixtureTransport {
             status: 200,
-            body: UpstreamBody::Json(err_body.as_bytes().to_vec()),
+            sse: false,
+            bytes: err_body.as_bytes().to_vec(),
         }),
     );
     assert_eq!(expect_err(em).await, 429);
@@ -250,7 +257,8 @@ async fn openai_stream_error_frame_surfaces() {
         openai_req_stream(),
         Arc::new(FixtureTransport {
             status: 200,
-            body: UpstreamBody::Sse(sse.as_bytes().to_vec()),
+            sse: true,
+            bytes: sse.as_bytes().to_vec(),
         }),
     )
     .run()
@@ -268,7 +276,8 @@ async fn openai_stream_error_with_http_code_maps_status() {
         openai_req_stream(),
         Arc::new(FixtureTransport {
             status: 200,
-            body: UpstreamBody::Sse(sse.as_bytes().to_vec()),
+            sse: true,
+            bytes: sse.as_bytes().to_vec(),
         }),
     )
     .run()
@@ -296,7 +305,8 @@ async fn openai_error_envelope_surfaces() {
     let fixture = r#"{"error":{"type":"rate_limit","code":"429","message":"too many requests"}}"#;
     let transport = Arc::new(FixtureTransport {
         status: 200, // vendor 200 body but error envelope → status from error.code
-        body: UpstreamBody::Json(fixture.as_bytes().to_vec()),
+        sse: false,
+        bytes: fixture.as_bytes().to_vec(),
     });
     let err = OpenAiEngine::new(openai_req(), transport)
         .run()
@@ -315,7 +325,8 @@ async fn anthropic_error_envelope_surfaces() {
         claude_req(),
         Arc::new(FixtureTransport {
             status: 200,
-            body: UpstreamBody::Json(fixture.as_bytes().to_vec()),
+            sse: false,
+            bytes: fixture.as_bytes().to_vec(),
         }),
     )
     .run()
@@ -334,7 +345,8 @@ async fn minimax_error_envelope_surfaces() {
         openai_req(),
         Arc::new(FixtureTransport {
             status: 200,
-            body: UpstreamBody::Json(fixture.as_bytes().to_vec()),
+            sse: false,
+            bytes: fixture.as_bytes().to_vec(),
         }),
     )
     .run()
@@ -353,7 +365,8 @@ const GO_GEMINI: &str = r#"{"candidates":[{"content":{"role":"model","parts":[{"
 async fn gemini_usage_metadata_matches_go_recorded() {
     let transport = Arc::new(FixtureTransport {
         status: 200,
-        body: UpstreamBody::Json(GO_GEMINI.as_bytes().to_vec()),
+        sse: false,
+        bytes: GO_GEMINI.as_bytes().to_vec(),
     });
     let req = GatewayRequest {
         message: vec![ChatMsg::text("user", "hi")],

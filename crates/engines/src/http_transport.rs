@@ -121,6 +121,15 @@ impl Transport for HttpTransport {
             .and_then(|v| v.to_str().ok())
             .map(|ct| ct.starts_with("text/event-stream"))
             .unwrap_or(false);
+        if is_sse {
+            use futures::TryStreamExt;
+            return Ok(UpstreamResponse {
+                status,
+                body: UpstreamBody::SseStream(Box::pin(
+                    resp.bytes_stream().map_err(|e| e.to_string()),
+                )),
+            });
+        }
         let bytes = resp
             .bytes()
             .await
@@ -128,11 +137,7 @@ impl Transport for HttpTransport {
             .to_vec();
         Ok(UpstreamResponse {
             status,
-            body: if is_sse {
-                UpstreamBody::Sse(bytes)
-            } else {
-                UpstreamBody::Json(bytes)
-            },
+            body: UpstreamBody::Json(bytes),
         })
     }
 }

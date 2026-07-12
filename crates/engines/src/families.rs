@@ -92,7 +92,10 @@ impl Base {
             stream,
             account: self.account(),
         };
-        self.transport.send(up).await
+        match self.transport.send(up).await {
+            Ok(reply) => reply.buffered().await,
+            Err(e) => Err(e),
+        }
     }
 
     /// POST body to `url`, expect JSON back (non-streaming).
@@ -100,7 +103,7 @@ impl Base {
         let reply = self.send_upstream(url, body, false).await?;
         let bytes = match &reply.body {
             UpstreamBody::Json(b) => b,
-            UpstreamBody::Sse(_) => {
+            UpstreamBody::Sse(_) | UpstreamBody::SseStream(_) => {
                 return Err(GatewayError::internal(
                     "unexpected sse body for json engine",
                 ));
@@ -882,6 +885,7 @@ impl ResponsesEngine {
                         chunks.push(StreamChunk {
                             delta: d.to_owned(),
                             finish_reason: None,
+                            ..Default::default()
                         });
                     }
                 }
@@ -900,6 +904,7 @@ impl ResponsesEngine {
                     chunks.push(StreamChunk {
                         delta: String::new(),
                         finish_reason: Some(finish_reason.clone()),
+                        ..Default::default()
                     });
                 }
                 _ => {} // response.created / output_item.added / content_part.* etc.
@@ -952,10 +957,15 @@ impl ModelEngine for ResponsesEngine {
         let reply = self
             .base
             .send_upstream(&url, body, self.base.request.stream)
+            .await?
+            .buffered()
             .await?;
         match &reply.body {
             UpstreamBody::Json(b) => self.parse_json(reply.status, b),
             UpstreamBody::Sse(b) => self.parse_sse(reply.status, b),
+            UpstreamBody::SseStream(_) => Err(GatewayError::internal(
+                "unbuffered stream reached responses engine",
+            )),
         }
     }
 
