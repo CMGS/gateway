@@ -11,21 +11,69 @@
 use gw_config::SecurityConf;
 use gw_models::{Block, GatewayRequest, GatewayResponse};
 
-/// Blocklist check. Returns Block on a hit (block=true implies hit=true).
+/// Blocklist check. Returns Block on a hit (block=true implies hit=true). Scans
+/// the same inbound text the DLP pass covers — chat messages, the Responses
+/// native body, and the family typed params — so no surface is a bypass.
 pub fn security_check(sec: &SecurityConf, request: &GatewayRequest) -> Option<Block> {
     if sec.blocklist.is_empty() {
         return None;
     }
+    let terms: Vec<String> = sec
+        .blocklist
+        .iter()
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .collect();
+    let hit = |text: &str| {
+        let lower = text.to_lowercase();
+        terms.iter().any(|w| lower.contains(w))
+    };
+    let mut blocked = false;
     for msg in &request.message {
-        let lower = msg.content.to_lowercase();
-        for word in &sec.blocklist {
-            if !word.is_empty() && lower.contains(&word.to_lowercase()) {
-                let e = gw_consts::error_code::exceptions::empty_resp_err();
-                return Some(Block::blocked(e.msg, e.code as i32));
-            }
+        blocked |= hit(&msg.content);
+        if let Some(parts) = &msg.parts {
+            visit_text(parts, &mut |t| blocked |= hit(t));
         }
     }
+    if let Some(param) = request.model_param_v2.as_ref() {
+        visit_text(&param.raw, &mut |t| blocked |= hit(t));
+        if let Some(typed) = param.typed.as_ref() {
+            visit_typed_text(typed, &mut |t| blocked |= hit(t));
+        }
+    }
+    if blocked {
+        let e = gw_consts::error_code::exceptions::empty_resp_err();
+        return Some(Block::blocked(e.msg, e.code as i32));
+    }
     None
+}
+
+/// Visit every string leaf in a JSON value.
+fn visit_text(v: &serde_json::Value, f: &mut impl FnMut(&str)) {
+    match v {
+        serde_json::Value::String(s) => f(s),
+        serde_json::Value::Array(a) => a.iter().for_each(|x| visit_text(x, f)),
+        serde_json::Value::Object(o) => o.values().for_each(|x| visit_text(x, f)),
+        _ => {}
+    }
+}
+
+/// Visit the free-text fields of the family typed params.
+fn visit_typed_text(typed: &gw_models::TypedParams, f: &mut impl FnMut(&str)) {
+    use gw_models::TypedParams as T;
+    match typed {
+        T::Chat(p) => {
+            if let Some(s) = &p.system {
+                f(s);
+            }
+        }
+        T::Embeddings(p) => p.input.iter().for_each(|s| f(s)),
+        T::AudioTts(p) => f(&p.input),
+        T::Image(p) => f(&p.prompt),
+        T::Video(p) => f(&p.prompt),
+        T::Search(p) => f(&p.query),
+        T::AudioStt(_) => {}
+    }
 }
 
 /// DLP inbound redaction: emails and 11-digit phone numbers.
@@ -119,7 +167,10 @@ fn redact_parts_text(parts: &mut serde_json::Value) -> usize {
     hits
 }
 
-/// DLP outbound redaction.
+/// DLP outbound redaction: the flat `message`, plus the structured payloads the
+/// non-chat surfaces actually return — `response_v2` (the Responses/embeddings/
+/// image native body) and `tool_calls` — so vendor-introduced PII can't leak
+/// through a field the surface serializes verbatim.
 pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -> usize {
     if !sec.dlp_redact {
         return 0;
@@ -128,7 +179,14 @@ pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -
     if n > 0 {
         response.message = redacted;
     }
-    n
+    let mut hits = n;
+    if let Some(v) = &mut response.response_v2 {
+        hits += redact_value(v);
+    }
+    if let Some(v) = &mut response.tool_calls {
+        hits += redact_value(v);
+    }
+    hits
 }
 
 /// Hand-rolled scanner (no regex dep): masks `local@domain.tld` email shapes and

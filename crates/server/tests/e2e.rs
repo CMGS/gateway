@@ -1851,6 +1851,111 @@ accounts: [{name: a, provider: openai, protocols: ["openai-chat"]}]
 }
 
 #[tokio::test]
+async fn batch_response_never_leaks_the_owning_key() {
+    let app = app();
+    let submit = json!({"model":"gpt-4o-mini","items":[
+        {"messages":[{"role":"user","content":"one"}]}]})
+    .to_string();
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/batches", Some("ak-demo-123"), &submit))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+    let resp = app
+        .oneshot(get_authed(&format!("/v1/batches/{id}")))
+        .await
+        .unwrap();
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(
+        !text.contains("ak-demo-123") && !text.contains("\"ak\""),
+        "batch response must not expose the owning bearer key: {text}"
+    );
+}
+
+#[tokio::test]
+async fn blocklist_covers_the_responses_body() {
+    // a blocked term in the Responses native input (not a chat message) must
+    // still be blocked, not bypass the filter.
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+security: {blocklist: ["forbiddenword"]}
+access_keys: [{ak: ak-b, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: gpt-5-responses, protocol: responses}]
+accounts: [{name: a, provider: openai, protocols: ["responses"]}]
+"#;
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let body = r#"{"model":"gpt-5-responses","input":"please say forbiddenword"}"#;
+    let resp = app
+        .oneshot(post("/v1/responses", Some("ak-b"), body))
+        .await
+        .unwrap();
+    // blocked → served the filter message, not the vendor reply
+    let j = body_json(resp).await;
+    assert_ne!(
+        j["output"][0]["content"][0]["text"], "please say forbiddenword",
+        "blocked Responses input must not reach the vendor: {j}"
+    );
+}
+
+#[tokio::test]
+async fn outbound_dlp_redacts_the_responses_body() {
+    // vendor-introduced PII in the Responses native body (response_v2) must be
+    // redacted, not returned verbatim.
+    #[derive(Debug)]
+    struct PiiResponses;
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for PiiResponses {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            let body = json!({
+                "id":"resp_x","object":"response","model":"gpt-5","status":"completed",
+                "output":[{"type":"message","role":"assistant",
+                    "content":[{"type":"output_text","text":"write to leak@evil.com"}]}],
+                "usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}
+            });
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::Json(body.to_string().into_bytes()),
+            })
+        }
+    }
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+security: {dlp_redact: true}
+access_keys: [{ak: ak-d, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: gpt-5-responses, protocol: responses}]
+accounts: [{name: a, provider: openai, protocols: ["responses"]}]
+"#;
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(cfg, state, Arc::new(PiiResponses)));
+    let body = r#"{"model":"gpt-5-responses","input":"hi"}"#;
+    let resp = app
+        .oneshot(post("/v1/responses", Some("ak-d"), body))
+        .await
+        .unwrap();
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(
+        text.contains("[REDACTED_EMAIL]"),
+        "response_v2 must be redacted: {text}"
+    );
+    assert!(
+        !text.contains("leak@evil.com"),
+        "raw PII must not leak: {text}"
+    );
+}
+
+#[tokio::test]
 async fn batch_requires_items_or_file() {
     let app = app();
     let resp = app
@@ -2082,12 +2187,22 @@ access_keys: [{ak: ak-c, product: demo, qps: 100, daily_token_quota: 1000000}]
 models: [{name: cachem, protocol: openai-chat, cache_ttl_seconds: 300}]
 accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
 "#;
+    // a changed config (extra model) → different generation hash → cache invalidated
+    const YAML2: &str = r#"
+listen: {host: 127.0.0.1, port: 0}
+admin: {token_env: GW_TEST_ADMIN_CACHEGEN}
+access_keys: [{ak: ak-c, product: demo, qps: 100, daily_token_quota: 1000000}]
+models:
+  - {name: cachem, protocol: openai-chat, cache_ttl_seconds: 300}
+  - {name: other, protocol: openai-chat}
+accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
+"#;
     // SAFETY: unique var name for this test; no concurrent reader.
     unsafe { std::env::set_var("GW_TEST_ADMIN_CACHEGEN", "cg-secret") };
     let cfg = Arc::new(GatewayConfig::from_yaml(YAML).unwrap());
     let state = Arc::new(GatewayState::from_config(&cfg));
     let loader: gw_views::ConfigLoader = Arc::new(|| {
-        Box::pin(async { GatewayConfig::from_yaml(YAML).map_err(|e| e.to_string()) })
+        Box::pin(async { GatewayConfig::from_yaml(YAML2).map_err(|e| e.to_string()) })
             as gw_views::ConfigFuture
     });
     let app = gw_views::app(gw_views::AppState::with_config(
@@ -2114,7 +2229,7 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
     }
     assert_eq!(count(app.clone()).await, 1, "second call was a cache hit");
 
-    // a reload bumps the config generation → prior cache entry is unreachable
+    // reloading a changed config changes the generation → prior entry unreachable
     let r = app
         .clone()
         .oneshot(admin("POST", "/admin/reload", Some("cg-secret"), None))

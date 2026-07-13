@@ -378,7 +378,8 @@ async fn bill_realtime_turn(
     it: i64,
     ot: i64,
 ) {
-    let total = it + ot;
+    let (it, ot) = (it.max(0), ot.max(0));
+    let total = it.saturating_add(ot);
     let state = s.handler.state();
     let gov = &state.governance;
     gov.quota_consume(&ak.ak, total).await;
@@ -541,6 +542,9 @@ fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
             )
         }
     };
+    // never trust upstream token counts: floor at 0 so a negative can't refund
+    // quota or write a negative ledger row
+    let usage = (usage.0.max(0), usage.1.max(0));
     (usage.0 + usage.1 > 0).then_some(usage)
 }
 

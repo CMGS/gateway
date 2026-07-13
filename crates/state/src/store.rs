@@ -87,8 +87,11 @@ pub struct BatchItemResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BatchJob {
     pub id: String,
+    /// Owning key — a bearer credential, so it's never serialized into a response.
+    #[serde(skip)]
     pub ak: String,
-    /// Owning tenant; reads are gated on it so one tenant can't see another's jobs.
+    /// Owning tenant; reads are gated on it. Internal routing, not client-facing.
+    #[serde(skip)]
     pub tenant: String,
     pub model: String,
     pub status: BatchStatus,

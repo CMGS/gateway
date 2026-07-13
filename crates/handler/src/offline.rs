@@ -64,17 +64,24 @@ impl OfflineHandler {
         // resume past items already recorded by a prior (crashed) executor, so
         // a reclaim re-runs and re-bills at most the one item that was in flight;
         // seed any_fail from those prior results so a pre-crash failure still
-        // makes the resumed batch terminal-Failed
-        let prior = store
-            .batch_get(id)
-            .await
-            .ok()
-            .flatten()
-            .map(|j| j.results)
-            .unwrap_or_default();
+        // makes the resumed batch terminal-Failed. A read failure here means we
+        // can't know what's already done — re-running everything would re-bill,
+        // so fail the job instead.
+        let prior = match store.batch_get(id).await {
+            Ok(Some(job)) => job.results,
+            Ok(None) => return, // the batch row vanished; nothing to run
+            Err(e) => {
+                tracing::error!(error = %e, batch = %id, "batch resume read failed; failing to avoid re-billing");
+                let _ = store.batch_set_status(id, BatchStatus::Failed).await;
+                return;
+            }
+        };
         let done_indices: std::collections::HashSet<usize> =
             prior.iter().map(|r| r.index).collect();
         let mut any_fail = prior.iter().any(|r| !r.ok);
+        // a result that failed to persist leaves the batch incomplete — it must
+        // not then be reported Completed
+        let mut writes_ok = true;
         // heartbeat claimed_at while items run so a slow item isn't judged
         // stale and reclaimed by another instance mid-execution
         let hb = {
@@ -139,10 +146,13 @@ impl OfflineHandler {
             any_fail |= !result.ok;
             if let Err(e) = store.batch_push_result(id, result).await {
                 tracing::error!(error = %e, batch = %id, "batch result write failed");
+                writes_ok = false;
             }
         }
         hb.abort();
-        let done = if any_fail {
+        // Completed only if every result persisted; a lost write means missing
+        // results, so report Failed rather than a Completed-but-incomplete batch.
+        let done = if any_fail || !writes_ok {
             BatchStatus::Failed
         } else {
             BatchStatus::Completed

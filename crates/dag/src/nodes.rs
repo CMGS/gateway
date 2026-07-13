@@ -628,9 +628,11 @@ impl DagNode for CostCalc {
             };
             let ct = enc.encode_len(&resp.message) as i64;
             ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
-            return bill(ctx, pt, ct, pt + ct).await;
+            return bill(ctx, pt, ct, pt.saturating_add(ct)).await;
         }
-        // default rate is 1:1 (total == prompt+completion); the formula carries future weighted rates
+        // default rate is 1:1 (total == prompt+completion); the formula carries
+        // future weighted rates. saturating sums so a malformed usage subtree
+        // can't overflow the billed totals.
         let (prompt, completion, total) = match &resp.common_usage {
             Some(u) => {
                 let ti = gw_models::TokenInput {
@@ -642,15 +644,17 @@ impl DagNode for CostCalc {
                 };
                 let rate = gw_models::TokenRate::default();
                 (
-                    u.platform_input + u.read_cache + u.write_cache,
-                    u.completion + u.reason,
+                    u.platform_input
+                        .saturating_add(u.read_cache)
+                        .saturating_add(u.write_cache),
+                    u.completion.saturating_add(u.reason),
                     gw_models::platform_total(&ti, &rate),
                 )
             }
             None => (
                 resp.prompt_tokens,
                 resp.completion_tokens,
-                resp.prompt_tokens + resp.completion_tokens,
+                resp.prompt_tokens.saturating_add(resp.completion_tokens),
             ),
         };
         bill(ctx, prompt, completion, total).await

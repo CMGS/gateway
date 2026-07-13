@@ -38,7 +38,7 @@ unconfigured (key, model) pairs never touch a counter.
 |-------|-------|--------|
 | QPS | per access key | `access_keys[].qps` |
 | QPS | pooled per tenant | `tenants[].qps` |
-| Daily tokens | per access key | `access_keys[].daily_token_quota` (rolls over at UTC midnight) |
+| Daily tokens | per access key | `access_keys[].daily_token_quota` (fleet/Redis: rolls at UTC midnight; single-node in-memory: a ~daily background reset) |
 | Daily tokens | per (key, model) | `tenants[].model_quotas` default, `access_keys[].model_quotas` override |
 | TPM | per access key | `access_keys[].tokens_per_minute` |
 | QPM | per model | `models[].qpm` |

@@ -412,6 +412,12 @@ impl GatewayConfig {
         cfg.normalize()?;
         cfg.validate()?;
         cfg.build_indices();
+        // generation = a stable hash of the source document, so every replica
+        // that loads the same published config agrees on it (fleet-stable) and a
+        // new document changes it (reload invalidates the shared cache). A
+        // per-process counter would start at 0 on each instance and let a
+        // restarted node hit another config's cache entries.
+        cfg.generation = stable_hash(yaml);
         Ok(cfg)
     }
 
@@ -570,14 +576,10 @@ impl GatewayConfig {
         Ok(())
     }
 
-    /// Config generation, bumped on each live reload; mixed into cache keys.
+    /// Config generation (a stable hash of the source document); mixed into
+    /// cache keys so a reload to a different config can't serve a stale entry.
     pub fn generation(&self) -> u64 {
         self.generation
-    }
-
-    /// Set the generation (called by the reload path to invalidate stale cache).
-    pub fn set_generation(&mut self, generation: u64) {
-        self.generation = generation;
     }
 
     pub fn find_product(&self, name: &str) -> Option<&ProductConfEntry> {
@@ -654,6 +656,15 @@ impl GatewayConfig {
     }
 }
 
+/// Deterministic hash of the config document, stable across processes of the
+/// same binary (fleet-wide) — the response-cache generation.
+fn stable_hash(yaml: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    yaml.hash(&mut h);
+    h.finish()
+}
+
 /// Build a name → slot-index map for O(1) lookups.
 fn index_by<T>(items: &[T], key: impl Fn(&T) -> &str) -> std::collections::HashMap<String, usize> {
     items
@@ -688,6 +699,17 @@ fn check_unique<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_is_stable_per_document_and_changes_on_edit() {
+        let a = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat}]";
+        let b = "listen: {host: h, port: 1}\nmodels: [{name: m2, protocol: openai-chat}]";
+        let g1 = GatewayConfig::from_yaml(a).unwrap().generation();
+        let g2 = GatewayConfig::from_yaml(a).unwrap().generation();
+        let g3 = GatewayConfig::from_yaml(b).unwrap().generation();
+        assert_eq!(g1, g2, "same document → same generation (fleet-stable)");
+        assert_ne!(g1, g3, "a changed document → a different generation");
+    }
 
     const PROVIDER_YAML: &str = r#"
 listen: {host: 127.0.0.1, port: 0}
