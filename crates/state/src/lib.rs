@@ -36,6 +36,8 @@ pub struct AkInfo {
     pub expires_at_epoch_secs: Option<i64>,
     /// A banned key stays in the table but fails auth with a distinct 403.
     pub banned: bool,
+    /// Per-model daily token caps overriding the tenant defaults; empty = none.
+    pub model_quotas: std::collections::HashMap<String, i64>,
 }
 
 impl AkInfo {
@@ -62,6 +64,7 @@ impl From<&gw_config::AkConf> for AkInfo {
             tokens_per_minute: k.tokens_per_minute,
             expires_at_epoch_secs: k.expires_at_epoch_secs,
             banned: k.banned,
+            model_quotas: k.model_quotas.clone(),
         }
     }
 }
@@ -694,6 +697,7 @@ mod tests {
                 tokens_per_minute: None,
                 expires_at_epoch_secs: None,
                 banned: false,
+                model_quotas: Default::default(),
             },
             KeySource::Config,
         );
@@ -707,6 +711,7 @@ mod tests {
                 tokens_per_minute: None,
                 expires_at_epoch_secs: None,
                 banned: false,
+                model_quotas: Default::default(),
             },
             KeySource::Admin,
         );
@@ -752,6 +757,7 @@ mod tests {
                 tokens_per_minute: None,
                 expires_at_epoch_secs: None,
                 banned: false,
+                model_quotas: Default::default(),
             },
             KeySource::Config,
         );
@@ -780,6 +786,7 @@ mod tests {
             tokens_per_minute: None,
             expires_at_epoch_secs: None,
             banned: false,
+            model_quotas: Default::default(),
         };
         auth.put(info("ak-x"), KeySource::Config);
         // an admin write to a config key updates values but keeps Config ownership
@@ -820,6 +827,7 @@ mod tests {
             tokens_per_minute: None,
             expires_at_epoch_secs: None,
             banned: false,
+            model_quotas: Default::default(),
         };
         assert_eq!(info.status_at(i64::MAX), KeyStatus::Active);
         info.expires_at_epoch_secs = Some(100);

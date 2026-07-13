@@ -31,6 +31,10 @@ pub struct DagContext {
     pub cache_hit: bool,
     /// This request's cache key (computed by cache_lookup, reused by cache_store).
     pub cache_key: Option<String>,
+    /// Governance key for the (AK, model) daily counter — set by model_quota
+    /// only when a cap is configured, consumed at billing time (unconfigured
+    /// pairs never touch a counter).
+    pub model_quota_key: Option<String>,
 }
 
 impl DagContext {
@@ -51,6 +55,7 @@ impl DagContext {
             decisions: Vec::new(),
             cache_hit: false,
             cache_key: None,
+            model_quota_key: None,
         }
     }
 

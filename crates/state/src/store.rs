@@ -17,7 +17,10 @@ pub struct BillingRecord {
     pub ak: String,
     pub product: String,
     pub tenant: String,
+    /// Public model the caller requested.
     pub model: String,
+    /// Model that actually served (differs from `model` after a quota fallback).
+    pub served_model: String,
     pub protocol: String,
     pub account: String,
     pub prompt_tokens: i64,
@@ -240,6 +243,7 @@ impl SqliteStore {
                 n INTEGER PRIMARY KEY AUTOINCREMENT,
                 ak TEXT NOT NULL, product TEXT NOT NULL,
                 tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
+                served_model TEXT NOT NULL DEFAULT '',
                 protocol TEXT NOT NULL, account TEXT NOT NULL,
                 prompt_tokens INTEGER NOT NULL, completion_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL, cost_micros INTEGER NOT NULL,
@@ -260,15 +264,17 @@ impl SqliteStore {
                 .await
                 .map_err(|e| store_err("create schema", e))?;
         }
-        // Pre-tenant databases lack the column; the ALTER fails once with
+        // Pre-existing databases lack these columns; the ALTER fails with
         // "duplicate column name" on every later boot, so that error is ignored.
-        if let Err(e) =
-            sqlx::query("ALTER TABLE billing ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'")
-                .execute(&pool)
-                .await
-            && !e.to_string().contains("duplicate column name")
-        {
-            return Err(store_err("migrate billing schema", e));
+        for ddl in [
+            "ALTER TABLE billing ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
+            "ALTER TABLE billing ADD COLUMN served_model TEXT NOT NULL DEFAULT ''",
+        ] {
+            if let Err(e) = sqlx::query(ddl).execute(&pool).await
+                && !e.to_string().contains("duplicate column name")
+            {
+                return Err(store_err("migrate billing schema", e));
+            }
         }
         // Jobs left pending/running by a dead process can never progress
         // (single-instance store) — surface them as failed instead of letting
@@ -288,14 +294,15 @@ impl SqliteStore {
 impl Store for SqliteStore {
     async fn ledger_add(&self, r: BillingRecord) -> GResult<()> {
         sqlx::query(
-            "INSERT INTO billing (ak, product, tenant, model, protocol, account, prompt_tokens,
-             completion_tokens, total_tokens, cost_micros, ptu_spillover)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
+             prompt_tokens, completion_tokens, total_tokens, cost_micros, ptu_spillover)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&r.ak)
         .bind(&r.product)
         .bind(&r.tenant)
         .bind(&r.model)
+        .bind(&r.served_model)
         .bind(&r.protocol)
         .bind(&r.account)
         .bind(r.prompt_tokens)
@@ -322,8 +329,8 @@ impl Store for SqliteStore {
             .await
             .map_err(|e| store_err("count billing records", e))?;
         let mut rows = sqlx::query(
-            "SELECT ak, product, tenant, model, protocol, account, prompt_tokens,
-             completion_tokens, total_tokens, cost_micros, ptu_spillover
+            "SELECT ak, product, tenant, model, served_model, protocol, account,
+             prompt_tokens, completion_tokens, total_tokens, cost_micros, ptu_spillover
              FROM billing ORDER BY n DESC LIMIT ?",
         )
         .bind(limit.min(i64::MAX as usize) as i64)
@@ -339,13 +346,14 @@ impl Store for SqliteStore {
                     product: row.get(1),
                     tenant: row.get(2),
                     model: row.get(3),
-                    protocol: row.get(4),
-                    account: row.get(5),
-                    prompt_tokens: row.get(6),
-                    completion_tokens: row.get(7),
-                    total_tokens: row.get(8),
-                    cost_micros: row.get(9),
-                    ptu_spillover: row.get(10),
+                    served_model: row.get(4),
+                    protocol: row.get(5),
+                    account: row.get(6),
+                    prompt_tokens: row.get(7),
+                    completion_tokens: row.get(8),
+                    total_tokens: row.get(9),
+                    cost_micros: row.get(10),
+                    ptu_spillover: row.get(11),
                 })
                 .collect(),
         ))
@@ -486,6 +494,7 @@ mod tests {
             product: "p".into(),
             tenant: "default".into(),
             model: model.into(),
+            served_model: model.into(),
             protocol: "openai-chat".into(),
             account: "acc".into(),
             prompt_tokens: 3,

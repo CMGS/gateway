@@ -63,6 +63,11 @@ access_keys:
     qps: 100
     daily_token_quota: 1000000
     expires_at_epoch_secs: 1
+  - ak: ak-beta-1 # e2e: (AK,model) quota + fallback degrade (tenant=beta)
+    tenant: beta
+    product: demo
+    qps: 100
+    daily_token_quota: 1000000
 
 # Tenants: pooled rate limits + model entitlement. Keys without a tenant join
 # the implicit unrestricted `default` tenant.
@@ -70,6 +75,10 @@ tenants:
   - name: acme # e2e: entitled to gpt-4o only; both acme keys share qps 2
     qps: 2
     models: [gpt-4o]
+  - name: beta # e2e: gpt-4o capped at 20 tokens/day per key, degrades to gpt-4o-mini
+    model_quotas:
+      gpt-4o: 20
+    fallback_model: gpt-4o-mini
 
 # Public model name → wire protocol, optional provider binding (only that
 # provider's accounts serve the model), plus demo prices (micros per 1k tokens).

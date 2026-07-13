@@ -38,6 +38,10 @@ pub enum ConfigError {
     UnknownTenant { ak: String, tenant: String },
     #[error("tenant `{tenant}` entitles unknown model `{model}`")]
     UnknownEntitledModel { tenant: String, model: String },
+    #[error("`{owner}` sets a daily quota for unknown model `{model}`")]
+    UnknownQuotaModel { owner: String, model: String },
+    #[error("tenant `{tenant}` fallback model `{model}` is unknown or not entitled")]
+    BadFallbackModel { tenant: String, model: String },
 }
 
 /// Build a name → slot-index map for O(1) lookups.
@@ -94,6 +98,9 @@ pub struct AkConf {
     /// A banned key stays in the table but fails auth with a distinct 403.
     #[serde(default)]
     pub banned: bool,
+    /// Per-model daily token caps for this key, overriding the tenant defaults.
+    #[serde(default)]
+    pub model_quotas: std::collections::HashMap<String, i64>,
 }
 
 /// Public model name → dispatch type + demo pricing + per-model governance.
@@ -257,6 +264,14 @@ pub struct TenantConf {
     /// Models this tenant may call; None = every configured model.
     #[serde(default)]
     pub models: Option<Vec<String>>,
+    /// Default per-model daily token caps, applied per key (each of the
+    /// tenant's keys is metered separately against the same value).
+    #[serde(default)]
+    pub model_quotas: std::collections::HashMap<String, i64>,
+    /// Where an over-quota request degrades to instead of hard-failing;
+    /// None = pass through unmetered (the per-AK daily cap still backstops).
+    #[serde(default)]
+    pub fallback_model: Option<String>,
 }
 
 /// First-class provider preset: `kind` fixes the endpoint, auth style, and
@@ -498,6 +513,33 @@ impl GatewayConfig {
                 if !self.models.iter().any(|c| &c.name == m) {
                     return Err(ConfigError::UnknownEntitledModel {
                         tenant: t.name.clone(),
+                        model: m.clone(),
+                    });
+                }
+            }
+            for m in t.model_quotas.keys() {
+                if !self.models.iter().any(|c| &c.name == m) {
+                    return Err(ConfigError::UnknownQuotaModel {
+                        owner: format!("tenant {}", t.name),
+                        model: m.clone(),
+                    });
+                }
+            }
+            if let Some(fb) = &t.fallback_model
+                && (!self.models.iter().any(|c| &c.name == fb)
+                    || !t.models.as_ref().is_none_or(|allow| allow.contains(fb)))
+            {
+                return Err(ConfigError::BadFallbackModel {
+                    tenant: t.name.clone(),
+                    model: fb.clone(),
+                });
+            }
+        }
+        for k in &self.access_keys {
+            for m in k.model_quotas.keys() {
+                if !self.models.iter().any(|c| &c.name == m) {
+                    return Err(ConfigError::UnknownQuotaModel {
+                        owner: format!("access key {}", k.ak),
                         model: m.clone(),
                     });
                 }
@@ -758,6 +800,27 @@ tenants: [{name: t1}, {name: t1}]
         assert!(matches!(
             GatewayConfig::from_yaml(dup),
             Err(ConfigError::DuplicateName { kind: "tenant", .. })
+        ));
+
+        let bad_quota = r#"
+listen: {host: h, port: 1}
+models: [{name: m1, protocol: openai-chat}]
+tenants: [{name: t1, model_quotas: {ghost: 10}}]
+"#;
+        assert!(matches!(
+            GatewayConfig::from_yaml(bad_quota),
+            Err(ConfigError::UnknownQuotaModel { .. })
+        ));
+
+        // fallback outside the tenant's own allowlist is a config error
+        let bad_fallback = r#"
+listen: {host: h, port: 1}
+models: [{name: m1, protocol: openai-chat}, {name: m2, protocol: openai-chat}]
+tenants: [{name: t1, models: [m1], fallback_model: m2}]
+"#;
+        assert!(matches!(
+            GatewayConfig::from_yaml(bad_fallback),
+            Err(ConfigError::BadFallbackModel { .. })
         ));
     }
 

@@ -63,6 +63,9 @@ pub mod domain {
         pub protocol: gw_consts::Protocol,
         /// public model name from the caller, pre-mapping. Empty if caller sent a wire type directly.
         pub model_name: String,
+        /// original caller model when a quota fallback swapped `model_name`;
+        /// the response echoes it and the ledger records both.
+        pub fallback_from: Option<String>,
         /// family-typed params (chat/embeddings/image/audio/video/search).
         pub typed: Option<TypedParams>,
         /// untyped vendor extras, passed through verbatim.
@@ -74,6 +77,7 @@ pub mod domain {
             Self {
                 protocol,
                 model_name: String::new(),
+                fallback_from: None,
                 typed: None,
                 raw: Value::Null,
             }
@@ -83,6 +87,7 @@ pub mod domain {
             Self {
                 protocol,
                 model_name: name.into(),
+                fallback_from: None,
                 typed: None,
                 raw: Value::Null,
             }
@@ -281,6 +286,7 @@ impl Default for ModelParamV2 {
         Self {
             protocol: gw_consts::Protocol::OpenaiChat,
             model_name: String::new(),
+            fallback_from: None,
             typed: None,
             raw: serde_json::Value::Null,
         }

@@ -273,6 +273,7 @@ async fn bill_realtime_turn(
         product: ak.product.clone(),
         tenant: ak.tenant.clone(),
         model: model.to_owned(),
+        served_model: model.to_owned(),
         protocol: mt.as_str().to_owned(),
         account: account.to_owned(),
         prompt_tokens: it,
@@ -645,6 +646,15 @@ fn authenticate(s: &AppState, headers: &HeaderMap) -> Result<AkInfo, (u16, &'sta
     Ok(info)
 }
 
+/// The caller's original model name when a quota fallback swapped the served
+/// one; the response echoes it instead of the vendor-reported name.
+fn fallback_echo(ctx: &DagContext) -> Option<String> {
+    ctx.request
+        .model_param_v2
+        .as_ref()
+        .and_then(|p| p.fallback_from.clone())
+}
+
 /// Lifecycle gate shared by every auth path: banned and expired keys stay in
 /// the table but fail with distinct 403s (unlike a revoked key's 401).
 fn check_key_status(info: &AkInfo) -> Result<(), (u16, &'static str)> {
@@ -740,6 +750,14 @@ async fn admin_key_create(
         tokens_per_minute: body["tokens_per_minute"].as_i64(),
         expires_at_epoch_secs: body["expires_at_epoch_secs"].as_i64(),
         banned: body["banned"].as_bool().unwrap_or(false),
+        model_quotas: body["model_quotas"]
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(m, v)| Some((m.clone(), v.as_i64()?)))
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
     s.handler.state().auth.put(info, gw_state::KeySource::Admin);
     (
@@ -963,6 +981,7 @@ async fn chat_completions(
         Err(e) => return gateway_error(e),
     };
     log_access("chat_completions", &ctx, started);
+    let echo = fallback_echo(&ctx);
     let Some(outcome) = ctx.outcome else {
         return error_response(500, "pipeline produced no outcome");
     };
@@ -974,25 +993,20 @@ async fn chat_completions(
         completion_tokens: outcome.response.completion_tokens,
         total_tokens: outcome.response.total_tokens,
     };
+    let model_out = echo.unwrap_or_else(|| outcome.response.model.clone());
 
     // tool_calls response: content=null + finish_reason=tool_calls (OpenAI semantics)
     if let Some(tc) = &outcome.response.tool_calls {
         let calls: Vec<gw_protocol::openai::ToolCall> =
             serde_json::from_value(tc.clone()).unwrap_or_default();
-        let resp = ChatCompletionResponse::tool_calls(
-            id,
-            created,
-            outcome.response.model.clone(),
-            calls,
-            usage,
-        );
+        let resp = ChatCompletionResponse::tool_calls(id, created, model_out, calls, usage);
         return (StatusCode::OK, Json(resp)).into_response();
     }
 
     let resp = ChatCompletionResponse::text(
         id,
         created,
-        outcome.response.model.clone(),
+        model_out,
         outcome.response.message.clone(),
         finish_openai(&outcome.response.finish_reason),
         usage,
@@ -1246,6 +1260,7 @@ async fn messages(
         Err(e) => return anthropic_gateway_error(e),
     };
     log_access("messages", &ctx, started);
+    let echo = fallback_echo(&ctx);
     let Some(outcome) = ctx.outcome else {
         return anthropic_error(500, "pipeline produced no outcome");
     };
@@ -1267,7 +1282,7 @@ async fn messages(
     }
     let resp = MessagesResponse::new(
         next_id("msg"),
-        outcome.response.model.clone(),
+        echo.unwrap_or_else(|| outcome.response.model.clone()),
         content,
         finish_anthropic(&outcome.response.finish_reason),
         AnthUsage {

@@ -8,6 +8,64 @@ use gw_state::BillingRecord;
 use crate::context::DagContext;
 use crate::executor::{DagNode, Layer};
 
+/// preprocess/model_quota: per-(AK, model) daily token cap — AK override, else
+/// tenant default, else unmetered (no counter is ever touched). Over-quota
+/// degrades to the tenant's fallback model when one is configured; otherwise
+/// the request passes and the per-AK daily cap stays the hard backstop.
+/// Runs before resolve_model so a swap re-routes protocol, entitlement, and
+/// cache to the served model.
+pub struct ModelQuotaGate;
+
+#[async_trait::async_trait]
+impl DagNode for ModelQuotaGate {
+    fn name(&self) -> &'static str {
+        "model_quota"
+    }
+    async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        let requested = match ctx.request.model_param_v2.as_ref() {
+            Some(p) if !p.model_name.is_empty() => p.model_name.clone(),
+            _ => return Ok(()),
+        };
+        let limit = ctx.ak.model_quotas.get(&requested).copied().or_else(|| {
+            ctx.cfg
+                .find_tenant(&ctx.ak.tenant)
+                .and_then(|t| t.model_quotas.get(&requested).copied())
+        });
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+        let key = format!("{}|{requested}", ctx.ak.ak);
+        let under = ctx.state.governance.quota_check(&key, limit).await;
+        // usage counts against the requested model either way, so a fallback
+        // period ends when the day resets, not when the fallback accrues usage
+        ctx.model_quota_key = Some(key);
+        if under {
+            return Ok(());
+        }
+        let fallback = ctx
+            .cfg
+            .find_tenant(&ctx.ak.tenant)
+            .and_then(|t| t.fallback_model.clone());
+        match fallback {
+            Some(fb) if fb != requested => {
+                ctx.decide(
+                    "model_quota",
+                    format!("{requested} over {limit}, serving {fb}"),
+                );
+                if let Some(param) = ctx.request.model_param_v2.as_mut() {
+                    param.fallback_from = Some(requested);
+                    param.model_name = fb;
+                }
+            }
+            _ => ctx.decide(
+                "model_quota",
+                format!("{requested} over {limit}, no fallback"),
+            ),
+        }
+        Ok(())
+    }
+}
+
 /// preprocess/resolve_model: public model name -> Protocol.
 pub struct ResolveModel;
 
@@ -15,6 +73,9 @@ pub struct ResolveModel;
 impl DagNode for ResolveModel {
     fn name(&self) -> &'static str {
         "resolve_model"
+    }
+    fn deps(&self) -> &'static [&'static str] {
+        &["model_quota"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let param = ctx
@@ -599,10 +660,19 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
         .map(|o| o.response.ptu_spillover)
         .unwrap_or(false);
     let param = ctx.request.model_param_v2.as_ref();
-    let public_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
-    let (p_in, p_out) = ctx.cfg.prices_for(public_name);
+    // served = what actually ran (post-fallback); requested = what the caller
+    // asked for. Cost bills at the served model's price; the (AK, model)
+    // counter accrues against the requested name.
+    let served = param.map(|p| p.model_name.as_str()).unwrap_or_default();
+    let requested = param
+        .and_then(|p| p.fallback_from.as_deref())
+        .unwrap_or(served);
+    let (p_in, p_out) = ctx.cfg.prices_for(served);
     let cost = prompt * p_in / 1000 + completion * p_out / 1000;
     ctx.state.governance.quota_consume(&ctx.ak.ak, total).await;
+    if let Some(key) = &ctx.model_quota_key {
+        ctx.state.governance.quota_consume(key, total).await;
+    }
     // TPM window accounting (post-hoc accumulation)
     ctx.state
         .governance
@@ -612,7 +682,8 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
         ak: ctx.ak.ak.clone(),
         product: ctx.ak.product.clone(),
         tenant: ctx.ak.tenant.clone(),
-        model: public_name.to_owned(),
+        model: requested.to_owned(),
+        served_model: served.to_owned(),
         protocol: param
             .map(|p| p.protocol.as_str().to_owned())
             .unwrap_or_default(),
@@ -684,6 +755,7 @@ pub fn default_layers() -> Vec<Layer> {
         Layer {
             name: "preprocess",
             nodes: vec![
+                Box::new(ModelQuotaGate),
                 Box::new(ResolveModel),
                 Box::new(TenantEntitlement),
                 Box::new(CacheLookup),

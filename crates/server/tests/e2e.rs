@@ -397,6 +397,61 @@ async fn tenant_entitlement_gates_models_and_catalog() {
 }
 
 #[tokio::test]
+async fn model_quota_degrades_to_fallback() {
+    let app = app();
+    // beta caps gpt-4o at 20 tokens/day per key; each mock call uses ~15.
+    // Calls 1-2 pass the pre-check (0, then 15 < 20); call 3 is over and
+    // degrades to gpt-4o-mini while still echoing the requested model name.
+    for i in 1..=2 {
+        let resp = app
+            .clone()
+            .oneshot(post("/v1/chat/completions", Some("ak-beta-1"), CHAT_BODY))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "call {i} under quota");
+        let j = body_json(resp).await;
+        assert_eq!(j["model"], "gpt-4o");
+        assert!(
+            j["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("mock-openai:gpt-4o]"),
+            "under-quota calls serve the requested model"
+        );
+    }
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", Some("ak-beta-1"), CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["model"], "gpt-4o", "response echoes the requested model");
+    assert!(
+        j["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("mock-openai:gpt-4o-mini"),
+        "over-quota call is served by the fallback model"
+    );
+
+    // the ledger records both names on the degraded call
+    let resp = app.oneshot(get_authed("/internal/ledger")).await.unwrap();
+    let j = body_json(resp).await;
+    let last = j["records"]
+        .as_array()
+        .and_then(|r| {
+            r.iter()
+                .rev()
+                .find(|rec| rec["ak"] == "ak-beta-1" && rec["served_model"] == "gpt-4o-mini")
+        })
+        .cloned()
+        .expect("degraded call recorded in the ledger");
+    assert_eq!(last["model"], "gpt-4o");
+    assert_eq!(last["tenant"], "beta");
+}
+
+#[tokio::test]
 async fn tenant_rate_limit_pools_across_keys() {
     let app = app();
     // acme's pooled bucket is qps 2: two calls from different keys pass,
