@@ -39,7 +39,7 @@ GW_CONFIG=conf/gateway.yaml cargo run -p gw-server
 # GW_TRANSPORT=mock forces zero egress; GW_TRANSPORT=http disables the mock.
 ```
 
-Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Issues](https://github.com/cocoonstack/gateway/issues)
+Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Roadmap](https://github.com/cocoonstack/gateway/issues/1)
 
 ## Docker
 
