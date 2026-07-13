@@ -55,6 +55,14 @@ impl OnlineHandler {
     pub async fn run(&self, mut request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
         // one consistent snapshot for the whole request
         let snap = self.config.load();
+        // Outbound DLP is a response-buffering boundary: no engine may stream raw
+        // deltas, since a masked span can straddle deltas and a live delta leaves
+        // before the post-stage scrubs it. Enforce it here at the security
+        // boundary so no caller (any view or future surface) can opt out.
+        let dlp = snap.cfg.security.dlp_redact;
+        if dlp {
+            request.stream_tx = None;
+        }
         let redacted = plugins::dlp_redact_request(&snap.cfg.security, &mut request);
         if let Some(block) = plugins::security_check(&snap.cfg.security, &request) {
             let mut ctx = DagContext::new(
@@ -94,9 +102,13 @@ impl OnlineHandler {
         }
 
         if let Err(e) = gw_dag::run(&self.plan, &mut ctx).await {
-            // a failed pipeline refunds its admission reservations whole
+            // a failed pipeline refunds its admission reservations whole, on the
+            // day bucket the reserve used
             if let Some(est) = ctx.quota_reserved.take() {
-                ctx.state.governance.quota_settle(&ctx.ak.ak, -est).await;
+                ctx.state
+                    .governance
+                    .quota_settle(&ctx.ak.ak, -est, ctx.quota_at)
+                    .await;
             }
             if let Some(est) = ctx.tpm_reserved.take() {
                 ctx.state
@@ -119,11 +131,19 @@ impl OnlineHandler {
             outcome.response.model = requested;
         }
 
-        if let Some(outcome) = ctx.outcome.as_mut() {
+        let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
             let n = plugins::dlp_redact_response(&snap.cfg.security, &mut outcome.response);
-            if n > 0 {
-                ctx.decide("dlp", format!("redacted {n} span(s) outbound"));
+            // raw decoded deltas are pre-redaction; drop them so no downstream
+            // reconstruction can replay unmasked text past the boundary
+            if dlp {
+                outcome.chunks.clear();
             }
+            n
+        } else {
+            0
+        };
+        if redacted_out > 0 {
+            ctx.decide("dlp", format!("redacted {redacted_out} span(s) outbound"));
         }
         Ok(ctx)
     }
@@ -280,7 +300,11 @@ mod tests {
 
     #[tokio::test]
     async fn aborted_stream_bills_estimated_delivered_tokens() {
-        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        // salvage-partial is a live-streaming behavior; DLP forces buffering, so
+        // disable it to exercise the abort path
+        let mut cfg = GatewayConfig::embedded_default().unwrap();
+        cfg.security.dlp_redact = false;
+        let cfg = Arc::new(cfg);
         let state = Arc::new(GatewayState::from_config(&cfg));
         let h = OnlineHandler::new(
             gw_state::SharedConfig::new(cfg, state),
@@ -334,7 +358,9 @@ mod tests {
 
     #[tokio::test]
     async fn aborted_anthropic_stream_bills_delivered_completion() {
-        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        let mut cfg = GatewayConfig::embedded_default().unwrap();
+        cfg.security.dlp_redact = false;
+        let cfg = Arc::new(cfg);
         let state = Arc::new(GatewayState::from_config(&cfg));
         let h = OnlineHandler::new(
             gw_state::SharedConfig::new(cfg, state),
@@ -356,6 +382,60 @@ mod tests {
             ledger[0].completion_tokens > 0,
             "delivered completion must not bill zero: {:?}",
             ledger[0]
+        );
+    }
+
+    #[derive(Debug)]
+    struct PiiStream;
+
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for PiiStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> GResult<gw_engines::transport::UpstreamResponse> {
+            use futures::StreamExt;
+            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+                Ok(bytes::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"reach me at jane@corp.com now\"}}]}\n\n",
+                )),
+                Ok(bytes::Bytes::from(
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                )),
+                Ok(bytes::Bytes::from("data: [DONE]\n\n")),
+            ];
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::SseStream(
+                    futures::stream::iter(frames).boxed(),
+                ),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dlp_buffers_stream_and_drops_raw_chunks() {
+        // #9: the handler is the DLP boundary — a caller that sets stream_tx
+        // under DLP still gets buffered redaction, and the raw pre-redaction
+        // chunks are cleared so nothing downstream can replay unmasked text.
+        let h = OnlineHandler::new(handler().config.clone(), Arc::new(PiiStream));
+        assert!(h.cfg().security.dlp_redact, "default config has DLP on");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut req = chat_req("gpt-4o", "hello");
+        req.stream = true;
+        req.stream_tx = Some(tx);
+        let ctx = h.run(req, ak(&h).await).await.unwrap();
+        let out = ctx.outcome.expect("outcome");
+        assert!(
+            out.chunks.is_empty(),
+            "raw chunks must be cleared under DLP: {:?}",
+            out.chunks
+        );
+        assert!(
+            !out.response.message.contains("jane@corp.com"),
+            "email must be redacted: {}",
+            out.response.message
         );
     }
 

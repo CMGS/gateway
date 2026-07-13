@@ -225,12 +225,18 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     }
     /// Claim one pending batch (requeuing any running batch whose executor went
     /// stale first). `None` = nothing to run. Only the distributed backend claims.
-    async fn batch_claim_pending(&self, _stale_secs: i64) -> GResult<Option<BatchJob>> {
+    /// The returned `i64` is a fence token bumped on each claim; the executor
+    /// passes it to [`Store::batch_touch`] so a stalled instance whose batch was
+    /// reclaimed detects that it lost ownership.
+    async fn batch_claim_pending(&self, _stale_secs: i64) -> GResult<Option<(BatchJob, i64)>> {
         Ok(None)
     }
-    /// Heartbeat a running batch so its executor isn't judged stale.
-    async fn batch_touch(&self, _id: &str) -> GResult<()> {
-        Ok(())
+    /// Heartbeat a running batch so its executor isn't judged stale. Returns
+    /// `false` if the fence token no longer matches — another instance reclaimed
+    /// the batch, so this executor must stop. Unfenced backends always return
+    /// `true`.
+    async fn batch_touch(&self, _id: &str, _claim: i64) -> GResult<bool> {
+        Ok(true)
     }
 }
 
@@ -496,8 +502,11 @@ impl SqliteStore {
             "ALTER TABLE billing ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE billing ADD COLUMN served_model TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN vendor_cost_micros INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE files ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
-            "ALTER TABLE batches ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
+            // pre-tenant rows had no owner (they were readable by any key); back-
+            // fill them to an unmatchable '' tenant so they fail closed rather
+            // than land in a live tenant. New rows always bind their tenant.
+            "ALTER TABLE files ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batches ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
         ] {
             if let Err(e) = sqlx::query(ddl).execute(&pool).await
                 && !e.to_string().contains("duplicate column name")
@@ -772,8 +781,12 @@ impl PostgresStore {
                 batch_id TEXT NOT NULL, idx BIGINT NOT NULL, messages TEXT NOT NULL,
                 PRIMARY KEY (batch_id, idx))",
             "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ",
-            "ALTER TABLE files ADD COLUMN IF NOT EXISTS tenant TEXT NOT NULL DEFAULT 'default'",
-            "ALTER TABLE batches ADD COLUMN IF NOT EXISTS tenant TEXT NOT NULL DEFAULT 'default'",
+            // fence token: bumped on every claim, so a reclaimed batch's prior
+            // executor sees its conditional heartbeat/writes affect no rows
+            "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_seq BIGINT NOT NULL DEFAULT 0",
+            // back-fill pre-tenant rows to an unmatchable '' tenant (fail closed)
+            "ALTER TABLE files ADD COLUMN IF NOT EXISTS tenant TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE batches ADD COLUMN IF NOT EXISTS tenant TEXT NOT NULL DEFAULT ''",
             // dedup any (batch_id, idx) rows the pre-fix plain-INSERT could have
             // left, so the unique index below builds on an already-upgraded fleet
             "DELETE FROM batch_results a USING batch_results b
@@ -1076,7 +1089,7 @@ impl Store for PostgresStore {
             .collect())
     }
 
-    async fn batch_claim_pending(&self, stale_secs: i64) -> GResult<Option<BatchJob>> {
+    async fn batch_claim_pending(&self, stale_secs: i64) -> GResult<Option<(BatchJob, i64)>> {
         // requeue batches whose executor stopped heartbeating, then claim one
         // pending batch — SKIP LOCKED so concurrent instances never collide.
         sqlx::query(
@@ -1088,33 +1101,42 @@ impl Store for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("requeue stale batches", e))?;
+        // bump claim_seq so any prior (stalled) executor's fenced writes no-op
         let row = sqlx::query(
-            "UPDATE batches SET status = 'running', claimed_at = now()
+            "UPDATE batches SET status = 'running', claimed_at = now(),
+                    claim_seq = claim_seq + 1
              WHERE id = (SELECT id FROM batches WHERE status = 'pending'
                          ORDER BY n FOR UPDATE SKIP LOCKED LIMIT 1)
-             RETURNING id, ak, tenant, model, total",
+             RETURNING id, ak, tenant, model, total, claim_seq",
         )
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("claim batch", e))?;
-        Ok(row.map(|r| BatchJob {
-            id: r.get(0),
-            ak: r.get(1),
-            tenant: r.get(2),
-            model: r.get(3),
-            status: BatchStatus::Running,
-            total: r.get::<i64, _>(4) as usize,
-            results: Vec::new(),
+        Ok(row.map(|r| {
+            (
+                BatchJob {
+                    id: r.get(0),
+                    ak: r.get(1),
+                    tenant: r.get(2),
+                    model: r.get(3),
+                    status: BatchStatus::Running,
+                    total: r.get::<i64, _>(4) as usize,
+                    results: Vec::new(),
+                },
+                r.get::<i64, _>(5),
+            )
         }))
     }
 
-    async fn batch_touch(&self, id: &str) -> GResult<()> {
-        sqlx::query("UPDATE batches SET claimed_at = now() WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("heartbeat batch", e))?;
-        Ok(())
+    async fn batch_touch(&self, id: &str, claim: i64) -> GResult<bool> {
+        let r =
+            sqlx::query("UPDATE batches SET claimed_at = now() WHERE id = $1 AND claim_seq = $2")
+                .bind(id)
+                .bind(claim)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("heartbeat batch", e))?;
+        Ok(r.rows_affected() > 0)
     }
 }
 
@@ -1349,7 +1371,7 @@ mod tests {
             .unwrap();
         assert_eq!(qjob.total, 2);
         loop {
-            let c = store
+            let (c, _claim) = store
                 .batch_claim_pending(120)
                 .await
                 .unwrap()
@@ -1369,7 +1391,60 @@ mod tests {
         let loaded = store.batch_load_items(&qjob.id).await.unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[1][0].content, "two");
-        while let Some(c) = store.batch_claim_pending(0).await.unwrap() {
+
+        // fence token: a reclaim bumps claim_seq so a stalled prior executor's
+        // fenced heartbeat/writes no-op instead of double-running the batch
+        let fjob = store
+            .batch_enqueue("ak-f", "default", "gpt-4o", &qmsgs)
+            .await
+            .unwrap();
+        let t1 = loop {
+            let (c, t) = store
+                .batch_claim_pending(120)
+                .await
+                .unwrap()
+                .expect("claim");
+            if c.id == fjob.id {
+                break t;
+            }
+            store
+                .batch_set_status(&c.id, BatchStatus::Completed)
+                .await
+                .unwrap();
+        };
+        assert!(
+            store.batch_touch(&fjob.id, t1).await.unwrap(),
+            "holder heartbeats"
+        );
+        let t2 = loop {
+            let (c, t) = store
+                .batch_claim_pending(0)
+                .await
+                .unwrap()
+                .expect("reclaim");
+            if c.id == fjob.id {
+                break t;
+            }
+            store
+                .batch_set_status(&c.id, BatchStatus::Completed)
+                .await
+                .unwrap();
+        };
+        assert_ne!(t1, t2, "reclaim bumps the fence token");
+        assert!(
+            !store.batch_touch(&fjob.id, t1).await.unwrap(),
+            "stale token loses the claim"
+        );
+        assert!(
+            store.batch_touch(&fjob.id, t2).await.unwrap(),
+            "new token holds the claim"
+        );
+        store
+            .batch_set_status(&fjob.id, BatchStatus::Completed)
+            .await
+            .unwrap();
+
+        while let Some((c, _claim)) = store.batch_claim_pending(0).await.unwrap() {
             assert_ne!(c.id, qjob.id, "completed batch must stay terminal");
             store
                 .batch_set_status(&c.id, BatchStatus::Completed)

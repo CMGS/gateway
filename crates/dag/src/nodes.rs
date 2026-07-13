@@ -243,10 +243,11 @@ impl DagNode for QuotaCheck {
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let est = reserve_estimate(&ctx.request);
+        let at = gw_state::epoch_secs();
         if !ctx
             .state
             .governance
-            .quota_reserve(&ctx.ak.ak, est, ctx.ak.daily_token_quota)
+            .quota_reserve(&ctx.ak.ak, est, ctx.ak.daily_token_quota, at)
             .await
         {
             return Err(GatewayError::new(
@@ -256,6 +257,7 @@ impl DagNode for QuotaCheck {
             ));
         }
         ctx.quota_reserved = Some(est);
+        ctx.quota_at = at;
         ctx.decide("quota_check", format!("reserved {est}"));
         Ok(())
     }
@@ -693,20 +695,23 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
         },
     );
     let cost = record.cost_micros;
-    // settle reservations to actuals (the model-quota counter stays soft
-    // post-hoc by design); independent keys run as one concurrent round-trip
+    // settle reservations to actuals on the admission day (the model-quota
+    // counter stays soft post-hoc by design); independent keys run concurrently
     let quota_delta = total - ctx.quota_reserved.take().unwrap_or(0);
+    let at = ctx.quota_at;
     match &ctx.model_quota_key {
         Some(key) => {
             tokio::join!(
-                ctx.state.governance.quota_settle(&ctx.ak.ak, quota_delta),
+                ctx.state
+                    .governance
+                    .quota_settle(&ctx.ak.ak, quota_delta, at),
                 ctx.state.governance.quota_consume(key, total)
             );
         }
         None => {
             ctx.state
                 .governance
-                .quota_settle(&ctx.ak.ak, quota_delta)
+                .quota_settle(&ctx.ak.ak, quota_delta, at)
                 .await
         }
     }

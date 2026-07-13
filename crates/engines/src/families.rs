@@ -252,15 +252,15 @@ fn vertex_apply_usage(um: &Value, resp: &mut GatewayResponse) {
         return;
     }
     if let Some(pt) = um["promptTokenCount"].as_i64() {
-        resp.prompt_tokens = pt;
+        resp.prompt_tokens = pt.max(0);
     }
-    let thoughts = um["thoughtsTokenCount"].as_i64().unwrap_or(0);
+    let thoughts = um["thoughtsTokenCount"].as_i64().unwrap_or(0).max(0);
     if let Some(cand) = um["candidatesTokenCount"].as_i64() {
-        resp.completion_tokens = cand + thoughts;
+        resp.completion_tokens = cand.max(0).saturating_add(thoughts);
         resp.reasoning_tokens = thoughts;
     }
     if let Some(tt) = um["totalTokenCount"].as_i64() {
-        resp.total_tokens = tt;
+        resp.total_tokens = tt.max(0);
     }
 }
 

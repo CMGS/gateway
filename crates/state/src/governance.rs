@@ -14,12 +14,19 @@ use crate::{QuotaStore, RateLimiter, TokenWindow, WindowCounter};
 /// Day-keyed quota buckets linger at most this long before self-expiring.
 const QUOTA_TTL_MS: i64 = 2 * 24 * 60 * 60 * 1000;
 
-/// The Redis daily-quota key for `key`, stamped with the UTC day index (unix
-/// epoch is UTC-midnight aligned, so `epoch_secs / 86400` increments exactly at
-/// midnight). Rollover is implicit and identical across replicas — no reset job,
-/// no shared-keyspace wipe.
+/// The Redis daily-quota key for `key` on the UTC day of `at_epoch_secs` (unix
+/// epoch is UTC-midnight aligned, so `/ 86400` increments exactly at midnight).
+/// Rollover is implicit and identical across replicas — no reset job, no shared-
+/// keyspace wipe. Callers pass the admission time so a reserve and its settle
+/// hit the same day even across a midnight boundary.
+fn quota_key_at(key: &str, at_epoch_secs: i64) -> String {
+    format!("gw:quota:{}:{key}", at_epoch_secs / 86_400)
+}
+
+/// The day bucket for "now" — used by the single-shot reads/writes that aren't
+/// part of a reserve/settle pair.
 fn quota_key(key: &str) -> String {
-    format!("gw:quota:{}:{key}", crate::epoch_secs() / 86_400)
+    quota_key_at(key, crate::epoch_secs())
 }
 
 /// The governance operations the request pipeline calls.
@@ -32,10 +39,13 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     async fn quota_check(&self, ak: &str, limit: i64) -> bool;
     /// Admission with reservation: admit while spent-before < `limit`, and
     /// atomically add `amount` so concurrent in-flight requests count against
-    /// the budget. False = rejected (nothing reserved).
-    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64) -> bool;
-    /// Apply the settle delta (actual - reserved; negative refunds).
-    async fn quota_settle(&self, key: &str, delta: i64);
+    /// the budget. False = rejected (nothing reserved). `at_epoch_secs` pins the
+    /// day bucket so a settle lands on the same day this reserve did, even if the
+    /// request straddles UTC midnight.
+    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, at_epoch_secs: i64) -> bool;
+    /// Apply the settle delta (actual - reserved; negative refunds) to the day
+    /// bucket the paired reserve used (`at_epoch_secs`).
+    async fn quota_settle(&self, key: &str, delta: i64, at_epoch_secs: i64);
     /// Tokens spent today by `ak`.
     async fn quota_used(&self, ak: &str) -> i64;
     /// Add to `ak`'s spent tokens.
@@ -79,10 +89,10 @@ impl Governance for MemoryGovernance {
     async fn quota_check(&self, ak: &str, limit: i64) -> bool {
         self.quota.check(ak, limit)
     }
-    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64) -> bool {
+    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, _at: i64) -> bool {
         self.quota.reserve(key, amount, limit)
     }
-    async fn quota_settle(&self, key: &str, delta: i64) {
+    async fn quota_settle(&self, key: &str, delta: i64, _at: i64) {
         self.quota.settle(key, delta);
     }
     async fn quota_used(&self, ak: &str) -> i64 {
@@ -197,7 +207,7 @@ impl Governance for RedisGovernance {
             }
         }
     }
-    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64) -> bool {
+    async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, at: i64) -> bool {
         let mut conn = self.conn.clone();
         // admit while spent-before < limit; the reservation itself may cross
         // the limit (same one-request overshoot the settle corrects). The
@@ -212,7 +222,7 @@ impl Governance for RedisGovernance {
              return 1",
         );
         match script
-            .key(quota_key(key))
+            .key(quota_key_at(key, at))
             .arg(amount)
             .arg(limit)
             .arg(QUOTA_TTL_MS)
@@ -226,16 +236,16 @@ impl Governance for RedisGovernance {
             }
         }
     }
-    async fn quota_settle(&self, key: &str, delta: i64) {
+    async fn quota_settle(&self, key: &str, delta: i64, at: i64) {
         if delta == 0 {
             return;
         }
-        // floor at 0 atomically: a reset/rollover between reserve and settle
-        // must not leave a negative counter that over-admits. Re-arm the TTL in
-        // case the day-key was created by this settle.
+        // floor at 0 atomically, on the SAME day bucket the reserve used (`at`),
+        // so a request that straddles midnight doesn't apply its negative delta
+        // to the next day's counter.
         settle_floored(
             &self.conn,
-            &quota_key(key),
+            &quota_key_at(key, at),
             delta,
             Some(Duration::from_millis(QUOTA_TTL_MS as u64)),
         )
@@ -363,9 +373,10 @@ mod tests {
         assert!(!g.quota_check(&ak, 10).await);
 
         let rkey = format!("r{}", std::process::id());
-        assert!(g.quota_reserve(&rkey, 300, 100).await);
-        assert!(!g.quota_reserve(&rkey, 300, 100).await);
-        g.quota_settle(&rkey, 15 - 300).await;
+        let now = crate::epoch_secs();
+        assert!(g.quota_reserve(&rkey, 300, 100, now).await);
+        assert!(!g.quota_reserve(&rkey, 300, 100, now).await);
+        g.quota_settle(&rkey, 15 - 300, now).await;
         assert_eq!(g.quota_used(&rkey).await, 15);
         assert!(
             g.token_window_reserve(&rkey, 300, 100, Duration::from_secs(60))
@@ -395,15 +406,22 @@ mod tests {
     #[tokio::test]
     async fn reserve_then_settle_semantics() {
         let g = MemoryGovernance::default();
-        assert!(g.quota_reserve("k", 300, 100).await, "admit while under");
-        assert!(!g.quota_reserve("k", 300, 100).await, "in-flight counts");
-        g.quota_settle("k", 15 - 300).await;
+        let now = crate::epoch_secs();
+        assert!(
+            g.quota_reserve("k", 300, 100, now).await,
+            "admit while under"
+        );
+        assert!(
+            !g.quota_reserve("k", 300, 100, now).await,
+            "in-flight counts"
+        );
+        g.quota_settle("k", 15 - 300, now).await;
         assert_eq!(g.quota_used("k").await, 15);
         assert!(
-            g.quota_reserve("k", 300, 100).await,
+            g.quota_reserve("k", 300, 100, now).await,
             "back under after settle"
         );
-        g.quota_settle("k", -300).await;
+        g.quota_settle("k", -300, now).await;
         assert_eq!(g.quota_used("k").await, 15, "refund restores");
 
         let w = Duration::from_secs(60);

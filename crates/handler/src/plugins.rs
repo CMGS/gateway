@@ -58,13 +58,21 @@ fn visit_text(v: &serde_json::Value, f: &mut impl FnMut(&str)) {
     }
 }
 
-/// Visit the free-text fields of the family typed params.
+/// Visit the free-text fields of the family typed params. Chat `tools` and
+/// `tool_choice` are client-supplied JSON forwarded to the vendor, so their
+/// strings (function names/descriptions) must be visited too.
 fn visit_typed_text(typed: &gw_models::TypedParams, f: &mut impl FnMut(&str)) {
     use gw_models::TypedParams as T;
     match typed {
         T::Chat(p) => {
             if let Some(s) = &p.system {
                 f(s);
+            }
+            if let Some(t) = &p.tools {
+                visit_text(t, f);
+            }
+            if let Some(t) = &p.tool_choice {
+                visit_text(t, f);
             }
         }
         T::Embeddings(p) => p.input.iter().for_each(|s| f(s)),
@@ -136,7 +144,17 @@ fn redact_typed(typed: &mut gw_models::TypedParams) -> usize {
         n
     };
     match typed {
-        T::Chat(p) => p.system.as_mut().map(&mut redact_str).unwrap_or(0),
+        T::Chat(p) => {
+            let mut n = p.system.as_mut().map(&mut redact_str).unwrap_or(0);
+            // `tools`/`tool_choice` are client JSON forwarded to the vendor
+            if let Some(t) = p.tools.as_mut() {
+                n += redact_value(t);
+            }
+            if let Some(t) = p.tool_choice.as_mut() {
+                n += redact_value(t);
+            }
+            n
+        }
         T::Embeddings(p) => p.input.iter_mut().map(&mut redact_str).sum(),
         T::AudioTts(p) => redact_str(&mut p.input),
         T::Image(p) => redact_str(&mut p.prompt),

@@ -48,15 +48,27 @@ impl OfflineHandler {
                 .await?;
             let this = self.clone();
             let (id, model) = (job.id.clone(), model.clone());
-            tokio::spawn(async move { this.execute(&id, &ak, &model, msgs).await });
+            // claim 0: in-process runs on a non-distributed store, so there is
+            // no fence token and the heartbeat is a no-op
+            tokio::spawn(async move { this.execute(&id, &ak, &model, msgs, 0).await });
             Ok(job)
         }
     }
 
     /// Run every item of a claimed/submitted batch through the online DAG,
     /// writing results and the terminal status. Heartbeats between items so a
-    /// distributed claim isn't judged stale mid-run.
-    async fn execute(&self, id: &str, ak: &AkInfo, model: &str, items: Vec<Vec<ChatMsg>>) {
+    /// distributed claim isn't judged stale mid-run. `claim` is the fence token
+    /// from [`gw_state::Store::batch_claim_pending`] (0 for the in-process path);
+    /// if a heartbeat reports the batch was reclaimed, this executor stops rather
+    /// than double-running items or clobbering the new owner's status.
+    async fn execute(
+        &self,
+        id: &str,
+        ak: &AkInfo,
+        model: &str,
+        items: Vec<Vec<ChatMsg>>,
+        claim: i64,
+    ) {
         let store = self.online.state().store.clone();
         if let Err(e) = store.batch_set_status(id, BatchStatus::Running).await {
             tracing::error!(error = %e, batch = %id, "batch status write failed");
@@ -83,20 +95,30 @@ impl OfflineHandler {
         // not then be reported Completed
         let mut writes_ok = true;
         // heartbeat claimed_at while items run so a slow item isn't judged
-        // stale and reclaimed by another instance mid-execution
+        // stale and reclaimed by another instance mid-execution; if a heartbeat
+        // reports the fence token no longer matches, another instance already
+        // reclaimed us — stop so we don't double-run or clobber its status
+        let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hb = {
             let store = store.clone();
             let id = id.to_owned();
+            let lost = lost.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 tick.tick().await;
                 loop {
                     tick.tick().await;
-                    let _ = store.batch_touch(&id).await;
+                    if let Ok(false) = store.batch_touch(&id, claim).await {
+                        lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
                 }
             })
         };
         for (index, messages) in items.into_iter().enumerate() {
+            if lost.load(std::sync::atomic::Ordering::Relaxed) {
+                break; // reclaimed by another instance; stop running new items
+            }
             if done_indices.contains(&index) {
                 continue; // already executed and billed before the reclaim
             }
@@ -150,6 +172,9 @@ impl OfflineHandler {
             }
         }
         hb.abort();
+        if lost.load(std::sync::atomic::Ordering::Relaxed) {
+            return; // the reclaiming instance owns the terminal status now
+        }
         // Completed only if every result persisted; a lost write means missing
         // results, so report Failed rather than a Completed-but-incomplete batch.
         let done = if any_fail || !writes_ok {
@@ -169,7 +194,7 @@ impl OfflineHandler {
         let store = self.online.state().store.clone();
         loop {
             match store.batch_claim_pending(stale_secs).await {
-                Ok(Some(job)) => {
+                Ok(Some((job, claim))) => {
                     // a key revoked/banned/expired since submit stops its queued work
                     let ak = match self.online.state().auth.authenticate(&job.ak).await {
                         Some(ak)
@@ -194,7 +219,7 @@ impl OfflineHandler {
                             continue;
                         }
                     };
-                    self.execute(&job.id, &ak, &job.model, items).await;
+                    self.execute(&job.id, &ak, &job.model, items, claim).await;
                 }
                 Ok(None) => tokio::time::sleep(poll).await,
                 Err(e) => {

@@ -35,6 +35,9 @@ pub struct DagContext {
     /// Tokens reserved against the AK daily quota at admission; settled to
     /// actual usage at billing, refunded whole if the pipeline fails.
     pub quota_reserved: Option<i64>,
+    /// Admission timestamp (unix secs), so the daily-quota settle/refund hits the
+    /// same UTC-day bucket the reserve did even if the request crosses midnight.
+    pub quota_at: i64,
     /// Tokens reserved in the AK TPM window at admission (same lifecycle).
     pub tpm_reserved: Option<i64>,
 }
@@ -59,6 +62,7 @@ impl DagContext {
             cache_key: None,
             model_quota_key: None,
             quota_reserved: None,
+            quota_at: 0,
             tpm_reserved: None,
         }
     }

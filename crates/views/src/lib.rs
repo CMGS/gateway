@@ -53,6 +53,9 @@ use serde_json::{Value, json};
 
 const LEDGER_PAGE_DEFAULT: usize = 100;
 const STREAM_CHANNEL_CAP: usize = 64;
+/// Tokens reserved against the AK daily quota per admitted realtime turn, before
+/// the turn's actual usage is known; settled to the real total at billing.
+const REALTIME_TURN_RESERVE: i64 = 1_000;
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -294,27 +297,39 @@ async fn realtime_ws(
     }
 }
 
+/// A realtime turn admitted by [`realtime_gate`]: the freshly re-authenticated
+/// key (so billing attributes to the key's current product/tenant/quotas, not
+/// the stale handshake snapshot), the tokens reserved against the AK daily quota,
+/// and the admission day so the paired settle/refund lands on the same bucket.
+struct RealtimeAdmit {
+    ak: AkInfo,
+    reserved: i64,
+    at: i64,
+}
+
 /// The full governance chain the REST path runs (tenant + AK QPS, product/model
 /// QPM, per-(AK, model) quota, AK daily quota, AK TPM), applied per realtime
 /// generation. Re-fetches the key each turn (the handshake snapshot is stale),
 /// so a key banned/expired/revoked or a model de-entitled mid-session stops
-/// generating and current limit values apply. `None` = admitted.
+/// generating and current limit values apply. `Err` carries the denial message.
 ///
-/// Quota/TPM use check-then-consume rather than the REST path's reserve/settle:
-/// a realtime turn's token count is only known when its usage frame arrives, and
-/// a relayed turn has no single success/failure point at which a reservation
-/// could be refunded, so there is nothing accurate to reserve up front.
-async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Option<String> {
+/// The AK daily quota reserves a fixed per-turn estimate (settled to actuals at
+/// billing) so concurrent turns across parallel sockets count against the budget
+/// instead of all passing a stale check — matching the REST path. The per-(AK,
+/// model) counter stays soft check-then-consume, as it does on REST; TPM is a
+/// self-healing rate window. The reserve is taken last so a denial from any
+/// check above never leaves a reservation behind.
+async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<RealtimeAdmit, String> {
     let snap = s.handler.config.load();
     let (cfg, state) = (&snap.cfg, &snap.state);
     let ak = match state.auth.authenticate(&ak.ak).await {
         Some(fresh) if fresh.status_at(gw_state::epoch_secs()) == gw_state::KeyStatus::Active => {
             fresh
         }
-        _ => return Some(format!("access key {} is no longer valid", ak.ak)),
+        _ => return Err(format!("access key {} is no longer valid", ak.ak)),
     };
     if !cfg.tenant_allows_model(&ak.tenant, model) {
-        return Some(format!(
+        return Err(format!(
             "model `{model}` is not entitled for tenant `{}`",
             ak.tenant
         ));
@@ -323,10 +338,10 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Option<String>
     if let Some(qps) = cfg.find_tenant(&ak.tenant).and_then(|t| t.qps)
         && !gov.rate_allow(&format!("tenant:{}", ak.tenant), qps).await
     {
-        return Some(format!("tenant rate limit exceeded for `{}`", ak.tenant));
+        return Err(format!("tenant rate limit exceeded for `{}`", ak.tenant));
     }
     if !gov.rate_allow(&ak.ak, ak.qps).await {
-        return Some(format!(
+        return Err(format!(
             "rate limit exceeded for ak {} (qps {})",
             ak.ak, ak.qps
         ));
@@ -336,34 +351,42 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Option<String>
             .window_allow(&format!("product:{}", ak.product), qpm, gw_consts::MINUTE)
             .await
     {
-        return Some(format!("product qpm limit exceeded for `{}`", ak.product));
+        return Err(format!("product qpm limit exceeded for `{}`", ak.product));
     }
     if let Some(qpm) = cfg.find_model(model).and_then(|m| m.qpm)
         && !gov
             .window_allow(&format!("model:{model}"), qpm, gw_consts::MINUTE)
             .await
     {
-        return Some(format!("model qpm limit exceeded for `{model}`"));
+        return Err(format!("model qpm limit exceeded for `{model}`"));
     }
     if let Some(limit) = ak.model_quotas.get(model).copied().or_else(|| {
         cfg.find_tenant(&ak.tenant)
             .and_then(|t| t.model_quotas.get(model).copied())
     }) && !gov.quota_check(&format!("{}|{model}", ak.ak), limit).await
     {
-        return Some(format!("model quota exhausted for `{model}`"));
-    }
-    if !gov.quota_check(&ak.ak, ak.daily_token_quota).await {
-        return Some(format!("daily token quota exhausted for ak {}", ak.ak));
+        return Err(format!("model quota exhausted for `{model}`"));
     }
     if let Some(tpm) = ak.tokens_per_minute
         && !gov.token_window_check(&ak.ak, tpm, gw_consts::MINUTE).await
     {
-        return Some(format!(
+        return Err(format!(
             "token-per-minute limit exceeded for ak {} (tpm {tpm})",
             ak.ak
         ));
     }
-    None
+    let at = gw_state::epoch_secs();
+    if !gov
+        .quota_reserve(&ak.ak, REALTIME_TURN_RESERVE, ak.daily_token_quota, at)
+        .await
+    {
+        return Err(format!("daily token quota exhausted for ak {}", ak.ak));
+    }
+    Ok(RealtimeAdmit {
+        ak,
+        reserved: REALTIME_TURN_RESERVE,
+        at,
+    })
 }
 
 /// Bill one realtime generation (quota + TPM window + ledger + metrics). Uses
@@ -371,18 +394,22 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Option<String>
 /// request-pipeline path; the per-(AK, model) counter accrues too.
 async fn bill_realtime_turn(
     s: &AppState,
-    ak: &AkInfo,
+    admit: &RealtimeAdmit,
     model: &str,
     mt: gw_consts::Protocol,
     account: &str,
     it: i64,
     ot: i64,
 ) {
+    let ak = &admit.ak;
     let (it, ot) = (it.max(0), ot.max(0));
     let total = it.saturating_add(ot);
     let state = s.handler.state();
     let gov = &state.governance;
-    gov.quota_consume(&ak.ak, total).await;
+    // settle the admission reserve to this turn's actual total on the reserved
+    // day (an ungated dialect passes reserved = 0, i.e. a plain consume)
+    gov.quota_settle(&ak.ak, total - admit.reserved, admit.at)
+        .await;
     if ak.model_quotas.contains_key(model)
         || s.handler
             .cfg()
@@ -448,12 +475,15 @@ async fn realtime_session(
         };
         match ev["type"].as_str().unwrap_or_default() {
             "input_text" => {
-                if let Some(denied) = realtime_gate(&s, &ak, &model).await {
-                    let _ = socket
-                        .send(send(json!({"type":"error","message": denied})))
-                        .await;
-                    continue;
-                }
+                let admit = match realtime_gate(&s, &ak, &model).await {
+                    Ok(a) => a,
+                    Err(denied) => {
+                        let _ = socket
+                            .send(send(json!({"type":"error","message": denied})))
+                            .await;
+                        continue;
+                    }
+                };
                 let input = ev["text"].as_str().unwrap_or_default().to_owned();
                 let reply = format!("[mock-realtime:{model}] you said: {input}");
                 let (it, ot) = (
@@ -475,7 +505,7 @@ async fn realtime_session(
                     .send(send(json!({"type":"response.done",
                         "usage":{"input_tokens": it, "output_tokens": ot}})))
                     .await;
-                bill_realtime_turn(&s, &ak, &model, mt, &account, it, ot).await;
+                bill_realtime_turn(&s, &admit, &model, mt, &account, it, ot).await;
             }
             "session.close" => {
                 let _ = socket.send(send(json!({"type":"session.closed"}))).await;
@@ -545,7 +575,7 @@ fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
     // never trust upstream token counts: floor at 0 so a negative can't refund
     // quota or write a negative ledger row
     let usage = (usage.0.max(0), usage.1.max(0));
-    (usage.0 + usage.1 > 0).then_some(usage)
+    (usage.0.saturating_add(usage.1) > 0).then_some(usage)
 }
 
 async fn realtime_bridge(
@@ -603,23 +633,32 @@ async fn realtime_bridge(
 
     let mut generations = 0u64;
     let mut billed_turns = 0u64;
+    // turns admitted (reserved) but not yet billed, oldest first — one active
+    // response at a time keeps this FIFO; drained on each usage frame, refunded
+    // on exit so a dropped/errored turn's reserve never leaks.
+    let mut pending: std::collections::VecDeque<RealtimeAdmit> = std::collections::VecDeque::new();
     loop {
         tokio::select! {
             m = cl_rx.next() => match m {
                 Some(Ok(CMsg::Text(t))) => {
                     // gate each generation trigger, not every control frame
                     if is_response_create(t.as_bytes()) {
-                        if let Some(denied) = realtime_gate(&s, &ak, &model).await {
-                            if cl_tx
-                                .send(CMsg::Text(send_err(denied).to_string().into()))
-                                .await
-                                .is_err()
-                            {
-                                break;
+                        match realtime_gate(&s, &ak, &model).await {
+                            Ok(admit) => {
+                                pending.push_back(admit);
+                                generations += 1;
                             }
-                            continue;
+                            Err(denied) => {
+                                if cl_tx
+                                    .send(CMsg::Text(send_err(denied).to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
                         }
-                        generations += 1;
                     }
                     if up_tx.send(UMsg::text(t.to_string())).await.is_err() {
                         break;
@@ -627,17 +666,22 @@ async fn realtime_bridge(
                 }
                 Some(Ok(CMsg::Binary(b))) => {
                     if is_response_create(&b) {
-                        if let Some(denied) = realtime_gate(&s, &ak, &model).await {
-                            if cl_tx
-                                .send(CMsg::Text(send_err(denied).to_string().into()))
-                                .await
-                                .is_err()
-                            {
-                                break;
+                        match realtime_gate(&s, &ak, &model).await {
+                            Ok(admit) => {
+                                pending.push_back(admit);
+                                generations += 1;
                             }
-                            continue;
+                            Err(denied) => {
+                                if cl_tx
+                                    .send(CMsg::Text(send_err(denied).to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
                         }
-                        generations += 1;
                     }
                     if up_tx.send(UMsg::binary(b)).await.is_err() {
                         break;
@@ -651,7 +695,32 @@ async fn realtime_bridge(
                     if let Ok(v) = serde_json::from_str::<Value>(&t)
                         && let Some((it, ot)) = realtime_usage(&account.provider, &v)
                     {
-                        bill_realtime_turn(&s, &ak, &model, mt, &account.name, it, ot).await;
+                        // settle the matching admitted turn (FIFO); a usage frame
+                        // with no gated turn (ungated dialect) bills unreserved
+                        match pending.pop_front() {
+                            Some(a) => {
+                                bill_realtime_turn(&s, &a, &model, mt, &account.name, it, ot).await
+                            }
+                            None => {
+                                // ungated dialect: no reserve to settle, plain
+                                // consume against the handshake key
+                                let unreserved = RealtimeAdmit {
+                                    ak: ak.clone(),
+                                    reserved: 0,
+                                    at: gw_state::epoch_secs(),
+                                };
+                                bill_realtime_turn(
+                                    &s,
+                                    &unreserved,
+                                    &model,
+                                    mt,
+                                    &account.name,
+                                    it,
+                                    ot,
+                                )
+                                .await
+                            }
+                        }
                         billed_turns += 1;
                     }
                     if cl_tx.send(CMsg::Text(t.to_string().into())).await.is_err() {
@@ -666,6 +735,14 @@ async fn realtime_bridge(
                 Some(Ok(UMsg::Close(_))) | Some(Err(_)) | None => break,
                 Some(Ok(_)) => {} // ping/pong handled by the ws stacks
             },
+        }
+    }
+    // refund reserves for turns that never produced a usage frame (session
+    // dropped mid-generation, or an errored/cancelled turn)
+    if !pending.is_empty() {
+        let gov = &s.handler.state().governance;
+        for a in pending {
+            gov.quota_settle(&a.ak.ak, -a.reserved, a.at).await;
         }
     }
     if generations > 0 && billed_turns == 0 {
@@ -2624,6 +2701,47 @@ mod tests {
             None,
             "zero usage never bills"
         );
+    }
+
+    #[tokio::test]
+    async fn realtime_gate_reserves_settles_and_refunds() {
+        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let ak = s
+            .handler
+            .state()
+            .auth
+            .authenticate("ak-demo-123")
+            .await
+            .unwrap();
+        let gov = || s.handler.state().governance.clone();
+        let used = || async { gov().quota_used(&ak.ak).await };
+
+        // admission reserves a fixed per-turn estimate up front, so a concurrent
+        // turn admitted before this one bills already counts against the budget
+        let a1 = realtime_gate(&s, &ak, "gpt-4o").await.expect("admit");
+        assert_eq!(used().await, REALTIME_TURN_RESERVE);
+
+        // billing settles the reserve to the turn's actual total (30 + 70)
+        bill_realtime_turn(
+            &s,
+            &a1,
+            "gpt-4o",
+            gw_consts::Protocol::Realtime,
+            "acc",
+            30,
+            70,
+        )
+        .await;
+        assert_eq!(used().await, 100);
+
+        // a turn that admits but never produces a usage frame is refunded whole
+        // by the bridge's close path, leaving only the settled turn's total
+        let a2 = realtime_gate(&s, &ak, "gpt-4o").await.expect("admit");
+        assert_eq!(used().await, 100 + REALTIME_TURN_RESERVE);
+        gov().quota_settle(&a2.ak.ak, -a2.reserved, a2.at).await;
+        assert_eq!(used().await, 100);
     }
 
     #[test]
