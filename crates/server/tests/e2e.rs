@@ -1507,6 +1507,54 @@ models:
 }
 
 #[tokio::test]
+async fn realtime_authenticates_via_ws_subprotocol() {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let application = app();
+    tokio::spawn(async move {
+        axum::serve(listener, application).await.unwrap();
+    });
+
+    // browser pattern: no Authorization header, the AK rides in the
+    // Sec-WebSocket-Protocol list
+    let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        "realtime, gw-api-key.ak-demo-123".parse().unwrap(),
+    );
+    let (mut ws, resp) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws connect via subprotocol auth");
+    assert_eq!(
+        resp.headers()
+            .get("sec-websocket-protocol")
+            .and_then(|v| v.to_str().ok()),
+        Some("realtime")
+    );
+    let first = ws.next().await.unwrap().unwrap();
+    let v: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    assert_eq!(v["type"], "session.created");
+
+    // a bogus subprotocol key (and no header) is rejected at the upgrade
+    let mut bad = format!("ws://{addr}/v1/realtime?model=realtime")
+        .into_client_request()
+        .unwrap();
+    bad.headers_mut().insert(
+        "sec-websocket-protocol",
+        "realtime, gw-api-key.nope".parse().unwrap(),
+    );
+    assert!(
+        tokio_tungstenite::connect_async(bad).await.is_err(),
+        "invalid subprotocol AK must be rejected"
+    );
+}
+
+#[tokio::test]
 async fn realtime_turns_are_rate_limited() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;

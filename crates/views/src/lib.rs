@@ -121,6 +121,21 @@ async fn track_requests(
     resp
 }
 
+/// The AK carried in the `Sec-WebSocket-Protocol` list as `gw-api-key.<ak>` —
+/// the one place a browser WebSocket can put a credential (it cannot set
+/// arbitrary headers); same pattern as OpenAI's realtime browser auth. A query
+/// parameter would leak the key into every LB access log.
+fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("sec-websocket-protocol")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("gw-api-key."))
+        .map(str::to_owned)
+}
+
 /// GET /v1/realtime?model=... (WebSocket upgrade).
 /// An account with a real endpoint bridges the session to the vendor's
 /// realtime WebSocket; an endpoint-less account serves the local mock session
@@ -131,16 +146,15 @@ async fn realtime_ws(
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
-    // Auth: header or ?ak= (fallback when a ws client can't easily set headers)
+    // Auth: header, or the gw-api-key.<ak> subprotocol for browser clients
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err((st, msg)) => match q
-            .get("ak")
-            .and_then(|k| s.handler.state.auth.authenticate(k))
-        {
-            Some(ak) => ak,
-            None => return error_response(st, msg),
-        },
+        Err((st, msg)) => {
+            match ws_subprotocol_ak(&headers).and_then(|k| s.handler.state.auth.authenticate(&k)) {
+                Some(ak) => ak,
+                None => return error_response(st, msg),
+            }
+        }
     };
     let Some(model) = q.get("model").cloned() else {
         return error_response(400, "model query param is required");
@@ -169,6 +183,8 @@ async fn realtime_ws(
     ) else {
         return error_response(503, format!("no healthy upstream account serves `{model}`"));
     };
+    // select "realtime" so subprotocol-offering clients get a valid handshake
+    let ws = ws.protocols(["realtime"]);
     // an account with a real endpoint bridges to the vendor; else the local mock
     if account.endpoint.is_empty() {
         ws.on_upgrade(move |socket| realtime_session(socket, s, ak, model, mt, account.name))
