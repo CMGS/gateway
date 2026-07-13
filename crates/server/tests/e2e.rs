@@ -2526,6 +2526,151 @@ models:
     assert_eq!(records[0].total_tokens, 13);
 }
 
+/// Server-VAD: the upstream auto-starts a turn (`response.created`) with no
+/// client `response.create`. The bridge must gate it like a manual turn — admit
+/// the first (billing it), then deny an over-quota second turn by cancelling it
+/// upstream and erroring the client, so it never bills.
+#[tokio::test]
+async fn realtime_bridge_gates_server_vad_turns() {
+    use axum::routing::any;
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    async fn vendor_ws(ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Response {
+        ws.on_upgrade(|mut socket| async move {
+            use axum::extract::ws::Message as M;
+            let send = |v: Value| M::Text(v.to_string().into());
+            let _ = socket
+                .send(send(serde_json::json!({"type":"session.created"})))
+                .await;
+            while let Some(Ok(M::Text(t))) = socket.recv().await {
+                let Ok(v) = serde_json::from_str::<Value>(&t) else {
+                    continue;
+                };
+                // VAD trigger: auto-start a response with no response.create. Then
+                // race real generation against a gateway cancel — mirroring a real
+                // upstream that aborts (zero usage) when the gateway denies the turn.
+                if v["type"] == "input_audio_buffer.append" {
+                    let _ = socket
+                        .send(send(serde_json::json!({"type":"response.created"})))
+                        .await;
+                    tokio::select! {
+                        m = socket.recv() => {
+                            if let Some(Ok(M::Text(c))) = m
+                                && serde_json::from_str::<Value>(&c)
+                                    .map(|c| c["type"] == "response.cancel")
+                                    .unwrap_or(false)
+                            {
+                                let _ = socket
+                                    .send(send(serde_json::json!({"type":"response.done",
+                                        "response":{"status":"cancelled","usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}})))
+                                    .await;
+                            }
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {
+                            let _ = socket
+                                .send(send(serde_json::json!({"type":"response.output_text.delta","delta":"vad"})))
+                                .await;
+                            let _ = socket
+                                .send(send(serde_json::json!({"type":"response.done",
+                                    "response":{"usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13}}})))
+                                .await;
+                        }
+                    }
+                }
+            }
+        })
+    }
+    let vendor_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let vendor_addr = vendor_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            vendor_listener,
+            axum::Router::new().route("/v1/realtime", any(vendor_ws)),
+        )
+        .await
+        .unwrap();
+    });
+
+    // daily_token_quota 10: the first turn's 1000-token reserve admits (spent
+    // was under), settling to 13; the second sees spent 13 >= 10 and is denied
+    let yaml = format!(
+        r#"
+listen: {{host: 127.0.0.1, port: 0}}
+access_keys:
+  - {{ak: ak-vad, product: rt, qps: 100, daily_token_quota: 10}}
+accounts:
+  - {{name: rt-vendor, provider: openai, endpoint: "http://{vendor_addr}", protocols: ["realtime"]}}
+models:
+  - {{name: rt-model, protocol: realtime}}
+"#
+    );
+    let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(&yaml).unwrap());
+    let state = Arc::new(gw_state::GatewayState::from_config(&cfg));
+    let application = gw_views::app(gw_views::AppState::new(
+        cfg,
+        state.clone(),
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, application).await.unwrap();
+    });
+
+    let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer ak-vad".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws connect");
+    // drain session.created
+    let _ = ws.next().await.unwrap().unwrap();
+
+    let append = || {
+        Message::text(
+            serde_json::json!({"type":"input_audio_buffer.append","audio":"aGk="}).to_string(),
+        )
+    };
+
+    // turn 1: admitted, streams and bills 13 tokens
+    ws.send(append()).await.unwrap();
+    let mut done1 = None;
+    while let Some(Ok(msg)) = ws.next().await {
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        if v["type"] == "response.done" {
+            done1 = Some(v);
+            break;
+        }
+    }
+    assert_eq!(done1.unwrap()["response"]["usage"]["total_tokens"], 13);
+
+    // turn 2: over quota — the gateway must deny it (error frame), and it must
+    // not bill
+    ws.send(append()).await.unwrap();
+    let mut saw_error = false;
+    while let Some(Ok(msg)) = ws.next().await {
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        if v["type"] == "error" {
+            saw_error = true;
+        }
+        if v["type"] == "response.done" {
+            break; // cancelled response.done ends turn 2
+        }
+    }
+    assert!(saw_error, "an over-quota server-VAD turn must be denied");
+
+    let (count, records) = state.store.ledger_snapshot(usize::MAX).await.unwrap();
+    assert_eq!(
+        count, 1,
+        "only the admitted turn bills; the denied one does not"
+    );
+    assert_eq!(records[0].total_tokens, 13);
+}
+
 #[tokio::test]
 async fn realtime_authenticates_via_ws_subprotocol() {
     use futures::StreamExt;

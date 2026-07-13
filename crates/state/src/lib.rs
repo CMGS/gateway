@@ -308,9 +308,11 @@ impl QuotaStore {
         self.used(ak) < limit
     }
 
-    /// Post-consume the actual token usage.
+    /// Post-consume the actual token usage. Saturating: a hostile upstream can
+    /// drive `tokens` to i64::MAX (usage is floored, not capped).
     pub fn consume(&self, ak: &str, tokens: i64) {
-        *self.used.entry(ak.to_owned()).or_insert(0) += tokens;
+        let mut e = self.used.entry(ak.to_owned()).or_insert(0);
+        *e = e.saturating_add(tokens);
     }
 
     /// Admission with reservation, atomic under the entry guard: admit while
@@ -320,14 +322,14 @@ impl QuotaStore {
         if *e >= limit {
             return false;
         }
-        *e += amount;
+        *e = e.saturating_add(amount);
         true
     }
 
     /// Apply the settle delta (actual - reserved); never below zero.
     pub fn settle(&self, key: &str, delta: i64) {
         let mut e = self.used.entry(key.to_owned()).or_insert(0);
-        *e = (*e + delta).max(0);
+        *e = e.saturating_add(delta).max(0);
     }
 
     /// Daily reset. Driven by the gw-task background job as an in-process
@@ -492,19 +494,20 @@ impl TokenWindow {
         if e.1 >= limit {
             return false;
         }
-        e.1 += amount;
+        e.1 = e.1.saturating_add(amount);
         true
     }
 
     /// Apply the settle delta to the current window; never below zero.
     pub fn settle(&self, key: &str, delta: i64, window: std::time::Duration) {
         let mut e = self.slot(key, window);
-        e.1 = (e.1 + delta).max(0);
+        e.1 = e.1.saturating_add(delta).max(0);
     }
 
-    /// Post-add actual token usage.
+    /// Post-add actual token usage (saturating on a hostile i64::MAX count).
     pub fn add(&self, key: &str, tokens: i64, window: std::time::Duration) {
-        self.slot(key, window).1 += tokens;
+        let mut e = self.slot(key, window);
+        e.1 = e.1.saturating_add(tokens);
     }
 
     /// The current window's entry, rotated if elapsed. Rotation and the

@@ -70,7 +70,13 @@ impl OfflineHandler {
         claim: i64,
     ) {
         let store = self.online.state().store.clone();
-        if let Err(e) = store.batch_set_status(id, BatchStatus::Running).await {
+        // the distributed claim already set status=running atomically with the
+        // fence bump; only the in-process path (claim 0, created 'pending') needs
+        // this write. Writing it unfenced on the distributed path could resurrect
+        // a batch a stale worker no longer owns back to Running.
+        if claim == 0
+            && let Err(e) = store.batch_set_status(id, BatchStatus::Running).await
+        {
             tracing::error!(error = %e, batch = %id, "batch status write failed");
         }
         // resume past items already recorded by a prior (crashed) executor, so

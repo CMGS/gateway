@@ -752,8 +752,20 @@ async fn realtime_bridge(
                                         .await
                                 }
                                 None if it.saturating_add(ot) > 0 => {
+                                    // ungated boundary: a denied server-VAD turn's
+                                    // partial usage, or a dialect with no
+                                    // response.created. Re-authenticate for fresh
+                                    // billing identity rather than the stale
+                                    // handshake key (falls back to it if deleted).
+                                    let billed = s
+                                        .handler
+                                        .state()
+                                        .auth
+                                        .authenticate(&ak.ak)
+                                        .await
+                                        .unwrap_or_else(|| ak.clone());
                                     let unreserved = RealtimeAdmit {
-                                        ak: ak.clone(),
+                                        ak: billed,
                                         reserved: 0,
                                         tpm_reserved: None,
                                         at: gw_state::epoch_secs(),

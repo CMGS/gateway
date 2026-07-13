@@ -308,12 +308,15 @@ impl Store for MemoryStore {
                     cost_micros: 0,
                     vendor_cost_micros: 0,
                 });
+            // saturating: a hostile upstream can drive a single record's counts
+            // to i64::MAX (usage is floored, not capped), so the rollup sum must
+            // not overflow across records
             e.requests += 1;
-            e.prompt_tokens += r.prompt_tokens;
-            e.completion_tokens += r.completion_tokens;
-            e.total_tokens += r.total_tokens;
-            e.cost_micros += r.cost_micros;
-            e.vendor_cost_micros += r.vendor_cost_micros;
+            e.prompt_tokens = e.prompt_tokens.saturating_add(r.prompt_tokens);
+            e.completion_tokens = e.completion_tokens.saturating_add(r.completion_tokens);
+            e.total_tokens = e.total_tokens.saturating_add(r.total_tokens);
+            e.cost_micros = e.cost_micros.saturating_add(r.cost_micros);
+            e.vendor_cost_micros = e.vendor_cost_micros.saturating_add(r.vendor_cost_micros);
         }
         Ok(rollup.into_values().collect())
     }
