@@ -292,6 +292,32 @@ impl MockTransport {
         let user = Self::last_user_text(body["input"]["messages"].as_array().unwrap_or(&vec![]));
         let reply = format!("[mock-dashscope] you said: {user}");
         let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
+        if req.stream {
+            // real wire: LF framing, `data:` without a space, id:/event:/comment
+            // lines, finish_reason the literal string "null" until the final
+            // frame, usage cumulative per frame
+            let mid = reply.len() / 2;
+            let (a, b) = reply.split_at(mid);
+            let frame = |i: usize, content: &str, fr: &str, out: i64| {
+                format!(
+                    "id:{i}\nevent:result\n:HTTP_STATUS/200\ndata:{}\n\n",
+                    json!({"output":{"choices":[{"message":{"content":content,"role":"assistant"},
+                                                 "finish_reason":fr}]},
+                           "usage":{"input_tokens":it,"output_tokens":out,"total_tokens":it+out},
+                           "request_id":"dashscope-mock"})
+                )
+            };
+            let sse = format!(
+                "{}{}{}",
+                frame(1, a, "null", ot / 2),
+                frame(2, b, "null", ot),
+                frame(3, "", "stop", ot),
+            );
+            return Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::Sse(sse.into_bytes()),
+            });
+        }
         Self::ok_json(json!({
             "output": {"choices": [{"finish_reason": "stop",
                 "message": {"role": "assistant", "content": reply}}]},

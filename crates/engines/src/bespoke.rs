@@ -11,9 +11,10 @@ use gw_models::{
 };
 use serde_json::{Value, json};
 
-use crate::engine::{EngineOutcome, ModelEngine};
+use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::sigv4::{SigV4Params, sign};
-use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest};
+use crate::sse::SseDecoder;
+use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 
 struct Base {
     request: GatewayRequest,
@@ -80,12 +81,15 @@ impl Base {
         }
     }
 
-    async fn post_json(
+    /// Build and send an upstream POST, returning the raw reply (no buffering)
+    /// so streaming engines can pump it incrementally.
+    async fn post_raw(
         &self,
         url: &str,
         mut headers: Vec<(String, String)>,
         mut body: Value,
-    ) -> GResult<(u16, Value)> {
+        stream: bool,
+    ) -> GResult<UpstreamResponse> {
         let param = self
             .request
             .model_param_v2
@@ -116,10 +120,23 @@ impl Base {
             url: url.to_owned(),
             headers,
             body: body.to_string().into_bytes(),
-            stream: false,
+            stream,
             account: self.account(),
         };
-        let reply = self.transport.send(up).await?.buffered().await?;
+        self.transport.send(up).await
+    }
+
+    async fn post_json(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Value,
+    ) -> GResult<(u16, Value)> {
+        let reply = self
+            .post_raw(url, headers, body, false)
+            .await?
+            .buffered()
+            .await?;
         let bytes = match &reply.body {
             UpstreamBody::Json(b) => b,
             UpstreamBody::Sse(_) | UpstreamBody::SseStream(_) => {
@@ -480,12 +497,8 @@ impl ModelEngine for LlamaEngine {
 
 bespoke_engine!(DashScopeEngine);
 
-#[async_trait::async_trait]
-impl ModelEngine for DashScopeEngine {
-    /// Ali DashScope native wire (not the openai-compatible mode):
-    /// {model, input:{messages}, parameters:{result_format:"message",…}};
-    /// response {output:{choices:[{message,finish_reason}]}, usage{input/output/total_tokens}}.
-    async fn run(&self) -> GResult<EngineOutcome> {
+impl DashScopeEngine {
+    fn build_body(&self, stream: bool) -> GResult<Value> {
         let model = self.base.model_name()?.to_owned();
         let messages: Vec<Value> = self
             .base
@@ -500,6 +513,10 @@ impl ModelEngine for DashScopeEngine {
             })
             .collect();
         let mut parameters = json!({"result_format": "message"});
+        if stream {
+            // deltas instead of the full-text-so-far in every frame
+            parameters["incremental_output"] = json!(true);
+        }
         if let Some(p) = self.base.chat_params() {
             if let Some(t) = p.temperature {
                 parameters["temperature"] = json!(t);
@@ -511,49 +528,154 @@ impl ModelEngine for DashScopeEngine {
                 parameters["max_tokens"] = json!(mt);
             }
         }
-        let body = json!({"model": model, "input": {"messages": messages},
-                          "parameters": parameters});
-        let ds_url = format!(
+        Ok(json!({"model": model, "input": {"messages": messages},
+                  "parameters": parameters}))
+    }
+
+    fn url(&self) -> String {
+        format!(
             "{}/api/v1/services/aigc/text-generation/generation",
             self.base.base_url("mock://dashscope.aliyuncs.com")
-        );
+        )
+    }
+
+    fn headers(&self, stream: bool) -> Vec<(String, String)> {
+        let mut h = vec![(
+            "authorization".into(),
+            format!("Bearer {}", self.base.api_key()),
+        )];
+        if stream {
+            // DashScope streams only when this header is present
+            h.push(("X-DashScope-SSE".into(), "enable".into()));
+        }
+        h
+    }
+
+    /// Native DashScope streaming: SSE frames decoded as they arrive and
+    /// forwarded through `stream_tx` when the request carries one (same
+    /// live-pump contract as the OpenAI engine).
+    async fn run_stream(&self) -> GResult<EngineOutcome> {
+        use futures::StreamExt;
+        let body = self.build_body(true)?;
+        let reply = self
+            .base
+            .post_raw(&self.url(), self.headers(true), body, true)
+            .await?;
+        let status = reply.status;
+        let mut resp = GatewayResponse {
+            model: self.base.model_name()?.to_owned(),
+            http_code: status as i64,
+            ..Default::default()
+        };
+        let mut full = String::new();
+        let mut chunks = Vec::new();
+        let tx = self.base.request.stream_tx.clone();
+        let mut sent_any = false;
+        match reply.body {
+            UpstreamBody::Json(b) => {
+                // a stream request answered with JSON is an error body
+                let v: Value = serde_json::from_slice(&b)
+                    .map_err(|e| GatewayError::internal("parse dashscope reply").with_source(e))?;
+                if let Some(err) = crate::engine::vendor_error(status, &v) {
+                    return Err(err);
+                }
+                return Err(GatewayError::internal(
+                    "expected sse from dashscope streaming",
+                ));
+            }
+            UpstreamBody::Sse(b) => {
+                let (events, _done) = SseDecoder::decode_all(&b);
+                for ev in events {
+                    let v: Value = serde_json::from_slice(ev.as_bytes()).map_err(|e| {
+                        GatewayError::internal("parse dashscope sse frame").with_source(e)
+                    })?;
+                    chunks.extend(dashscope_apply_frame(&v, status, &mut resp, &mut full)?);
+                }
+            }
+            UpstreamBody::SseStream(mut s) => {
+                let mut dec = SseDecoder::default();
+                while let Some(item) = s.next().await {
+                    let bytes = item.map_err(|e| {
+                        if sent_any {
+                            GatewayError::client_closed(format!(
+                                "upstream stream failed mid-response: {e}"
+                            ))
+                        } else {
+                            GatewayError::new(
+                                gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                                502,
+                                format!("upstream stream failed: {e}"),
+                            )
+                        }
+                    })?;
+                    for data in dec.feed(&bytes) {
+                        let v: Value = serde_json::from_str(&data).map_err(|e| {
+                            GatewayError::internal("parse dashscope sse frame").with_source(e)
+                        })?;
+                        for chunk in dashscope_apply_frame(&v, status, &mut resp, &mut full)? {
+                            match &tx {
+                                Some(tx) => {
+                                    tx.send(chunk).await.map_err(|_| {
+                                        GatewayError::client_closed("client stream closed")
+                                    })?;
+                                    sent_any = true;
+                                }
+                                None => chunks.push(chunk),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        resp.message = full;
+        if resp.total_tokens == 0 {
+            resp.total_tokens = resp.prompt_tokens + resp.completion_tokens;
+        }
+        resp.raw_usage_json = dashscope_raw_usage(&resp);
+        Ok(EngineOutcome {
+            response: resp,
+            http_code: status,
+            chunks,
+            streamed_live: sent_any,
+            ..Default::default()
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelEngine for DashScopeEngine {
+    /// Ali DashScope native wire (not the openai-compatible mode):
+    /// {model, input:{messages}, parameters:{result_format:"message",…}};
+    /// response {output:{choices:[{message,finish_reason}]}, usage{input/output/total_tokens}}.
+    /// Streaming: `X-DashScope-SSE: enable` + `incremental_output`.
+    async fn run(&self) -> GResult<EngineOutcome> {
+        if self.base.request.stream {
+            return self.run_stream().await;
+        }
+        let body = self.build_body(false)?;
         let (status, v) = self
             .base
-            .post_json(
-                &ds_url,
-                vec![(
-                    "authorization".into(),
-                    format!("Bearer {}", self.base.api_key()),
-                )],
-                body,
-            )
+            .post_json(&self.url(), self.headers(false), body)
             .await?;
         let choice = &v["output"]["choices"][0];
-        let usage = &v["usage"];
-        let (input, output) = (
-            usage["input_tokens"].as_i64().unwrap_or(0),
-            usage["output_tokens"].as_i64().unwrap_or(0),
-        );
-        // usage dialect normalized to the openai shape at the engine boundary (same as Vertex)
-        let raw_usage = json!({"prompt_tokens": input, "completion_tokens": output,
-                                "total_tokens": usage["total_tokens"].as_i64().unwrap_or(input + output)});
-        let resp = GatewayResponse {
+        let mut resp = GatewayResponse {
             message: choice["message"]["content"]
                 .as_str()
                 .unwrap_or_default()
                 .to_owned(),
-            model,
+            model: self.base.model_name()?.to_owned(),
             finish_reason: choice["finish_reason"]
                 .as_str()
                 .unwrap_or("stop")
                 .to_owned(),
-            prompt_tokens: input,
-            completion_tokens: output,
-            total_tokens: input + output,
-            raw_usage_json: raw_usage.to_string().into_bytes(),
             http_code: status as i64,
             ..Default::default()
         };
+        dashscope_apply_usage(&v["usage"], &mut resp);
+        if resp.total_tokens == 0 {
+            resp.total_tokens = resp.prompt_tokens + resp.completion_tokens;
+        }
+        resp.raw_usage_json = dashscope_raw_usage(&resp);
         Ok(EngineOutcome {
             response: resp,
             http_code: status,
@@ -564,6 +686,73 @@ impl ModelEngine for DashScopeEngine {
     fn recorder(&self) -> &dyn Recorder {
         &self.base.recorder
     }
+}
+
+/// Apply one DashScope SSE frame; returns the chunks it yields. Running
+/// frames carry the literal string "null" as finish_reason; usage is
+/// cumulative — the last frame's counts win.
+fn dashscope_apply_frame(
+    v: &Value,
+    status: u16,
+    resp: &mut GatewayResponse,
+    full: &mut String,
+) -> GResult<Vec<StreamChunk>> {
+    if let Some(err) = crate::engine::vendor_error(status, v) {
+        return Err(err);
+    }
+    let mut chunks = Vec::new();
+    let choice = &v["output"]["choices"][0];
+    if let Some(t) = choice["message"]["content"].as_str()
+        && !t.is_empty()
+    {
+        full.push_str(t);
+        chunks.push(StreamChunk {
+            delta: t.to_owned(),
+            ..Default::default()
+        });
+    }
+    if let Some(fr) = choice["finish_reason"].as_str()
+        && !fr.is_empty()
+        && fr != "null"
+    {
+        resp.finish_reason = fr.to_owned();
+        chunks.push(StreamChunk {
+            finish_reason: Some(fr.to_owned()),
+            ..Default::default()
+        });
+    }
+    dashscope_apply_usage(&v["usage"], resp);
+    Ok(chunks)
+}
+
+fn dashscope_apply_usage(usage: &Value, resp: &mut GatewayResponse) {
+    if usage.is_null() {
+        return;
+    }
+    if let Some(it) = usage["input_tokens"].as_i64() {
+        resp.prompt_tokens = it;
+    }
+    if let Some(ot) = usage["output_tokens"].as_i64() {
+        resp.completion_tokens = ot;
+    }
+    if let Some(tt) = usage["total_tokens"].as_i64() {
+        resp.total_tokens = tt;
+    }
+    if let Some(cached) = usage["prompt_tokens_details"]["cached_tokens"].as_i64() {
+        resp.read_cached_prompt_tokens = cached;
+    }
+}
+
+/// usage dialect normalized to the openai shape at the engine boundary.
+fn dashscope_raw_usage(resp: &GatewayResponse) -> Vec<u8> {
+    json!({
+        "prompt_tokens": resp.prompt_tokens,
+        "completion_tokens": resp.completion_tokens,
+        "total_tokens": resp.total_tokens,
+        "prompt_tokens_details": {"cached_tokens": resp.read_cached_prompt_tokens},
+    })
+    .to_string()
+    .into_bytes()
 }
 
 #[cfg(test)]
@@ -630,6 +819,23 @@ mod tests {
         assert!(out.response.message.contains("[mock-llama]"));
         assert!(out.response.total_tokens > 0);
     }
+    #[tokio::test]
+    async fn dashscope_stream_decodes_frames() {
+        let mut r = req(Protocol::Dashscope, "qwen-max");
+        r.stream = true;
+        let e = DashScopeEngine::new(r, t());
+        let out = e.run().await.unwrap();
+        assert!(out.chunks.len() >= 3, "chunks: {:?}", out.chunks);
+        assert!(
+            out.response
+                .message
+                .contains("[mock-dashscope] you said: hello bespoke")
+        );
+        assert_eq!(out.response.finish_reason, "stop");
+        assert!(out.response.prompt_tokens > 0 && out.response.completion_tokens > 0);
+        assert!(out.chunks.iter().any(|c| c.finish_reason.is_some()));
+    }
+
     #[tokio::test]
     async fn dashscope_wire_shape() {
         let e = DashScopeEngine::new(req(Protocol::Dashscope, "qwen-max"), t());
