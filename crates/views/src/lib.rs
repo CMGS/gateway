@@ -217,12 +217,17 @@ async fn realtime_ws(
     if mt != gw_consts::Protocol::Realtime {
         return error_response(400, format!("`{model}` is not a realtime model"));
     }
-    let Some(account) = snap.state.pool.select_healthy(
-        mt,
-        model_conf.and_then(|m| m.provider.as_deref()),
-        &[],
-        &snap.state.health,
-    ) else {
+    let account = snap
+        .state
+        .pool
+        .select_healthy(
+            mt,
+            model_conf.and_then(|m| m.provider.as_deref()),
+            &[],
+            snap.state.health.as_ref(),
+        )
+        .await;
+    let Some(account) = account else {
         return error_response(503, format!("no healthy upstream account serves `{model}`"));
     };
     // select "realtime" so subprotocol-offering clients get a valid handshake
@@ -611,22 +616,19 @@ async fn ledger(
 
 /// Account pool view (name/provider/tier/priority/served model family).
 async fn accounts(State(s): State<AppState>) -> Json<Value> {
-    let data: Vec<Value> = s
-        .handler
-        .cfg()
-        .accounts
-        .iter()
-        .map(|a| {
-            json!({
-                "name": a.name,
-                "provider": a.provider,
-                "priority": a.priority,
-                "tier": if a.tier.is_empty() { "paygo" } else { a.tier.as_str() },
-                "health": s.handler.state().health.status(&a.name),
-                "protocols": a.protocols,
-            })
-        })
-        .collect();
+    let cfg = s.handler.cfg();
+    let health = &s.handler.state().health;
+    let mut data: Vec<Value> = Vec::with_capacity(cfg.accounts.len());
+    for a in &cfg.accounts {
+        data.push(json!({
+            "name": a.name,
+            "provider": a.provider,
+            "priority": a.priority,
+            "tier": if a.tier.is_empty() { "paygo" } else { a.tier.as_str() },
+            "health": health.status(&a.name).await,
+            "protocols": a.protocols,
+        }));
+    }
     Json(json!({ "count": data.len(), "accounts": data }))
 }
 

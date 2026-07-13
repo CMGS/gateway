@@ -14,10 +14,12 @@ use gw_consts::Protocol;
 use gw_models::Account;
 
 pub mod governance;
+pub mod health;
 pub mod keystore;
 pub mod store;
 
 pub use governance::{Governance, MemoryGovernance, RedisGovernance};
+pub use health::{HealthStore, RedisHealth};
 pub use keystore::{KeyStore, PostgresKeyStore};
 pub use store::*;
 
@@ -338,19 +340,19 @@ impl AccountPool {
 
     /// Same as `select_excluding`, plus a health filter: accounts in cooldown are
     /// excluded.
-    pub fn select_healthy(
+    pub async fn select_healthy(
         &self,
         p: Protocol,
         provider: Option<&str>,
         excluded: &[String],
-        health: &AccountHealth,
+        health: &dyn HealthStore,
     ) -> Option<Account> {
-        let unhealthy: Vec<String> = self
-            .accounts
-            .iter()
-            .filter(|a| a.protocols.contains(&p) && !health.available(&a.name))
-            .map(|a| a.name.clone())
-            .collect();
+        let mut unhealthy: Vec<String> = Vec::new();
+        for a in self.accounts.iter().filter(|a| a.protocols.contains(&p)) {
+            if !health.available(&a.name).await {
+                unhealthy.push(a.name.clone());
+            }
+        }
         let mut all_excluded = excluded.to_vec();
         all_excluded.extend(unhealthy);
         self.select_excluding(p, provider, &all_excluded)
@@ -589,8 +591,9 @@ pub struct GatewayState {
     /// Durable records (ledger/files/batches): memory by default, sqlite when
     /// `storage.sqlite_path` is configured (swapped in by the server at boot).
     pub store: Arc<dyn Store>,
-    /// Account health (cooldown/recovery).
-    pub health: Arc<AccountHealth>,
+    /// Account health (cooldown/recovery): in-process by default, Redis for
+    /// fleet-wide cooldown.
+    pub health: Arc<dyn HealthStore>,
     /// Request-level response cache.
     pub cache: Arc<ResponseCache>,
 }

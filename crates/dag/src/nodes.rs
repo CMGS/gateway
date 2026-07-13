@@ -257,7 +257,8 @@ impl DagNode for SelectAccount {
         let account = ctx
             .state
             .pool
-            .select_healthy(mt, provider.as_deref(), &[], &ctx.state.health)
+            .select_healthy(mt, provider.as_deref(), &[], ctx.state.health.as_ref())
+            .await
             .ok_or_else(|| {
                 GatewayError::new(
                     ErrCode::SYSTEM_ERROR,
@@ -485,7 +486,7 @@ impl DagNode for CallEngine {
                 if !outcome.response.aborted
                     && let Some(a) = ctx.request.account.as_ref()
                 {
-                    ctx.state.health.record_success(&a.name);
+                    ctx.state.health.record_success(&a.name).await;
                 }
                 ctx.decide(
                     "call_engine",
@@ -508,6 +509,7 @@ impl DagNode for CallEngine {
                     .state
                     .health
                     .record_failure(&failed.name, threshold, cooldown)
+                    .await
                 {
                     ctx.decide(
                         "account_health",
@@ -518,12 +520,17 @@ impl DagNode for CallEngine {
                     );
                 }
                 let provider = model_provider(ctx);
-                let Some(next) = ctx.state.pool.select_healthy(
-                    mt,
-                    provider.as_deref(),
-                    std::slice::from_ref(&failed.name),
-                    &ctx.state.health,
-                ) else {
+                let next = ctx
+                    .state
+                    .pool
+                    .select_healthy(
+                        mt,
+                        provider.as_deref(),
+                        std::slice::from_ref(&failed.name),
+                        ctx.state.health.as_ref(),
+                    )
+                    .await;
+                let Some(next) = next else {
                     return Err(first_err); // no backup account available, propagate the original error
                 };
                 let spillover = failed.is_ptu() && !next.is_ptu();
@@ -538,7 +545,7 @@ impl DagNode for CallEngine {
                 let retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
                 match retry.run().await {
                     Ok(mut outcome) => {
-                        ctx.state.health.record_success(&next.name);
+                        ctx.state.health.record_success(&next.name).await;
                         outcome.response.ptu_spillover = spillover;
                         ctx.outcome = Some(outcome);
                         Ok(())
@@ -546,7 +553,8 @@ impl DagNode for CallEngine {
                     Err(e) => {
                         ctx.state
                             .health
-                            .record_failure(&next.name, threshold, cooldown);
+                            .record_failure(&next.name, threshold, cooldown)
+                            .await;
                         Err(e)
                     }
                 }

@@ -70,6 +70,15 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!(error = %e, "redis connect failed; staying in-process");
             }
         }
+        match gw_state::RedisHealth::connect(&cfg.storage.redis_url).await {
+            Ok(h) => {
+                state.health = Arc::new(h);
+                tracing::info!("account health = redis (fleet-wide cooldown)");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "redis health connect failed; staying in-process");
+            }
+        }
     }
     if !cfg.storage.postgres_url.is_empty() {
         state.store = Arc::new(
