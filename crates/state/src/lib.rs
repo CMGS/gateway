@@ -129,14 +129,17 @@ impl AkAuth {
         }
     }
 
-    /// Update quota fields of an existing key in place; returns the new view.
-    /// `None` if the key doesn't exist.
+    /// Update quota/lifecycle fields of an existing key in place; returns the
+    /// new view. `None` if the key doesn't exist.
+    #[allow(clippy::too_many_arguments)]
     pub fn patch(
         &self,
         ak: &str,
         qps: Option<f64>,
         daily_token_quota: Option<i64>,
         tokens_per_minute: Option<Option<i64>>,
+        expires_at_epoch_secs: Option<Option<i64>>,
+        banned: Option<bool>,
     ) -> Option<AkInfo> {
         let mut e = self.keys.get_mut(ak)?;
         if let Some(v) = qps {
@@ -148,7 +151,20 @@ impl AkAuth {
         if let Some(v) = tokens_per_minute {
             e.0.tokens_per_minute = v;
         }
+        if let Some(v) = expires_at_epoch_secs {
+            e.0.expires_at_epoch_secs = v;
+        }
+        if let Some(v) = banned {
+            e.0.banned = v;
+        }
         Some(e.0.clone())
+    }
+
+    /// Every key in the table, sorted by ak for stable listings.
+    pub fn list(&self) -> Vec<AkInfo> {
+        let mut keys: Vec<AkInfo> = self.keys.iter().map(|e| e.value().0.clone()).collect();
+        keys.sort_by(|a, b| a.ak.cmp(&b.ak));
+        keys
     }
 
     /// Remove a key regardless of source; returns whether it existed.
@@ -735,10 +751,11 @@ mod tests {
         );
         // patch + revoke
         let patched = auth
-            .patch("ak-admin", Some(9.0), None, Some(Some(5)))
+            .patch("ak-admin", Some(9.0), None, Some(Some(5)), None, Some(true))
             .unwrap();
         assert_eq!(patched.qps, 9.0);
         assert_eq!(patched.tokens_per_minute, Some(5));
+        assert!(patched.banned);
         assert!(auth.revoke("ak-admin"));
         assert!(auth.authenticate("ak-admin").is_none());
         assert!(!auth.revoke("ak-admin"));

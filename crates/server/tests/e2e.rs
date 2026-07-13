@@ -397,6 +397,170 @@ async fn tenant_entitlement_gates_models_and_catalog() {
 }
 
 #[tokio::test]
+async fn tenant_scoped_admin() {
+    const YAML: &str = r#"
+listen: {host: 127.0.0.1, port: 0}
+admin: {token_env: GW_TEST_GLOBAL_ADMIN_TSA}
+models: [{name: gpt-4o, protocol: openai-chat}]
+accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
+tenants:
+  - {name: acme, admin_token_env: GW_TEST_ACME_ADMIN_TSA}
+  - {name: beta}
+access_keys:
+  - {ak: ak-beta-key, tenant: beta, product: demo, qps: 100, daily_token_quota: 1000000}
+"#;
+    // SAFETY: unique var names for this test; no concurrent reader of them.
+    unsafe {
+        std::env::set_var("GW_TEST_GLOBAL_ADMIN_TSA", "g-secret");
+        std::env::set_var("GW_TEST_ACME_ADMIN_TSA", "t-secret");
+    }
+    let cfg = Arc::new(GatewayConfig::from_yaml(YAML).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let admin = |method: &str, uri: &str, token: &str, body: Option<&str>| {
+        let b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"));
+        match body {
+            Some(j) => b
+                .header("content-type", "application/json")
+                .body(Body::from(j.to_owned()))
+                .unwrap(),
+            None => b.body(Body::empty()).unwrap(),
+        }
+    };
+
+    // tenant admin creates a key; tenant defaults to its own scope
+    let r = app
+        .clone()
+        .oneshot(admin(
+            "POST",
+            "/admin/keys",
+            "t-secret",
+            Some(r#"{"ak":"ak-acme-new","product":"demo","qps":100,"daily_token_quota":1000}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let r = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", Some("ak-acme-new"), CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "tenant-created key serves");
+
+    // cross-tenant create is refused; cross-tenant patch/delete answer 404
+    let r = app
+        .clone()
+        .oneshot(admin(
+            "POST",
+            "/admin/keys",
+            "t-secret",
+            Some(r#"{"ak":"x","product":"p","tenant":"beta"}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    for (method, uri) in [
+        ("PATCH", "/admin/keys/ak-beta-key"),
+        ("DELETE", "/admin/keys/ak-beta-key"),
+    ] {
+        let r = app
+            .clone()
+            .oneshot(admin(method, uri, "t-secret", Some(r#"{"qps":1}"#)))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::NOT_FOUND,
+            "{method} on another tenant's key must not leak its existence"
+        );
+    }
+
+    // reload is global-only
+    let r = app
+        .clone()
+        .oneshot(admin("POST", "/admin/reload", "t-secret", None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+    // listing is scoped; the global token sees everything
+    let r = app
+        .clone()
+        .oneshot(admin("GET", "/admin/keys", "t-secret", None))
+        .await
+        .unwrap();
+    let j = body_json(r).await;
+    assert_eq!(j["count"], 1);
+    assert_eq!(j["keys"][0]["ak"], "ak-acme-new");
+    let r = app
+        .clone()
+        .oneshot(admin("GET", "/admin/keys", "g-secret", None))
+        .await
+        .unwrap();
+    let j = body_json(r).await;
+    assert_eq!(j["count"], 2);
+
+    // tenant admin bans its own key via PATCH → the key 403s; unban restores it
+    let r = app
+        .clone()
+        .oneshot(admin(
+            "PATCH",
+            "/admin/keys/ak-acme-new",
+            "t-secret",
+            Some(r#"{"banned":true}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", Some("ak-acme-new"), CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+    // usage rollup: beta traffic exists, but the acme admin sees only acme
+    let r = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", Some("ak-beta-key"), CHAT_BODY))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = app
+        .clone()
+        .oneshot(admin("GET", "/admin/usage", "t-secret", None))
+        .await
+        .unwrap();
+    let j = body_json(r).await;
+    let tenants: Vec<&str> = j["usage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["tenant"].as_str().unwrap())
+        .collect();
+    assert_eq!(tenants, vec!["acme"], "usage is tenant-scoped");
+    let r = app
+        .oneshot(admin("GET", "/admin/usage", "g-secret", None))
+        .await
+        .unwrap();
+    let j = body_json(r).await;
+    let tenants: Vec<&str> = j["usage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["tenant"].as_str().unwrap())
+        .collect();
+    assert_eq!(tenants, vec!["acme", "beta"], "global usage sees all");
+}
+
+#[tokio::test]
 async fn model_quota_degrades_to_fallback() {
     let app = app();
     // beta caps gpt-4o at 20 tokens/day per key; each mock call uses ~15.

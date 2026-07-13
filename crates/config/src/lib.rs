@@ -272,6 +272,23 @@ pub struct TenantConf {
     /// None = pass through unmetered (the per-AK daily cap still backstops).
     #[serde(default)]
     pub fallback_model: Option<String>,
+    /// Env var holding this tenant's admin bearer token: it manages only this
+    /// tenant's keys/usage on `/admin/*`. Empty = no tenant-scoped admin.
+    #[serde(default)]
+    pub admin_token_env: String,
+}
+
+impl TenantConf {
+    /// The tenant admin token, read from its env var at call time; `None` when
+    /// unconfigured (this tenant has no scoped admin access).
+    pub fn admin_token(&self) -> Option<String> {
+        if self.admin_token_env.is_empty() {
+            return None;
+        }
+        std::env::var(&self.admin_token_env)
+            .ok()
+            .filter(|t| !t.is_empty())
+    }
 }
 
 /// First-class provider preset: `kind` fixes the endpoint, auth style, and

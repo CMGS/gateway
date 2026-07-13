@@ -125,7 +125,8 @@ pub fn app(state: AppState) -> Router {
         .route("/internal/ledger", get(ledger))
         .route("/internal/accounts", get(accounts))
         .route("/admin/reload", post(admin_reload))
-        .route("/admin/keys", post(admin_key_create))
+        .route("/admin/keys", post(admin_key_create).get(admin_key_list))
+        .route("/admin/usage", get(admin_usage))
         .route(
             "/admin/keys/{ak}",
             axum::routing::patch(admin_key_patch).delete(admin_key_delete),
@@ -674,22 +675,51 @@ fn error_response(status: u16, message: impl Into<String>) -> Response {
         .into_response()
 }
 
-/// Admin surface gate: a bearer check against the configured admin token.
-/// Disabled (404) when no token is configured, so probing the surface can't
-/// tell it apart from a nonexistent route.
-fn admin_auth(s: &AppState, headers: &HeaderMap) -> Result<(), (u16, &'static str)> {
-    let Some(token) = s.handler.cfg().admin.token() else {
+/// Who an admin bearer token speaks for: the global operator, or one tenant
+/// (which may only touch its own keys and usage).
+enum AdminScope {
+    Global,
+    Tenant(String),
+}
+
+impl AdminScope {
+    /// Whether this scope may act on a key belonging to `tenant`.
+    fn covers(&self, tenant: &str) -> bool {
+        match self {
+            AdminScope::Global => true,
+            AdminScope::Tenant(t) => t == tenant,
+        }
+    }
+}
+
+/// Admin surface gate: a bearer check against the global admin token, then
+/// each tenant's scoped token. Disabled (404) while no admin token of any kind
+/// is configured, so probing the surface can't tell it apart from a
+/// nonexistent route.
+fn admin_auth(s: &AppState, headers: &HeaderMap) -> Result<AdminScope, (u16, &'static str)> {
+    let cfg = s.handler.cfg();
+    let global = cfg.admin.token();
+    if global.is_none() && !cfg.tenants.iter().any(|t| t.admin_token().is_some()) {
         return Err((404, "not found"));
-    };
+    }
     let presented = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    if presented == Some(token.as_str()) {
-        Ok(())
-    } else {
-        Err((401, "invalid admin token"))
+    let Some(presented) = presented else {
+        return Err((401, "invalid admin token"));
+    };
+    if global.as_deref() == Some(presented) {
+        return Ok(AdminScope::Global);
     }
+    if let Some(t) = cfg
+        .tenants
+        .iter()
+        .find(|t| t.admin_token().as_deref() == Some(presented))
+    {
+        return Ok(AdminScope::Tenant(t.name.clone()));
+    }
+    Err((401, "invalid admin token"))
 }
 
 /// POST /admin/reload — re-read config from source and swap it in atomically
@@ -697,8 +727,12 @@ fn admin_auth(s: &AppState, headers: &HeaderMap) -> Result<(), (u16, &'static st
 /// account health, and cache preserved). Storage-backend URL changes need a
 /// restart.
 async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err((st, msg)) = admin_auth(&s, &headers) {
-        return error_response(st, msg);
+    match admin_auth(&s, &headers) {
+        Ok(AdminScope::Global) => {}
+        Ok(AdminScope::Tenant(_)) => {
+            return error_response(403, "reload requires the global admin token");
+        }
+        Err((st, msg)) => return error_response(st, msg),
     }
     match s.reload() {
         Ok(()) => {
@@ -731,20 +765,36 @@ async fn admin_key_create(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err((st, msg)) = admin_auth(&s, &headers) {
-        return error_response(st, msg);
-    }
+    let scope = match admin_auth(&s, &headers) {
+        Ok(scope) => scope,
+        Err((st, msg)) => return error_response(st, msg),
+    };
     let (Some(ak), Some(product)) = (body["ak"].as_str(), body["product"].as_str()) else {
         return error_response(400, "ak and product are required");
     };
+    // A tenant admin creates keys in its own tenant only (and that's the
+    // default when the body omits one); overwriting another tenant's key is
+    // rejected before the write.
+    let default_tenant = match &scope {
+        AdminScope::Global => gw_config::DEFAULT_TENANT,
+        AdminScope::Tenant(t) => t.as_str(),
+    };
+    let tenant = body["tenant"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .unwrap_or(default_tenant);
+    if !scope.covers(tenant) {
+        return error_response(403, "tenant admin may only create keys in its own tenant");
+    }
+    if let Some(existing) = s.handler.state().auth.authenticate(ak)
+        && !scope.covers(&existing.tenant)
+    {
+        return error_response(403, "key exists under another tenant");
+    }
     let info = AkInfo {
         ak: ak.to_owned(),
         product: product.to_owned(),
-        tenant: body["tenant"]
-            .as_str()
-            .filter(|t| !t.is_empty())
-            .unwrap_or(gw_config::DEFAULT_TENANT)
-            .to_owned(),
+        tenant: tenant.to_owned(),
         qps: body["qps"].as_f64().unwrap_or(0.0),
         daily_token_quota: body["daily_token_quota"].as_i64().unwrap_or(0),
         tokens_per_minute: body["tokens_per_minute"].as_i64(),
@@ -767,21 +817,32 @@ async fn admin_key_create(
         .into_response()
 }
 
-/// PATCH /admin/keys/{ak} — re-quota an existing key (qps / daily_token_quota /
-/// tokens_per_minute). Only the fields present in the body change.
+/// PATCH /admin/keys/{ak} — re-quota or re-state an existing key (qps /
+/// daily_token_quota / tokens_per_minute / expires_at_epoch_secs / banned).
+/// Only the fields present in the body change.
 async fn admin_key_patch(
     State(s): State<AppState>,
     headers: HeaderMap,
     Path(ak): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err((st, msg)) = admin_auth(&s, &headers) {
-        return error_response(st, msg);
+    let scope = match admin_auth(&s, &headers) {
+        Ok(scope) => scope,
+        Err((st, msg)) => return error_response(st, msg),
+    };
+    // Another tenant's key answers 404 (not 403) so a tenant admin can't
+    // probe which keys exist outside its scope.
+    match s.handler.state().auth.authenticate(&ak) {
+        Some(existing) if !scope.covers(&existing.tenant) => {
+            return error_response(404, format!("key {ak} not found"));
+        }
+        _ => {}
     }
-    // tokens_per_minute is Option<Option<i64>>: absent = leave, null = clear, a
-    // number = set. A malformed value leaves it unchanged (never silently drops
-    // the cap), matching how qps/daily_token_quota ignore malformed input.
-    let tpm = match body.get("tokens_per_minute") {
+    // tokens_per_minute / expires_at_epoch_secs are Option<Option<i64>>:
+    // absent = leave, null = clear, a number = set. A malformed value leaves
+    // the field unchanged (never silently drops a cap or an expiry), matching
+    // how qps/daily_token_quota ignore malformed input.
+    let tri = |field: &str| match body.get(field) {
         Some(Value::Null) => Some(None),
         Some(v) if v.is_i64() || v.is_u64() => Some(v.as_i64()),
         _ => None,
@@ -790,7 +851,9 @@ async fn admin_key_patch(
         &ak,
         body["qps"].as_f64(),
         body["daily_token_quota"].as_i64(),
-        tpm,
+        tri("tokens_per_minute"),
+        tri("expires_at_epoch_secs"),
+        body["banned"].as_bool(),
     ) {
         Some(info) => (
             StatusCode::OK,
@@ -815,8 +878,15 @@ async fn admin_key_delete(
     headers: HeaderMap,
     Path(ak): Path<String>,
 ) -> Response {
-    if let Err((st, msg)) = admin_auth(&s, &headers) {
-        return error_response(st, msg);
+    let scope = match admin_auth(&s, &headers) {
+        Ok(scope) => scope,
+        Err((st, msg)) => return error_response(st, msg),
+    };
+    match s.handler.state().auth.authenticate(&ak) {
+        Some(existing) if !scope.covers(&existing.tenant) => {
+            return error_response(404, format!("key {ak} not found"));
+        }
+        _ => {}
     }
     if s.handler.state().auth.revoke(&ak) {
         (
@@ -827,6 +897,86 @@ async fn admin_key_delete(
     } else {
         error_response(404, format!("key {ak} not found"))
     }
+}
+
+/// GET /admin/keys — the key table, scoped: a tenant admin sees only its own
+/// tenant's keys.
+async fn admin_key_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    let scope = match admin_auth(&s, &headers) {
+        Ok(scope) => scope,
+        Err((st, msg)) => return error_response(st, msg),
+    };
+    let keys: Vec<Value> = s
+        .handler
+        .state()
+        .auth
+        .list()
+        .into_iter()
+        .filter(|k| scope.covers(&k.tenant))
+        .map(|k| {
+            json!({
+                "ak": k.ak, "product": k.product, "tenant": k.tenant,
+                "qps": k.qps, "daily_token_quota": k.daily_token_quota,
+                "tokens_per_minute": k.tokens_per_minute,
+                "expires_at_epoch_secs": k.expires_at_epoch_secs,
+                "banned": k.banned,
+            })
+        })
+        .collect();
+    Json(json!({ "count": keys.len(), "keys": keys })).into_response()
+}
+
+/// GET /admin/usage — ledger rollup by (tenant, requested model). A tenant
+/// admin sees only its own tenant; the global admin may filter with ?tenant=.
+async fn admin_usage(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let scope = match admin_auth(&s, &headers) {
+        Ok(scope) => scope,
+        Err((st, msg)) => return error_response(st, msg),
+    };
+    let filter = match &scope {
+        AdminScope::Tenant(t) => Some(t.clone()),
+        AdminScope::Global => q.get("tenant").cloned(),
+    };
+    let (_, records) = match s.handler.state().store.ledger_snapshot(usize::MAX).await {
+        Ok(v) => v,
+        Err(e) => return gateway_error(e),
+    };
+    #[derive(Default)]
+    struct Agg {
+        requests: i64,
+        prompt: i64,
+        completion: i64,
+        total: i64,
+        cost_micros: i64,
+    }
+    let mut rollup: std::collections::BTreeMap<(String, String), Agg> =
+        std::collections::BTreeMap::new();
+    for r in records {
+        if filter.as_deref().is_some_and(|t| t != r.tenant) {
+            continue;
+        }
+        let e = rollup.entry((r.tenant, r.model)).or_default();
+        e.requests += 1;
+        e.prompt += r.prompt_tokens;
+        e.completion += r.completion_tokens;
+        e.total += r.total_tokens;
+        e.cost_micros += r.cost_micros;
+    }
+    let usage: Vec<Value> = rollup
+        .into_iter()
+        .map(|((tenant, model), a)| {
+            json!({
+                "tenant": tenant, "model": model, "requests": a.requests,
+                "prompt_tokens": a.prompt, "completion_tokens": a.completion,
+                "total_tokens": a.total, "cost_micros": a.cost_micros,
+            })
+        })
+        .collect();
+    Json(json!({ "usage": usage })).into_response()
 }
 
 fn gateway_error(e: GatewayError) -> Response {
