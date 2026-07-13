@@ -37,10 +37,12 @@ Use the sample [`deploy/nginx.conf`](../deploy/nginx.conf). The essentials:
 - **Chat/completions/embeddings/etc.** are stateless — any instance, no
   affinity needed.
 - **Realtime WebSocket** pins naturally (the connection lives on one instance).
-- **Batch**: submit runs the job on the receiving instance's background task.
-  With a shared `Store`, polling `GET /v1/batches/{id}` works from any
-  instance; without it, poll must return to the submitting instance (use
-  `ip_hash` or a sticky cookie on `/v1/batches`).
+- **Batch**: with the Postgres store, submission persists the items and any
+  instance's drain loop claims and runs the batch (`FOR UPDATE SKIP LOCKED`),
+  so execution survives the submitter restarting and a crashed executor's
+  work is requeued. On a local store (memory/sqlite) the job runs on the
+  receiving instance; polling `GET /v1/batches/{id}` needs the submitting
+  instance (use `ip_hash` on `/v1/batches`).
 
 ## Dynamic config
 

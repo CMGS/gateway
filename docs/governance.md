@@ -49,6 +49,14 @@ fixed 1s window in Redis); the token/window counters are fixed windows. When
 Redis is configured and unreachable, limits fail open (requests pass) and a
 warning is logged — a persistent outage never silently wedges the gateway.
 
+Daily-token and TPM admission **reserve then settle**: on admission a cheap
+estimate (prompt heuristic + requested `max_tokens`) is reserved atomically, so
+concurrent in-flight requests count against the budget instead of all passing a
+stale check and jointly overshooting. Billing settles the reservation to actual
+usage; a failed request refunds it. Charged price is the model's list price, or
+a tenant's `model_prices` override; when an account declares `cost_*_price` the
+ledger also records the vendor cost, so margin is queryable via `/admin/usage`.
+
 A streaming response that breaks after delivery has begun (client disconnect or
 upstream failure) is billed for what was delivered: the vendor's usage frame
 never arrives, so the token count is estimated from the request and the

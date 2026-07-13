@@ -25,6 +25,7 @@ storage:
   sqlite_path: /var/lib/gw/store.db   # empty/absent = in-memory
   postgres_url: postgres://gw:secret@db.internal/gw   # fleet-shared backend
   redis_url: redis://cache.internal:6379              # shared counters + health
+  shared_cache: false                 # also share the response cache in Redis (needs redis_url)
   ledger_max_rows: 100000             # prune oldest billing rows past the cap; 0 = unlimited
 ```
 
@@ -32,9 +33,12 @@ The billing ledger, uploaded files, and batch jobs live here. In-memory by
 default (lost on restart); a SQLite path makes them durable on one node.
 `postgres_url` turns Postgres into the fleet backend: the source of truth for
 config (versioned documents + a change feed every instance follows), the
-shared access-key table, and the shared ledger/files/batches store.
+shared access-key table, the shared ledger/files/batches store, and a
+distributed batch queue (any instance claims and runs submitted batches).
 `redis_url` shares rate/quota/TPM counters and account-health cooldowns across
-instances.
+instances; `shared_cache: true` additionally moves the request cache into
+Redis so a hit on one instance serves the fleet (off = each instance caches
+in-process, a miss just recomputes).
 
 ### `access_keys` — client authentication and per-key governance
 
@@ -63,6 +67,8 @@ tenants:
       gpt-4o: 100000
     fallback_model: gpt-4o-mini     # over-quota requests degrade here instead of failing
     admin_token_env: ACME_ADMIN_TOKEN   # optional tenant-scoped /admin token
+    model_prices:            # optional per-model charged-price override for this tenant
+      gpt-4o: {input_price_per_1k_micros: 5000, output_price_per_1k_micros: 20000}
 ```
 
 Keys without a `tenant` join the implicit `default` tenant (no pooled limits,
@@ -115,10 +121,15 @@ accounts:
     connect_retries: 1         # connect-phase retries; an in-flight request is never replayed
     api_key_env: ""            # env var name holding the API key (never the key itself)
     secret_key_env: ""         # AWS only: env var of the secret key (api_key_env = access key id)
+    cost_input_price_per_1k_micros: 100   # optional: what this vendor charges us (margin accounting)
+    cost_output_price_per_1k_micros: 400
 ```
 
 Secrets never live in config files: `api_key_env` names an environment
-variable that is read per request.
+variable that is read per request. The optional `cost_*_price` fields record
+what the vendor charges, so the ledger carries `vendor_cost_micros` alongside
+the charged `cost_micros` and margin is queryable per tenant/model via
+`GET /admin/usage`.
 
 ### `security`, `stability`, `products`
 

@@ -113,7 +113,7 @@ surface on a private network regardless.
 | POST | `/admin/keys` | create/replace a key: `{ak, product, tenant?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` |
 | PATCH | `/admin/keys/{ak}` | update any of `qps` / `daily_token_quota` / `tokens_per_minute` / `expires_at_epoch_secs` (null clears) / `banned` |
 | DELETE | `/admin/keys/{ak}` | revoke a key |
-| GET | `/admin/usage` | ledger rollup by tenant × model; `?tenant=` filter for the global token |
+| GET | `/admin/usage` | ledger rollup by tenant × model (requests, tokens, charged `cost_micros`, `vendor_cost_micros` for margin); `?tenant=` filter for the global token |
 
 Two token tiers: the global token (`admin.token_env`) manages everything; a
 tenant's `admin_token_env` token manages only that tenant's keys and usage
