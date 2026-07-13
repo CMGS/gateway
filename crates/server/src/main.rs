@@ -79,53 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("{host}:{port}");
 
     let cfg = Arc::new(cfg);
-    let mut state = GatewayState::from_config(&cfg);
-    if !cfg.storage.postgres_url.is_empty() {
-        use gw_state::KeyStore;
-        let ks = gw_state::PostgresKeyStore::connect(&cfg.storage.postgres_url).await?;
-        ks.reload_config_keys(&cfg.access_keys).await?;
-        state.auth = Arc::new(ks);
-        tracing::info!("key store = postgres (config keys seeded)");
-    }
-    if !cfg.storage.redis_url.is_empty() {
-        match gw_state::RedisGovernance::connect(&cfg.storage.redis_url).await {
-            Ok(g) => {
-                state.governance = Arc::new(g);
-                tracing::info!(url = %cfg.storage.redis_url, "governance = redis");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "redis connect failed; staying in-process");
-            }
-        }
-        match gw_state::RedisHealth::connect(&cfg.storage.redis_url).await {
-            Ok(h) => {
-                state.health = Arc::new(h);
-                tracing::info!("account health = redis (fleet-wide cooldown)");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "redis health connect failed; staying in-process");
-            }
-        }
-    }
-    if !cfg.storage.postgres_url.is_empty() {
-        state.store = Arc::new(
-            gw_state::PostgresStore::connect_with_cap(
-                &cfg.storage.postgres_url,
-                cfg.storage.ledger_max_rows,
-            )
-            .await?,
-        );
-        tracing::info!("store = postgres");
-    } else if !cfg.storage.sqlite_path.is_empty() {
-        state.store = Arc::new(
-            gw_state::SqliteStore::open_with_cap(
-                &cfg.storage.sqlite_path,
-                cfg.storage.ledger_max_rows,
-            )
-            .await?,
-        );
-        tracing::info!(path = %cfg.storage.sqlite_path, "store = sqlite");
-    }
+    let state = GatewayState::build(&cfg).await?;
     let state = Arc::new(state);
     tracing::info!(
         access_keys = cfg.access_keys.len(),

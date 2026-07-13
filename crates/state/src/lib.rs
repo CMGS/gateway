@@ -645,6 +645,61 @@ impl GatewayState {
         }
     }
 
+    /// Build state with the backends the config selects: Postgres becomes the
+    /// key table + durable store (and aborts on failure — it is the source of
+    /// truth when configured); Redis backs governance + account health
+    /// (fail-soft: a connect error logs and stays in-process).
+    pub async fn build(cfg: &GatewayConfig) -> gw_models::GResult<Self> {
+        let mut state = GatewayState {
+            pool: AccountPool::from_config(cfg),
+            ..Default::default()
+        };
+        if cfg.storage.postgres_url.is_empty() {
+            for k in &cfg.access_keys {
+                state.auth.put(AkInfo::from(k), KeySource::Config).await?;
+            }
+        } else {
+            let ks = PostgresKeyStore::connect(&cfg.storage.postgres_url).await?;
+            ks.reload_config_keys(&cfg.access_keys).await?;
+            state.auth = Arc::new(ks);
+            tracing::info!("key store = postgres (config keys seeded)");
+            state.store = Arc::new(
+                PostgresStore::connect_with_cap(
+                    &cfg.storage.postgres_url,
+                    cfg.storage.ledger_max_rows,
+                )
+                .await?,
+            );
+            tracing::info!("store = postgres");
+        }
+        if cfg.storage.postgres_url.is_empty() && !cfg.storage.sqlite_path.is_empty() {
+            state.store = Arc::new(
+                SqliteStore::open_with_cap(&cfg.storage.sqlite_path, cfg.storage.ledger_max_rows)
+                    .await?,
+            );
+            tracing::info!(path = %cfg.storage.sqlite_path, "store = sqlite");
+        }
+        if !cfg.storage.redis_url.is_empty() {
+            match RedisGovernance::connect(&cfg.storage.redis_url).await {
+                Ok(g) => {
+                    state.governance = Arc::new(g);
+                    tracing::info!(url = %cfg.storage.redis_url, "governance = redis");
+                }
+                Err(e) => tracing::error!(error = %e, "redis connect failed; staying in-process"),
+            }
+            match RedisHealth::connect(&cfg.storage.redis_url).await {
+                Ok(h) => {
+                    state.health = Arc::new(h);
+                    tracing::info!("account health = redis (fleet-wide cooldown)");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "redis health connect failed; staying in-process")
+                }
+            }
+        }
+        Ok(state)
+    }
+
     /// Rebuild the config-derived account pool from `cfg` while preserving the
     /// runtime seams — key table, governance, store, account health, and the
     /// response cache — from `prev`. The key table's config-sourced entries are

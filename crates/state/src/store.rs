@@ -213,6 +213,32 @@ impl Store for MemoryStore {
     }
 }
 
+/// Positional row → record mapping shared by the SQL backends (their SELECT
+/// column order is identical).
+fn row_to_billing<'r, R>(row: &'r R) -> BillingRecord
+where
+    R: sqlx::Row,
+    usize: sqlx::ColumnIndex<R>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    BillingRecord {
+        ak: row.get(0),
+        product: row.get(1),
+        tenant: row.get(2),
+        model: row.get(3),
+        served_model: row.get(4),
+        protocol: row.get(5),
+        account: row.get(6),
+        prompt_tokens: row.get(7),
+        completion_tokens: row.get(8),
+        total_tokens: row.get(9),
+        cost_micros: row.get(10),
+        ptu_spillover: row.get(11),
+    }
+}
+
 /// SQLite-backed store (sqlx, WAL). One database file holds the billing
 /// ledger, uploaded files, and batch jobs; ids are derived from rowids so they
 /// stay unique across restarts.
@@ -337,25 +363,7 @@ impl Store for SqliteStore {
         .await
         .map_err(|e| crate::sqlx_err("read billing records", e))?;
         rows.reverse();
-        Ok((
-            total as usize,
-            rows.iter()
-                .map(|row| BillingRecord {
-                    ak: row.get(0),
-                    product: row.get(1),
-                    tenant: row.get(2),
-                    model: row.get(3),
-                    served_model: row.get(4),
-                    protocol: row.get(5),
-                    account: row.get(6),
-                    prompt_tokens: row.get(7),
-                    completion_tokens: row.get(8),
-                    total_tokens: row.get(9),
-                    cost_micros: row.get(10),
-                    ptu_spillover: row.get(11),
-                })
-                .collect(),
-        ))
+        Ok((total as usize, rows.iter().map(row_to_billing).collect()))
     }
 
     async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
@@ -582,25 +590,7 @@ impl Store for PostgresStore {
         .await
         .map_err(|e| crate::sqlx_err("read billing records", e))?;
         rows.reverse();
-        Ok((
-            total as usize,
-            rows.iter()
-                .map(|row| BillingRecord {
-                    ak: row.get(0),
-                    product: row.get(1),
-                    tenant: row.get(2),
-                    model: row.get(3),
-                    served_model: row.get(4),
-                    protocol: row.get(5),
-                    account: row.get(6),
-                    prompt_tokens: row.get(7),
-                    completion_tokens: row.get(8),
-                    total_tokens: row.get(9),
-                    cost_micros: row.get(10),
-                    ptu_spillover: row.get(11),
-                })
-                .collect(),
-        ))
+        Ok((total as usize, rows.iter().map(row_to_billing).collect()))
     }
 
     async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
