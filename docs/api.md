@@ -1,0 +1,82 @@
+# API reference
+
+All requests authenticate with an access key, sent either way:
+
+```
+Authorization: Bearer <ak>
+x-api-key: <ak>
+```
+
+A missing or unknown key is `401`. Errors use a consistent envelope:
+
+```json
+{"error": {"message": "...", "code": 3002, "type": "gateway_error"}}
+```
+
+## OpenAI-compatible
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/v1/chat/completions` | streaming + non-streaming |
+| POST | `/v1/completions` | legacy text completion (`prompt`) |
+| POST | `/v1/responses` | Responses API, streaming + non-streaming |
+| POST | `/v1/embeddings` | |
+| POST | `/v1/images/generations` | |
+| POST | `/v1/images/edits` | source image + optional mask (base64) |
+| POST | `/v1/audio/speech` | TTS, returns audio bytes |
+| POST | `/v1/audio/transcriptions` | STT, JSON carries base64 audio |
+| GET | `/v1/models` | configured public model names |
+
+### Chat completions
+
+```bash
+curl -s localhost:8080/v1/chat/completions \
+  -H 'authorization: Bearer ak-demo-123' -H 'content-type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Set `"stream": true` for an SSE response. Frames arrive incrementally as the
+upstream produces them; the final frame carries `usage` and `finish_reason`,
+then `data: [DONE]`. Multimodal `content` arrays, `tools`/`tool_choice`, and
+`tool_calls` responses are supported and passed through.
+
+## Anthropic-compatible
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/v1/messages` | streaming + non-streaming |
+
+`/v1/messages` works on both Anthropic-protocol models and OpenAI-protocol
+models — the gateway converts between the two, including the streaming event
+sequence (`message_start` → `content_block_*` → `message_delta` →
+`message_stop`) and `stop_reason`/`finish_reason` mapping.
+
+## Batch & files
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/v1/files` | upload JSONL: `{"purpose":"batch","file":"<content>"}` |
+| GET | `/v1/files/{id}` | file metadata |
+| GET | `/v1/files/{id}/content` | raw content |
+| POST | `/v1/batches` | `{"input_file_id":"..."}` or inline `{"items":[...]}` |
+| GET | `/v1/batches/{id}` | status (`pending`/`running`/`completed`/`failed`) + results |
+
+Each JSONL line is `{"body": {"model": ..., "messages": [...]}}`. A batch runs
+every item through the same pipeline as a live request (auth, quota, limits,
+billing all apply per item).
+
+## Realtime
+
+`GET /v1/realtime` upgrades to a WebSocket. Auth via header or `?ak=<key>`;
+select the model with `?model=<name>` (must be a realtime-family model). The
+local session mirrors the OpenAI Realtime event shape; bridging to a real
+upstream is not implemented yet.
+
+## Introspection
+
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/health` | liveness |
+| GET | `/metrics` | Prometheus registry (see [Observability](observability.md)) |
+| GET | `/internal/ledger` | billing records; `?limit=N` pages (newest first, `count` is the total) |
+| GET | `/internal/accounts` | account pool view with health |

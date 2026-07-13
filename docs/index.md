@@ -13,10 +13,14 @@ client ──► /v1/* (OpenAI + Anthropic surfaces, streaming SSE, realtime WS)
 
 ## Guides
 
-- [Architecture](architecture.md) — crate layout, request pipeline, trait
-  seams, testing
-- [Configuration](configuration.md) — the `gateway.yaml` reference, env
-  switches, going live against real upstreams
+- [API reference](api.md) — every endpoint, auth, streaming, batch/files
+- [Providers](providers.md) — presets, going live, failover, SigV4
+- [Governance](governance.md) — access keys, rate limits, quotas, cache, safety
+- [Observability](observability.md) — `/metrics`, access logs, the ledger
+- [Deployment](deployment.md) — binary, Docker, env vars, multi-replica
+- [Configuration](configuration.md) — the full `gateway.yaml` reference
+- [Architecture](architecture.md) — crate layout, pipeline, trait seams
+- [Development](development.md) — build, test, workspace map, contributing
 
 ## Repository
 

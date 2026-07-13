@@ -39,7 +39,7 @@ AP_GATEWAY_CONF=conf/gateway.yaml cargo run -p ap-server
 # AP_TRANSPORT=mock forces zero egress; AP_TRANSPORT=http disables the mock.
 ```
 
-Guides: [Architecture](docs/architecture.md) · [Configuration](docs/configuration.md) · [Roadmap](ROADMAP.md)
+Guides: [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Roadmap](ROADMAP.md)
 
 ## Docker
 
