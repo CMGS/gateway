@@ -131,6 +131,29 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>>;
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()>;
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()>;
+
+    /// Whether this backend runs a fleet work queue (any instance drains
+    /// submitted batches). Local backends execute on the submitting instance.
+    fn distributed_batches(&self) -> bool {
+        false
+    }
+    /// Persist a batch's input items so another instance can execute them.
+    async fn batch_save_items(&self, _id: &str, _items: &[Vec<gw_models::ChatMsg>]) -> GResult<()> {
+        Ok(())
+    }
+    /// Load a batch's input items for execution.
+    async fn batch_load_items(&self, _id: &str) -> GResult<Vec<Vec<gw_models::ChatMsg>>> {
+        Ok(Vec::new())
+    }
+    /// Claim one pending batch (requeuing any running batch whose executor went
+    /// stale first). `None` = nothing to run. Only the distributed backend claims.
+    async fn batch_claim_pending(&self, _stale_secs: i64) -> GResult<Option<BatchJob>> {
+        Ok(None)
+    }
+    /// Heartbeat a running batch so its executor isn't judged stale.
+    async fn batch_touch(&self, _id: &str) -> GResult<()> {
+        Ok(())
+    }
 }
 
 /// In-process store: append-only ledger, DashMap-backed files and batches.
@@ -633,6 +656,10 @@ impl PostgresStore {
             "CREATE TABLE IF NOT EXISTS batch_results (
                 batch_id TEXT NOT NULL, idx BIGINT NOT NULL, ok BOOLEAN NOT NULL,
                 message TEXT NOT NULL, total_tokens BIGINT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS batch_items (
+                batch_id TEXT NOT NULL, idx BIGINT NOT NULL, messages TEXT NOT NULL,
+                PRIMARY KEY (batch_id, idx))",
+            "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ",
         ] {
             sqlx::query(ddl)
                 .execute(&pool)
@@ -860,6 +887,76 @@ impl Store for PostgresStore {
         .map_err(|e| crate::sqlx_err("insert batch result", e))?;
         Ok(())
     }
+
+    fn distributed_batches(&self) -> bool {
+        true
+    }
+
+    async fn batch_save_items(&self, id: &str, items: &[Vec<gw_models::ChatMsg>]) -> GResult<()> {
+        for (idx, msgs) in items.iter().enumerate() {
+            let json = serde_json::to_string(msgs).unwrap_or_else(|_| "[]".into());
+            sqlx::query("INSERT INTO batch_items (batch_id, idx, messages) VALUES ($1, $2, $3)")
+                .bind(id)
+                .bind(idx as i64)
+                .bind(json)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("save batch item", e))?;
+        }
+        Ok(())
+    }
+
+    async fn batch_load_items(&self, id: &str) -> GResult<Vec<Vec<gw_models::ChatMsg>>> {
+        let rows = sqlx::query("SELECT messages FROM batch_items WHERE batch_id = $1 ORDER BY idx")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("load batch items", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default())
+            .collect())
+    }
+
+    async fn batch_claim_pending(&self, stale_secs: i64) -> GResult<Option<BatchJob>> {
+        // requeue batches whose executor stopped heartbeating, then claim one
+        // pending batch — SKIP LOCKED so concurrent instances never collide.
+        sqlx::query(
+            "UPDATE batches SET status = 'pending', claimed_at = NULL
+             WHERE status = 'running'
+               AND claimed_at < now() - make_interval(secs => $1)",
+        )
+        .bind(stale_secs as f64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("requeue stale batches", e))?;
+        let row = sqlx::query(
+            "UPDATE batches SET status = 'running', claimed_at = now()
+             WHERE id = (SELECT id FROM batches WHERE status = 'pending'
+                         ORDER BY n FOR UPDATE SKIP LOCKED LIMIT 1)
+             RETURNING id, ak, model, total",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("claim batch", e))?;
+        Ok(row.map(|r| BatchJob {
+            id: r.get(0),
+            ak: r.get(1),
+            model: r.get(2),
+            status: BatchStatus::Running,
+            total: r.get::<i64, _>(3) as usize,
+            results: Vec::new(),
+        }))
+    }
+
+    async fn batch_touch(&self, id: &str) -> GResult<()> {
+        sqlx::query("UPDATE batches SET claimed_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("heartbeat batch", e))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1070,6 +1167,45 @@ mod tests {
         let got = store.batch_get(&b.id).await.unwrap().unwrap();
         assert_eq!(got.status, BatchStatus::Running);
         assert_eq!(got.results.len(), 1);
+
+        // distributed queue: save items, claim (loop to ours), requeue-on-stale
+        assert!(store.distributed_batches());
+        let qjob = store.batch_create("ak-b", "gpt-4o", 2).await.unwrap();
+        let qmsgs = vec![
+            vec![gw_models::ChatMsg::text("user", "one")],
+            vec![gw_models::ChatMsg::text("user", "two")],
+        ];
+        store.batch_save_items(&qjob.id, &qmsgs).await.unwrap();
+        loop {
+            let c = store
+                .batch_claim_pending(120)
+                .await
+                .unwrap()
+                .expect("claim");
+            let mine = c.id == qjob.id;
+            if mine {
+                assert_eq!(c.total, 2);
+            }
+            store
+                .batch_set_status(&c.id, BatchStatus::Completed)
+                .await
+                .unwrap();
+            if mine {
+                break;
+            }
+        }
+        let loaded = store.batch_load_items(&qjob.id).await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[1][0].content, "two");
+        // our completed batch is never re-claimed even at zero staleness
+        // (other runs' leftover pending batches may still surface — drain them)
+        while let Some(c) = store.batch_claim_pending(0).await.unwrap() {
+            assert_ne!(c.id, qjob.id, "completed batch must stay terminal");
+            store
+                .batch_set_status(&c.id, BatchStatus::Completed)
+                .await
+                .unwrap();
+        }
 
         let store = std::sync::Arc::new(store);
         let mut handles = Vec::new();

@@ -90,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
 
     // daily quota reset; governance is a preserved seam, so this survives reloads
     let quota_task = gw_task::spawn_quota_reset(state.clone(), gw_task::DAILY);
+    let distributed_batches = state.store.distributed_batches();
 
     let transport = select_transport(&cfg)?;
     let postgres_url = cfg.storage.postgres_url.clone();
@@ -118,6 +119,18 @@ async fn main() -> anyhow::Result<()> {
     let mut app_state = AppState::with_config(shared, transport, Some(loader));
     if let Some(store) = &config_store {
         app_state = app_state.with_config_store(store.clone());
+    }
+
+    // fleet batch drain: on a distributed store any instance claims and runs
+    // submitted batches (local stores execute on the submitting instance)
+    if distributed_batches {
+        let offline = app_state.offline.clone();
+        tokio::spawn(async move {
+            offline
+                .drain_forever(120, std::time::Duration::from_secs(2))
+                .await
+        });
+        tracing::info!("batch drain loop started (distributed store)");
     }
 
     // change feed: reload on every published config version; reconnects forever

@@ -1,7 +1,9 @@
 //! Offline batch orchestration.
 //!
-//! Submission runs in the background immediately; status/results are
-//! queryable in-process; no external queue is involved.
+//! Local backends execute a submitted batch on the receiving instance's
+//! background task. With a distributed store (Postgres) submission only
+//! persists the items; a fleet drain loop on any instance claims and runs
+//! them, so execution survives the submitter restarting.
 
 use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
 use gw_state::{AkInfo, BatchItemResult, BatchJob, BatchStatus};
@@ -25,89 +27,123 @@ impl OfflineHandler {
         Self { online }
     }
 
-    /// Submit a batch: registers the job and processes it on a background task.
-    /// Items run through the SAME online DAG (billing/quota/limits apply per
-    /// item; the request cache is bypassed so that stays true).
+    /// Submit a batch. Local stores execute it now on a background task;
+    /// distributed stores persist the items and leave it pending for the
+    /// fleet drain loop. Items run through the SAME online DAG (billing/quota/
+    /// limits apply per item; the request cache is bypassed).
     pub async fn submit(
         &self,
         ak: AkInfo,
         model: String,
         items: Vec<BatchItem>,
     ) -> gw_models::GResult<BatchJob> {
-        let job = self
-            .online
-            .state()
-            .store
-            .batch_create(&ak.ak, &model, items.len())
-            .await?;
-        let id = job.id.clone();
-        let this = self.clone();
-        tokio::spawn(async move {
-            let state = this.online.state();
-            let store = &state.store;
-            if let Err(e) = store.batch_set_status(&id, BatchStatus::Running).await {
-                tracing::error!(error = %e, batch = %id, "batch status write failed");
+        let store = self.online.state().store.clone();
+        let job = store.batch_create(&ak.ak, &model, items.len()).await?;
+        let msgs: Vec<Vec<ChatMsg>> = items.into_iter().map(|i| i.messages).collect();
+        if store.distributed_batches() {
+            store.batch_save_items(&job.id, &msgs).await?;
+        } else {
+            let this = self.clone();
+            let (id, model) = (job.id.clone(), model.clone());
+            tokio::spawn(async move { this.execute(&id, &ak, &model, msgs).await });
+        }
+        Ok(job)
+    }
+
+    /// Run every item of a claimed/submitted batch through the online DAG,
+    /// writing results and the terminal status. Heartbeats between items so a
+    /// distributed claim isn't judged stale mid-run.
+    async fn execute(&self, id: &str, ak: &AkInfo, model: &str, items: Vec<Vec<ChatMsg>>) {
+        let store = self.online.state().store.clone();
+        if let Err(e) = store.batch_set_status(id, BatchStatus::Running).await {
+            tracing::error!(error = %e, batch = %id, "batch status write failed");
+        }
+        let mut any_fail = false;
+        for (index, messages) in items.into_iter().enumerate() {
+            let request = GatewayRequest {
+                is_online: false,
+                ak: ak.ak.clone(),
+                message: messages,
+                model_param_v2: Some(ModelParamV2::with_name(
+                    gw_consts::Protocol::OpenaiChat,
+                    model.to_owned(),
+                )),
+                ..Default::default()
+            };
+            // each item on its own task so a pipeline panic fails that item
+            // instead of wedging the batch in Running forever
+            let online = self.online.clone();
+            let item_ak = ak.clone();
+            let ran = tokio::spawn(async move { online.run(request, item_ak).await }).await;
+            let result = match ran {
+                Ok(Ok(ctx)) => match ctx.outcome {
+                    Some(out) => BatchItemResult {
+                        index,
+                        ok: true,
+                        message: out.response.message,
+                        total_tokens: out.response.total_tokens,
+                    },
+                    None => BatchItemResult {
+                        index,
+                        ok: false,
+                        message: "pipeline produced no outcome".into(),
+                        total_tokens: 0,
+                    },
+                },
+                Ok(Err(e)) => BatchItemResult {
+                    index,
+                    ok: false,
+                    message: e.to_string(),
+                    total_tokens: 0,
+                },
+                Err(join_err) => BatchItemResult {
+                    index,
+                    ok: false,
+                    message: format!("item task failed: {join_err}"),
+                    total_tokens: 0,
+                },
+            };
+            any_fail |= !result.ok;
+            if let Err(e) = store.batch_push_result(id, result).await {
+                tracing::error!(error = %e, batch = %id, "batch result write failed");
             }
-            let mut any_fail = false;
-            for (index, item) in items.into_iter().enumerate() {
-                let request = GatewayRequest {
-                    is_online: false, // offline path
-                    ak: ak.ak.clone(),
-                    message: item.messages,
-                    model_param_v2: Some(ModelParamV2::with_name(
-                        gw_consts::Protocol::OpenaiChat, // rewritten by the resolve_model node
-                        model.clone(),
-                    )),
-                    ..Default::default()
-                };
-                // Each item runs on its own task so a panic inside the pipeline
-                // fails that item instead of unwinding past the terminal
-                // status write and wedging the batch in Running forever.
-                let online = this.online.clone();
-                let item_ak = ak.clone();
-                let ran = tokio::spawn(async move { online.run(request, item_ak).await }).await;
-                let result = match ran {
-                    Ok(Ok(ctx)) => match ctx.outcome {
-                        Some(out) => BatchItemResult {
-                            index,
-                            ok: true,
-                            message: out.response.message,
-                            total_tokens: out.response.total_tokens,
-                        },
-                        None => BatchItemResult {
-                            index,
-                            ok: false,
-                            message: "pipeline produced no outcome".into(),
-                            total_tokens: 0,
-                        },
-                    },
-                    Ok(Err(e)) => BatchItemResult {
-                        index,
-                        ok: false,
-                        message: e.to_string(),
-                        total_tokens: 0,
-                    },
-                    Err(join_err) => BatchItemResult {
-                        index,
-                        ok: false,
-                        message: format!("item task failed: {join_err}"),
-                        total_tokens: 0,
-                    },
-                };
-                any_fail |= !result.ok;
-                if let Err(e) = store.batch_push_result(&id, result).await {
-                    tracing::error!(error = %e, batch = %id, "batch result write failed");
+            let _ = store.batch_touch(id).await;
+        }
+        let done = if any_fail {
+            BatchStatus::Failed
+        } else {
+            BatchStatus::Completed
+        };
+        if let Err(e) = store.batch_set_status(id, done).await {
+            tracing::error!(error = %e, batch = %id, "batch status write failed");
+        }
+    }
+
+    /// Fleet drain loop (distributed stores only): claim pending batches and
+    /// execute them, requeuing on the way any batch whose executor went stale.
+    /// Runs forever; poll interval applies only when the queue is empty.
+    pub async fn drain_forever(&self, stale_secs: i64, poll: std::time::Duration) {
+        let store = self.online.state().store.clone();
+        loop {
+            match store.batch_claim_pending(stale_secs).await {
+                Ok(Some(job)) => {
+                    let ak = match self.online.state().auth.authenticate(&job.ak).await {
+                        Some(ak) => ak,
+                        None => {
+                            tracing::warn!(batch = %job.id, ak = %job.ak, "claimed batch's key is gone; failing it");
+                            let _ = store.batch_set_status(&job.id, BatchStatus::Failed).await;
+                            continue;
+                        }
+                    };
+                    let items = store.batch_load_items(&job.id).await.unwrap_or_default();
+                    self.execute(&job.id, &ak, &job.model, items).await;
+                }
+                Ok(None) => tokio::time::sleep(poll).await,
+                Err(e) => {
+                    tracing::warn!(error = %e, "batch claim failed; backing off");
+                    tokio::time::sleep(poll).await;
                 }
             }
-            let done = if any_fail {
-                BatchStatus::Failed
-            } else {
-                BatchStatus::Completed
-            };
-            if let Err(e) = store.batch_set_status(&id, done).await {
-                tracing::error!(error = %e, batch = %id, "batch status write failed");
-            }
-        });
-        Ok(job)
+        }
     }
 }
