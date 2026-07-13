@@ -75,6 +75,15 @@ impl UpstreamResponse {
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync + std::fmt::Debug {
     async fn send(&self, req: UpstreamRequest) -> GResult<UpstreamResponse>;
+
+    /// Apply reloaded per-account upstream policy (timeouts/retries) live.
+    /// Default no-op: only the HTTP-backed transports carry policy.
+    fn reload_policies(
+        &self,
+        _default: crate::http_transport::UpstreamPolicy,
+        _per_account: std::collections::HashMap<String, crate::http_transport::UpstreamPolicy>,
+    ) {
+    }
 }
 
 pub type SharedTransport = Arc<dyn Transport>;

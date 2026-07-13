@@ -778,6 +778,52 @@ fn responses_usage(usage: &Value) -> (i64, i64, Vec<u8>) {
     (input, output, raw)
 }
 
+/// Apply one Responses SSE frame to the accumulating response; returns the
+/// chunks it yields. Text rides in `response.output_text.delta`; the final
+/// usage/status arrive in `response.completed`.
+fn responses_apply_frame(
+    v: &Value,
+    status: u16,
+    resp: &mut GatewayResponse,
+    full: &mut String,
+) -> GResult<Vec<StreamChunk>> {
+    if let Some(err) = crate::engine::vendor_error(status, v) {
+        return Err(err);
+    }
+    let mut chunks = Vec::new();
+    match v["type"].as_str().unwrap_or_default() {
+        "response.output_text.delta" => {
+            if let Some(d) = v["delta"].as_str() {
+                full.push_str(d);
+                chunks.push(StreamChunk {
+                    delta: d.to_owned(),
+                    ..Default::default()
+                });
+            }
+        }
+        "response.completed" => {
+            let r = &v["response"];
+            if let Some(m) = r["model"].as_str() {
+                resp.model = m.to_owned();
+            }
+            if let Some(st) = r["status"].as_str() {
+                resp.finish_reason = st.to_owned();
+            }
+            let (input, output, raw) = responses_usage(&r["usage"]);
+            resp.prompt_tokens = input;
+            resp.completion_tokens = output;
+            resp.total_tokens = input + output;
+            resp.raw_usage_json = raw;
+            chunks.push(StreamChunk {
+                finish_reason: Some(resp.finish_reason.clone()),
+                ..Default::default()
+            });
+        }
+        _ => {}
+    }
+    Ok(chunks)
+}
+
 impl ResponsesEngine {
     fn model_name(&self) -> String {
         self.base
@@ -786,6 +832,74 @@ impl ResponsesEngine {
             .as_ref()
             .map(|p| p.model_name.clone())
             .unwrap_or_default()
+    }
+
+    /// Native passthrough: forward the client's Responses-shaped body verbatim,
+    /// ensuring `model` is present.
+    fn build_body(&self) -> GResult<Value> {
+        let param = self.base.param()?;
+        let mut body = match &param.raw {
+            Value::Object(_) => param.raw.clone(),
+            _ => json!({}),
+        };
+        if let Some(map) = body.as_object_mut() {
+            map.entry("model".to_owned())
+                .or_insert_with(|| json!(param.model_name));
+        }
+        Ok(body)
+    }
+
+    fn url(&self) -> String {
+        format!(
+            "{}/v1/responses",
+            self.base.base_url("mock://api.openai.com")
+        )
+    }
+
+    /// Streaming Responses reply pumped live: `response.output_text.delta` frames
+    /// are forwarded through `stream_tx` as they arrive (real vendors), and
+    /// `response.completed` carries the final usage/status.
+    async fn run_stream(&self) -> GResult<EngineOutcome> {
+        let reply = self
+            .base
+            .send_upstream_raw(
+                &self.url(),
+                self.base.bearer_headers(),
+                self.build_body()?,
+                true,
+            )
+            .await?;
+        let status = reply.status;
+        let mut resp = GatewayResponse {
+            model: self.model_name(),
+            finish_reason: "completed".to_owned(),
+            ..Default::default()
+        };
+        if let UpstreamBody::Json(b) = &reply.body {
+            // a stream request answered with JSON is an error body
+            let v: Value = serde_json::from_slice(b)
+                .map_err(|e| GatewayError::internal("parse responses reply").with_source(e))?;
+            if let Some(err) = crate::engine::vendor_error(status, &v) {
+                return Err(err);
+            }
+        }
+        let mut full = String::new();
+        let r = crate::pump::pump_sse(
+            "responses",
+            reply.body,
+            self.base.request.stream_tx.clone(),
+            |v| responses_apply_frame(v, status, &mut resp, &mut full),
+        )
+        .await?;
+        resp.message = full;
+        resp.aborted = r.aborted;
+        Ok(EngineOutcome {
+            response: resp,
+            http_code: status,
+            chunks: r.chunks,
+            streamed_live: r.streamed_live,
+            ..Default::default()
+        })
     }
 
     /// Non-streaming Responses reply: full `output` array + `usage`.
@@ -891,28 +1005,16 @@ impl ModelEngine for ResponsesEngine {
     /// (input_tokens/output_tokens) is normalized to the openai shape at the engine
     /// boundary.
     async fn run(&self) -> GResult<EngineOutcome> {
-        let param = self.base.param()?;
-        // native passthrough: forward the client's Responses-shaped body verbatim,
-        // ensuring `model` is present.
-        let mut body = match &param.raw {
-            Value::Object(_) => param.raw.clone(),
-            _ => json!({}),
-        };
-        if let Some(map) = body.as_object_mut() {
-            map.entry("model".to_owned())
-                .or_insert_with(|| json!(param.model_name));
+        if self.base.request.stream {
+            return self.run_stream().await;
         }
-        let url = format!(
-            "{}/v1/responses",
-            self.base.base_url("mock://api.openai.com")
-        );
         let reply = self
             .base
             .send_upstream(
-                &url,
+                &self.url(),
                 self.base.bearer_headers(),
-                body,
-                self.base.request.stream,
+                self.build_body()?,
+                false,
             )
             .await?;
         match &reply.body {

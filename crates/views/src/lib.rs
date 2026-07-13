@@ -108,12 +108,48 @@ impl AppState {
     pub async fn reload(&self) -> Result<(), String> {
         let loader = self.loader.as_ref().ok_or("reload not configured")?;
         let cfg = loader().await?;
+        // per-account upstream policy is baked into the transport at boot, not part
+        // of the config-derived state; push the reloaded timeouts/retries in so a
+        // published policy change takes effect without a restart.
+        let (default, per_account) = upstream_policies(&cfg);
         self.handler
             .config
             .reload(cfg)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        self.handler.transport.reload_policies(default, per_account);
+        Ok(())
     }
+}
+
+/// The default + per-account [`UpstreamPolicy`] map derived from a config. Used
+/// at boot and re-derived on reload so a config change updates the transport.
+pub fn upstream_policies(
+    cfg: &GatewayConfig,
+) -> (
+    gw_engines::http_transport::UpstreamPolicy,
+    std::collections::HashMap<String, gw_engines::http_transport::UpstreamPolicy>,
+) {
+    use gw_engines::http_transport::UpstreamPolicy;
+    let default = UpstreamPolicy::default();
+    let per_account = cfg
+        .accounts
+        .iter()
+        .filter(|a| a.timeout_seconds.is_some() || a.connect_retries.is_some())
+        .map(|a| {
+            (
+                a.name.clone(),
+                UpstreamPolicy {
+                    timeout: a
+                        .timeout_seconds
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or(default.timeout),
+                    connect_retries: a.connect_retries.unwrap_or(default.connect_retries),
+                },
+            )
+        })
+        .collect();
+    (default, per_account)
 }
 
 /// Build the application router.
@@ -258,24 +294,63 @@ async fn realtime_ws(
     }
 }
 
-/// Same governance gates as the REST surfaces — the realtime surface bills, so
-/// it must also be rate/quota limited. Re-fetches the key each generation (the
-/// handshake snapshot is stale), so a key banned/expired/revoked mid-session
-/// stops generating and current limit values apply. `None` = admitted.
-async fn realtime_gate(s: &AppState, ak: &AkInfo) -> Option<String> {
-    let state = s.handler.state();
+/// The full governance chain the REST path runs (tenant + AK QPS, product/model
+/// QPM, per-(AK, model) quota, AK daily quota, AK TPM), applied per realtime
+/// generation. Re-fetches the key each turn (the handshake snapshot is stale),
+/// so a key banned/expired/revoked or a model de-entitled mid-session stops
+/// generating and current limit values apply. `None` = admitted.
+///
+/// Quota/TPM use check-then-consume rather than the REST path's reserve/settle:
+/// a realtime turn's token count is only known when its usage frame arrives, and
+/// a relayed turn has no single success/failure point at which a reservation
+/// could be refunded, so there is nothing accurate to reserve up front.
+async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Option<String> {
+    let snap = s.handler.config.load();
+    let (cfg, state) = (&snap.cfg, &snap.state);
     let ak = match state.auth.authenticate(&ak.ak).await {
         Some(fresh) if fresh.status_at(gw_state::epoch_secs()) == gw_state::KeyStatus::Active => {
             fresh
         }
         _ => return Some(format!("access key {} is no longer valid", ak.ak)),
     };
+    if !cfg.tenant_allows_model(&ak.tenant, model) {
+        return Some(format!(
+            "model `{model}` is not entitled for tenant `{}`",
+            ak.tenant
+        ));
+    }
     let gov = &state.governance;
+    if let Some(qps) = cfg.find_tenant(&ak.tenant).and_then(|t| t.qps)
+        && !gov.rate_allow(&format!("tenant:{}", ak.tenant), qps).await
+    {
+        return Some(format!("tenant rate limit exceeded for `{}`", ak.tenant));
+    }
     if !gov.rate_allow(&ak.ak, ak.qps).await {
         return Some(format!(
             "rate limit exceeded for ak {} (qps {})",
             ak.ak, ak.qps
         ));
+    }
+    if let Some(qpm) = cfg.find_product(&ak.product).and_then(|p| p.qpm)
+        && !gov
+            .window_allow(&format!("product:{}", ak.product), qpm, gw_consts::MINUTE)
+            .await
+    {
+        return Some(format!("product qpm limit exceeded for `{}`", ak.product));
+    }
+    if let Some(qpm) = cfg.find_model(model).and_then(|m| m.qpm)
+        && !gov
+            .window_allow(&format!("model:{model}"), qpm, gw_consts::MINUTE)
+            .await
+    {
+        return Some(format!("model qpm limit exceeded for `{model}`"));
+    }
+    if let Some(limit) = ak.model_quotas.get(model).copied().or_else(|| {
+        cfg.find_tenant(&ak.tenant)
+            .and_then(|t| t.model_quotas.get(model).copied())
+    }) && !gov.quota_check(&format!("{}|{model}", ak.ak), limit).await
+    {
+        return Some(format!("model quota exhausted for `{model}`"));
     }
     if !gov.quota_check(&ak.ak, ak.daily_token_quota).await {
         return Some(format!("daily token quota exhausted for ak {}", ak.ak));
@@ -291,7 +366,9 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo) -> Option<String> {
     None
 }
 
-/// Bill one realtime generation (quota + TPM window + ledger + metrics).
+/// Bill one realtime generation (quota + TPM window + ledger + metrics). Uses
+/// the shared [`gw_state::billing_record`] pricing so it can't drift from the
+/// request-pipeline path; the per-(AK, model) counter accrues too.
 async fn bill_realtime_turn(
     s: &AppState,
     ak: &AkInfo,
@@ -301,41 +378,39 @@ async fn bill_realtime_turn(
     it: i64,
     ot: i64,
 ) {
-    let cfg = s.handler.cfg();
-    let charged = cfg.prices_for_tenant(&ak.tenant, model);
-    let vendor = cfg
-        .accounts
-        .iter()
-        .find(|a| a.name == account)
-        .map(|a| {
-            (
-                a.cost_input_price_per_1k_micros,
-                a.cost_output_price_per_1k_micros,
-            )
-        })
-        .unwrap_or((0, 0));
-    let gov = &s.handler.state().governance;
-    gov.quota_consume(&ak.ak, it + ot).await;
-    gov.token_window_add(&ak.ak, it + ot, gw_consts::MINUTE)
-        .await;
-    let record = gw_state::BillingRecord {
-        ak: ak.ak.clone(),
-        product: ak.product.clone(),
-        tenant: ak.tenant.clone(),
-        model: model.to_owned(),
-        served_model: model.to_owned(),
-        protocol: mt.as_str().to_owned(),
-        account: account.to_owned(),
-        prompt_tokens: it,
-        completion_tokens: ot,
-        total_tokens: it + ot,
-        cost_micros: gw_models::cost_micros(it, ot, charged),
-        vendor_cost_micros: gw_models::cost_micros(it, ot, vendor),
-        ptu_spillover: false,
-    };
+    let total = it + ot;
+    let state = s.handler.state();
+    let gov = &state.governance;
+    gov.quota_consume(&ak.ak, total).await;
+    if ak.model_quotas.contains_key(model)
+        || s.handler
+            .cfg()
+            .find_tenant(&ak.tenant)
+            .is_some_and(|t| t.model_quotas.contains_key(model))
+    {
+        gov.quota_consume(&format!("{}|{model}", ak.ak), total)
+            .await;
+    }
+    gov.token_window_add(&ak.ak, total, gw_consts::MINUTE).await;
+    let record = gw_state::billing_record(
+        &s.handler.cfg(),
+        &gw_state::BillingInput {
+            ak: &ak.ak,
+            product: &ak.product,
+            tenant: &ak.tenant,
+            requested_model: model,
+            served_model: model,
+            protocol: mt.as_str(),
+            account,
+            prompt: it,
+            completion: ot,
+            total,
+            ptu_spillover: false,
+        },
+    );
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it.max(0) as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ot.max(0) as u64);
-    if let Err(e) = s.handler.state().store.ledger_add(record).await {
+    if let Err(e) = state.store.ledger_add(record).await {
         metrics::counter!("gateway_ledger_write_failures_total").increment(1);
         tracing::error!(error = %e, "realtime billing write failed");
     }
@@ -372,7 +447,7 @@ async fn realtime_session(
         };
         match ev["type"].as_str().unwrap_or_default() {
             "input_text" => {
-                if let Some(denied) = realtime_gate(&s, &ak).await {
+                if let Some(denied) = realtime_gate(&s, &ak, &model).await {
                     let _ = socket
                         .send(send(json!({"type":"error","message": denied})))
                         .await;
@@ -530,7 +605,7 @@ async fn realtime_bridge(
                 Some(Ok(CMsg::Text(t))) => {
                     // gate each generation trigger, not every control frame
                     if is_response_create(t.as_bytes()) {
-                        if let Some(denied) = realtime_gate(&s, &ak).await {
+                        if let Some(denied) = realtime_gate(&s, &ak, &model).await {
                             if cl_tx
                                 .send(CMsg::Text(send_err(denied).to_string().into()))
                                 .await
@@ -548,7 +623,7 @@ async fn realtime_bridge(
                 }
                 Some(Ok(CMsg::Binary(b))) => {
                     if is_response_create(&b) {
-                        if let Some(denied) = realtime_gate(&s, &ak).await {
+                        if let Some(denied) = realtime_gate(&s, &ak, &model).await {
                             if cl_tx
                                 .send(CMsg::Text(send_err(denied).to_string().into()))
                                 .await
@@ -1936,7 +2011,7 @@ async fn responses(
     }
     let stream = body["stream"].as_bool().unwrap_or(false);
     // native passthrough: the whole Responses-shaped body rides in `raw`
-    let mut param = ModelParamV2::with_name(gw_consts::Protocol::Responses, model);
+    let mut param = ModelParamV2::with_name(gw_consts::Protocol::Responses, model.clone());
     param.raw = body;
     let request = GatewayRequest {
         is_online: true,
@@ -1945,6 +2020,11 @@ async fn responses(
         model_param_v2: Some(param),
         ..Default::default()
     };
+
+    if stream {
+        return responses_stream_response(s, request, ak, model, started).into_response();
+    }
+
     let ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
         Err(e) => return gateway_error(e),
@@ -1953,68 +2033,107 @@ async fn responses(
     let Some(outcome) = ctx.outcome else {
         return error_response(500, "pipeline produced no outcome");
     };
-
-    if stream {
-        return responses_sse(&outcome).into_response();
-    }
     match outcome.response.response_v2 {
         Some(v) => (StatusCode::OK, Json(v)).into_response(),
         None => error_response(500, "responses engine returned no payload"),
     }
 }
 
-/// Re-emit a Responses outcome as the client-facing Responses SSE sequence:
-/// `response.output_text.delta` per text chunk, then `response.completed` with
-/// usage (input_tokens/output_tokens — the Responses dialect). Synthesizes a
-/// single delta when the engine returned a buffered (non-streaming) reply.
-fn responses_sse(
-    outcome: &gw_engines::EngineOutcome,
+/// Streaming /v1/responses: pipeline chunks re-emitted incrementally as the
+/// Responses SSE dialect (`response.created` → `response.output_text.delta`× →
+/// `response.completed` with input/output token usage → `[DONE]`). Live for
+/// real vendors; buffered-then-redacted when outbound DLP is on.
+fn responses_stream_response(
+    s: AppState,
+    request: GatewayRequest,
+    ak: AkInfo,
+    model: String,
+    started: Instant,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
-    let r = &outcome.response;
-    let mut events: Vec<Event> = Vec::new();
-    events.push(Event::default().data(
-        json!({"type": "response.created", "response": {"model": r.model, "status": "in_progress"}})
-            .to_string(),
-    ));
-    let deltas: Vec<String> = if outcome.chunks.is_empty() && !r.message.is_empty() {
-        vec![r.message.clone()]
-    } else {
-        outcome
-            .chunks
-            .iter()
-            .filter(|c| !c.delta.is_empty())
-            .map(|c| c.delta.clone())
-            .collect()
-    };
-    for d in deltas {
-        events.push(
-            Event::default()
-                .data(json!({"type": "response.output_text.delta", "delta": d}).to_string()),
-        );
+    let rx = spawn_stream_pipeline(&s, request, ak, "responses", started);
+
+    struct St {
+        rx: tokio::sync::mpsc::Receiver<gw_engines::StreamChunk>,
+        queue: std::collections::VecDeque<Event>,
+        model: String,
+        created: bool,
+        status: String,
+        ended: bool,
     }
-    let status = if r.finish_reason.is_empty() {
-        "completed"
-    } else {
-        r.finish_reason.as_str()
+    impl St {
+        fn ensure_created(&mut self) {
+            if self.created {
+                return;
+            }
+            self.created = true;
+            self.queue.push_back(Event::default().data(
+                json!({"type":"response.created","response":{"model":self.model,"status":"in_progress"}})
+                    .to_string(),
+            ));
+        }
+    }
+    let st = St {
+        rx,
+        queue: std::collections::VecDeque::new(),
+        model,
+        created: false,
+        status: "completed".to_owned(),
+        ended: false,
     };
-    events.push(
-        Event::default().data(
-            json!({"type": "response.completed", "response": {
-                "model": r.model,
-                "status": status,
-                "usage": {
-                    "input_tokens": r.prompt_tokens,
-                    "output_tokens": r.completion_tokens,
-                    "total_tokens": r.total_tokens,
-                },
-            }})
-            .to_string(),
-        ),
-    );
-    events.push(Event::default().data("[DONE]"));
-    Sse::new(futures::stream::iter(
-        events.into_iter().map(Ok::<_, Infallible>),
-    ))
+    let stream =
+        futures::stream::unfold(st, |mut st| async move {
+            loop {
+                if let Some(ev) = st.queue.pop_front() {
+                    return Some((Ok::<_, Infallible>(ev), st));
+                }
+                if st.ended {
+                    return None;
+                }
+                match st.rx.recv().await {
+                    Some(c) if c.error.is_some() => {
+                        st.ensure_created();
+                        let msg = c.error.unwrap_or_default();
+                        st.queue.push_back(Event::default().data(
+                        json!({"type":"error","error":{"type":"gateway_error","message":msg}})
+                            .to_string(),
+                    ));
+                        st.queue.push_back(Event::default().data("[DONE]"));
+                        st.ended = true;
+                    }
+                    Some(c) => {
+                        st.ensure_created();
+                        if !c.delta.is_empty() {
+                            st.queue.push_back(
+                                Event::default().data(
+                                    json!({"type":"response.output_text.delta","delta":c.delta})
+                                        .to_string(),
+                                ),
+                            );
+                        }
+                        if let Some(fr) = c.finish_reason {
+                            st.status = fr;
+                        }
+                        if let Some((pt, ct, tt)) = c.usage_totals {
+                            st.queue.push_back(Event::default().data(
+                            json!({"type":"response.completed","response":{
+                                "model": st.model, "status": st.status,
+                                "usage":{"input_tokens":pt,"output_tokens":ct,"total_tokens":tt},
+                            }})
+                            .to_string(),
+                        ));
+                            st.queue.push_back(Event::default().data("[DONE]"));
+                            st.ended = true;
+                        }
+                    }
+                    None => {
+                        st.ensure_created();
+                        st.queue.push_back(Event::default().data("[DONE]"));
+                        st.ended = true;
+                    }
+                }
+            }
+        });
+    Sse::new(stream)
 }
 
 async fn embeddings(

@@ -36,12 +36,19 @@ impl Default for UpstreamPolicy {
     }
 }
 
-/// Real HTTP transport (reqwest + rustls).
+/// The default plus per-account upstream policies, swapped as one unit on reload.
+#[derive(Debug, Default)]
+struct Policies {
+    default: UpstreamPolicy,
+    per_account: HashMap<String, UpstreamPolicy>,
+}
+
+/// Real HTTP transport (reqwest + rustls). Per-account policy lives behind an
+/// `ArcSwap` so a config reload can update timeouts/retries without a restart.
 #[derive(Debug)]
 pub struct HttpTransport {
     client: reqwest::Client,
-    default_policy: UpstreamPolicy,
-    per_account: HashMap<String, UpstreamPolicy>,
+    policies: arc_swap::ArcSwap<Policies>,
 }
 
 impl HttpTransport {
@@ -56,7 +63,7 @@ impl HttpTransport {
     }
 
     pub fn with_policies(
-        default_policy: UpstreamPolicy,
+        default: UpstreamPolicy,
         per_account: HashMap<String, UpstreamPolicy>,
     ) -> GResult<Self> {
         let client = reqwest::Client::builder()
@@ -65,21 +72,36 @@ impl HttpTransport {
             .map_err(|e| GatewayError::internal("build http client").with_source(e))?;
         Ok(Self {
             client,
-            default_policy,
-            per_account,
+            policies: arc_swap::ArcSwap::from_pointee(Policies {
+                default,
+                per_account,
+            }),
         })
     }
 
     pub fn policy_for(&self, account: &str) -> UpstreamPolicy {
-        self.per_account
-            .get(account)
-            .copied()
-            .unwrap_or(self.default_policy)
+        let p = self.policies.load();
+        p.per_account.get(account).copied().unwrap_or(p.default)
+    }
+
+    fn set_policies(&self, default: UpstreamPolicy, per_account: HashMap<String, UpstreamPolicy>) {
+        self.policies.store(std::sync::Arc::new(Policies {
+            default,
+            per_account,
+        }));
     }
 }
 
 #[async_trait::async_trait]
 impl Transport for HttpTransport {
+    fn reload_policies(
+        &self,
+        default: UpstreamPolicy,
+        per_account: HashMap<String, UpstreamPolicy>,
+    ) {
+        self.set_policies(default, per_account);
+    }
+
     async fn send(&self, req: UpstreamRequest) -> GResult<UpstreamResponse> {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|e| GatewayError::bad_request(format!("bad method: {e}")))?;
@@ -171,6 +193,14 @@ impl DispatchTransport {
 
 #[async_trait::async_trait]
 impl Transport for DispatchTransport {
+    fn reload_policies(
+        &self,
+        default: UpstreamPolicy,
+        per_account: HashMap<String, UpstreamPolicy>,
+    ) {
+        self.http.reload_policies(default, per_account);
+    }
+
     async fn send(&self, req: UpstreamRequest) -> GResult<UpstreamResponse> {
         if req.url.starts_with("mock://") {
             self.mock.send(req).await

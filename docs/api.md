@@ -87,10 +87,12 @@ headers — a `gw-api-key.<ak>` entry in the `Sec-WebSocket-Protocol` list.
 The session is refused at accept if the tenant is not entitled to the model.
 A realtime model bound to an account with a real `endpoint` bridges the session
 to that vendor's realtime WebSocket: a transparent relay, with the gateway
-still enforcing auth, per-generation rate/quota limits, and billing from the
-vendor's usage. Each generation re-checks the key (a key banned, expired, or
-revoked mid-session stops generating). An endpoint-less account serves a local
-mock session (OpenAI Realtime event shape) for offline development.
+enforcing the same governance chain as the REST path per generation — tenant and
+AK QPS, product/model QPM, per-(key, model) and daily-token quota, TPM — plus
+billing (shared pricing) from the vendor's usage. Each generation re-checks the
+key, so a key banned, expired, or revoked (or a model de-entitled) mid-session
+stops generating. An endpoint-less account serves a local mock session (OpenAI
+Realtime event shape) for offline development.
 
 ## Introspection
 
@@ -128,7 +130,10 @@ tenant's `admin_token_env` token manages only that tenant's keys and usage
 
 A reload rebuilds the AK table (config keys), models, providers, tenants, and
 accounts while preserving the runtime seams — governance counters, the durable
-store, account health, and the response cache. Storage-backend URL changes
+store, account health, and the response cache. Per-account upstream policy
+(`timeout_seconds` / `connect_retries`) is pushed into the live transport, and
+the response cache is invalidated (a reload may remap a model), so a published
+change takes effect without a restart. Storage-backend URL changes
 (`storage.postgres_url` / `redis_url` / `sqlite_path`) still need a restart.
 Reload is also triggered by `SIGHUP` and, with the Postgres config store, by
 any instance publishing via `PUT /admin/config`.

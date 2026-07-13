@@ -109,6 +109,56 @@ pub struct StoredFile {
     pub content: String,
 }
 
+/// Identity + token counts for one billed call, priced into a [`BillingRecord`].
+pub struct BillingInput<'a> {
+    pub ak: &'a str,
+    pub product: &'a str,
+    pub tenant: &'a str,
+    /// Public model the caller requested (accrues the per-(AK, model) counter).
+    pub requested_model: &'a str,
+    /// Model that actually served — charged at its price (may differ on fallback).
+    pub served_model: &'a str,
+    pub protocol: &'a str,
+    pub account: &'a str,
+    pub prompt: i64,
+    pub completion: i64,
+    pub total: i64,
+    pub ptu_spillover: bool,
+}
+
+/// Price one call into a [`BillingRecord`]: charged at the tenant's price for the
+/// served model, vendor cost from the serving account. Shared by the request
+/// pipeline and the realtime surface so the two pricing paths can't drift.
+pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
+    let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
+    let vendor = cfg
+        .accounts
+        .iter()
+        .find(|a| a.name == b.account)
+        .map(|a| {
+            (
+                a.cost_input_price_per_1k_micros,
+                a.cost_output_price_per_1k_micros,
+            )
+        })
+        .unwrap_or((0, 0));
+    BillingRecord {
+        ak: b.ak.to_owned(),
+        product: b.product.to_owned(),
+        tenant: b.tenant.to_owned(),
+        model: b.requested_model.to_owned(),
+        served_model: b.served_model.to_owned(),
+        protocol: b.protocol.to_owned(),
+        account: b.account.to_owned(),
+        prompt_tokens: b.prompt,
+        completion_tokens: b.completion,
+        total_tokens: b.total,
+        cost_micros: gw_models::cost_micros(b.prompt, b.completion, charged),
+        vendor_cost_micros: gw_models::cost_micros(b.prompt, b.completion, vendor),
+        ptu_spillover: b.ptu_spillover,
+    }
+}
+
 /// One row of the per-(tenant, model) usage rollup.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UsageRow {

@@ -3,7 +3,6 @@
 
 use gw_consts::{ErrCode, Protocol};
 use gw_models::{GResult, GatewayError};
-use gw_state::BillingRecord;
 
 use crate::context::DagContext;
 use crate::executor::{DagNode, Layer};
@@ -193,6 +192,9 @@ fn cache_key_of(ctx: &DagContext) -> Option<String> {
     use sha2::{Digest, Sha256};
     let param = ctx.request.model_param_v2.as_ref()?;
     let mut h = Sha256::new();
+    // config generation: a reload may have remapped the model, so a pre-reload
+    // entry must not be served under the same key.
+    h.update(ctx.cfg.generation().to_le_bytes());
     h.update(param.model_name.as_bytes());
     h.update(serde_json::to_vec(&ctx.request.message).ok()?);
     if let Some(t) = &param.typed {
@@ -669,26 +671,24 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
     let requested = param
         .and_then(|p| p.fallback_from.as_deref())
         .unwrap_or(served);
-    let cost = gw_models::cost_micros(
-        prompt,
-        completion,
-        ctx.cfg.prices_for_tenant(&ctx.ak.tenant, served),
+    let account = ctx.request.account_name();
+    let record = gw_state::billing_record(
+        &ctx.cfg,
+        &gw_state::BillingInput {
+            ak: &ctx.ak.ak,
+            product: &ctx.ak.product,
+            tenant: &ctx.ak.tenant,
+            requested_model: requested,
+            served_model: served,
+            protocol: param.map(|p| p.protocol.as_str()).unwrap_or_default(),
+            account: &account,
+            prompt,
+            completion,
+            total,
+            ptu_spillover,
+        },
     );
-    let vendor_cost = ctx
-        .request
-        .account
-        .as_ref()
-        .map(|a| {
-            gw_models::cost_micros(
-                prompt,
-                completion,
-                (
-                    a.cost_input_price_per_1k_micros,
-                    a.cost_output_price_per_1k_micros,
-                ),
-            )
-        })
-        .unwrap_or(0);
+    let cost = record.cost_micros;
     // settle reservations to actuals (the model-quota counter stays soft
     // post-hoc by design); independent keys run as one concurrent round-trip
     let quota_delta = total - ctx.quota_reserved.take().unwrap_or(0);
@@ -721,23 +721,6 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
                 .await
         }
     }
-    let record = BillingRecord {
-        ak: ctx.ak.ak.clone(),
-        product: ctx.ak.product.clone(),
-        tenant: ctx.ak.tenant.clone(),
-        model: requested.to_owned(),
-        served_model: served.to_owned(),
-        protocol: param
-            .map(|p| p.protocol.as_str().to_owned())
-            .unwrap_or_default(),
-        account: ctx.request.account_name(),
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        total_tokens: total,
-        cost_micros: cost,
-        vendor_cost_micros: vendor_cost,
-        ptu_spillover,
-    };
     // a ledger write failure must not fail an already-served response
     if let Err(e) = ctx.state.store.ledger_add(record).await {
         metrics::counter!("gateway_ledger_write_failures_total").increment(1);

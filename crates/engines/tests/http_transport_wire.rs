@@ -205,6 +205,27 @@ async fn per_account_policy_and_connect_retry() {
     assert_eq!(transport.policy_for("tight").connect_retries, 2);
     assert_eq!(transport.policy_for("other").connect_retries, 1);
 
+    // a reload swaps the live per-account policy without rebuilding the transport
+    let mut reloaded = HashMap::new();
+    reloaded.insert(
+        "tight".to_owned(),
+        UpstreamPolicy {
+            timeout: Duration::from_secs(9),
+            connect_retries: 5,
+        },
+    );
+    Transport::reload_policies(&transport, UpstreamPolicy::default(), reloaded);
+    assert_eq!(transport.policy_for("tight").connect_retries, 5);
+    assert_eq!(
+        transport.policy_for("tight").timeout,
+        Duration::from_secs(9)
+    );
+    assert_eq!(
+        transport.policy_for("other").connect_retries,
+        1,
+        "an account dropped from the reload falls back to the default"
+    );
+
     let closed = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap()

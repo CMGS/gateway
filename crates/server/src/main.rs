@@ -206,25 +206,7 @@ async fn main() -> anyhow::Result<()> {
 /// `http` forces real HTTP (accounts without an endpoint fail loudly), anything
 /// else routes `mock://` sentinels in-process and real URLs over HTTP.
 fn select_transport(cfg: &GatewayConfig) -> anyhow::Result<gw_engines::SharedTransport> {
-    use gw_engines::http_transport::UpstreamPolicy;
-    let default_policy = UpstreamPolicy::default();
-    let per_account: std::collections::HashMap<String, UpstreamPolicy> = cfg
-        .accounts
-        .iter()
-        .filter(|a| a.timeout_seconds.is_some() || a.connect_retries.is_some())
-        .map(|a| {
-            (
-                a.name.clone(),
-                UpstreamPolicy {
-                    timeout: a
-                        .timeout_seconds
-                        .map(std::time::Duration::from_secs)
-                        .unwrap_or(default_policy.timeout),
-                    connect_retries: a.connect_retries.unwrap_or(default_policy.connect_retries),
-                },
-            )
-        })
-        .collect();
+    let (default_policy, per_account) = gw_views::upstream_policies(cfg);
     Ok(match env::var("GW_TRANSPORT").as_deref() {
         Ok("mock") => {
             tracing::info!("transport = mock (zero egress)");

@@ -2005,6 +2005,36 @@ async fn responses_api_streaming_full_pipeline() {
 }
 
 #[tokio::test]
+async fn responses_stream_is_incremental_with_dlp_off() {
+    // with outbound DLP off the Responses stream is incremental (multiple
+    // output_text.delta frames), not one buffered blob.
+    let yaml = gw_config::DEFAULT_YAML.replace("dlp_redact: true", "dlp_redact: false");
+    let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+
+    let body = r#"{"model":"gpt-5-responses","stream":true,"input":"stream this"}"#;
+    let resp = app
+        .oneshot(post("/v1/responses", Some("ak-demo-123"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    let deltas = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|f| *f != "[DONE]")
+        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+        .filter(|v| v["type"] == "response.output_text.delta")
+        .count();
+    assert!(deltas >= 2, "expected incremental deltas, got {deltas}");
+}
+
+#[tokio::test]
 async fn responses_api_requires_input() {
     let app = app();
     let resp = app
@@ -2040,6 +2070,68 @@ async fn cache_key_distinguishes_raw_passthrough_params() {
         body_json(resp).await["count"],
         2,
         "differing raw params must not share a cache entry"
+    );
+}
+
+#[tokio::test]
+async fn reload_invalidates_the_response_cache() {
+    const YAML: &str = r#"
+listen: {host: 127.0.0.1, port: 0}
+admin: {token_env: GW_TEST_ADMIN_CACHEGEN}
+access_keys: [{ak: ak-c, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: cachem, protocol: openai-chat, cache_ttl_seconds: 300}]
+accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
+"#;
+    // SAFETY: unique var name for this test; no concurrent reader.
+    unsafe { std::env::set_var("GW_TEST_ADMIN_CACHEGEN", "cg-secret") };
+    let cfg = Arc::new(GatewayConfig::from_yaml(YAML).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let loader: gw_views::ConfigLoader = Arc::new(|| {
+        Box::pin(async { GatewayConfig::from_yaml(YAML).map_err(|e| e.to_string()) })
+            as gw_views::ConfigFuture
+    });
+    let app = gw_views::app(gw_views::AppState::with_config(
+        gw_state::SharedConfig::new(cfg, state),
+        Arc::new(gw_engines::MockTransport),
+        Some(loader),
+    ));
+
+    let body = r#"{"model":"cachem","messages":[{"role":"user","content":"cache me"}]}"#;
+    let count = |app: Router| async move {
+        body_json(app.oneshot(get("/internal/ledger")).await.unwrap()).await["count"]
+            .as_i64()
+            .unwrap()
+    };
+
+    // first call misses and bills; second is a cache hit (not billed)
+    for _ in 0..2 {
+        let r = app
+            .clone()
+            .oneshot(post("/v1/chat/completions", Some("ak-c"), body))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    assert_eq!(count(app.clone()).await, 1, "second call was a cache hit");
+
+    // a reload bumps the config generation → prior cache entry is unreachable
+    let r = app
+        .clone()
+        .oneshot(admin("POST", "/admin/reload", Some("cg-secret"), None))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    let r = app
+        .clone()
+        .oneshot(post("/v1/chat/completions", Some("ak-c"), body))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        count(app).await,
+        2,
+        "the same request misses the cache after a reload and bills again"
     );
 }
 

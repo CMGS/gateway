@@ -869,9 +869,12 @@ impl SharedConfig {
 
     /// Swap in a new config, rebuilding derived state and preserving seams.
     /// On error (networked key table unreachable) the old snapshot stays live.
-    pub async fn reload(&self, cfg: GatewayConfig) -> gw_models::GResult<()> {
+    pub async fn reload(&self, mut cfg: GatewayConfig) -> gw_models::GResult<()> {
         let _serialized = self.reload_lock.lock().await;
         let prev = self.inner.load();
+        // bump the generation so the preserved response cache can't serve a
+        // pre-reload entry for a model this reload may have remapped.
+        cfg.set_generation(prev.cfg.generation() + 1);
         let state = GatewayState::reload_from(&cfg, &prev.state).await?;
         self.inner.store(Arc::new(Snapshot {
             cfg: Arc::new(cfg),

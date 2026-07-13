@@ -387,6 +387,11 @@ pub struct GatewayConfig {
     /// Admin surface gate (dynamic config reload / key management).
     #[serde(default)]
     pub admin: AdminConf,
+    /// Bumped on each live reload so cache keys change when the model mapping
+    /// might have (a preserved response cache must not serve a pre-reload entry
+    /// for a remapped model).
+    #[serde(skip)]
+    generation: u64,
     /// name → index lookups, built once after parse to avoid per-request scans.
     #[serde(skip)]
     model_idx: std::collections::HashMap<String, usize>,
@@ -563,6 +568,16 @@ impl GatewayConfig {
         // cool down / exclude the wrong physical account.
         check_unique("account", self.accounts.iter().map(|a| a.name.as_str()))?;
         Ok(())
+    }
+
+    /// Config generation, bumped on each live reload; mixed into cache keys.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Set the generation (called by the reload path to invalidate stale cache).
+    pub fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
     }
 
     pub fn find_product(&self, name: &str) -> Option<&ProductConfEntry> {
