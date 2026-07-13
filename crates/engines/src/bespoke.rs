@@ -94,14 +94,9 @@ impl ModelEngine for ErnieEngine {
             completion_tokens: usage["completion_tokens"].as_i64().unwrap_or(0),
             total_tokens: usage["total_tokens"].as_i64().unwrap_or(0),
             raw_usage_json: usage.to_string().into_bytes(),
-            http_code: status as i64,
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -154,14 +149,9 @@ impl ModelEngine for MinimaxV1Engine {
             finish_reason: "stop".into(),
             total_tokens: total,
             raw_usage_json: v["usage"].to_string().into_bytes(),
-            http_code: status as i64,
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -237,14 +227,9 @@ impl ModelEngine for CohereEngine {
                 .to_string()
                 .into_bytes(),
             is_messages_protocol: true, // anthropic's usage fields align with cohere's input/output
-            http_code: status as i64,
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -314,14 +299,9 @@ impl ModelEngine for LlamaEngine {
                 json!({"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct})
                     .to_string()
                     .into_bytes(),
-            http_code: status as i64,
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -397,7 +377,6 @@ impl DashScopeEngine {
         let status = reply.status;
         let mut resp = GatewayResponse {
             model: self.base.model_name()?.to_owned(),
-            http_code: status as i64,
             ..Default::default()
         };
         if let UpstreamBody::Json(b) = &reply.body {
@@ -458,7 +437,6 @@ impl ModelEngine for DashScopeEngine {
                 .as_str()
                 .unwrap_or("stop")
                 .to_owned(),
-            http_code: status as i64,
             ..Default::default()
         };
         dashscope_apply_usage(&v["usage"], &mut resp);
@@ -466,11 +444,7 @@ impl ModelEngine for DashScopeEngine {
             resp.total_tokens = resp.prompt_tokens + resp.completion_tokens;
         }
         resp.raw_usage_json = dashscope_raw_usage(&resp);
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {

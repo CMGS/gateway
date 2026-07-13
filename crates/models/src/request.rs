@@ -44,6 +44,14 @@ impl GatewayRequest {
     pub fn protocol(&self) -> Option<gw_consts::Protocol> {
         self.model_param_v2.as_ref().map(|p| p.protocol)
     }
+
+    /// The serving account's name; empty when none is selected.
+    pub fn account_name(&self) -> String {
+        self.account
+            .as_ref()
+            .map(|a| a.name.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// Domain types referenced by `GatewayRequest`. Per-vendor long-tail fields

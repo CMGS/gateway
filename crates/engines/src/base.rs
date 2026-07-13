@@ -24,11 +24,7 @@ impl Base {
     }
 
     pub fn account(&self) -> String {
-        self.request
-            .account
-            .as_ref()
-            .map(|a| a.name.clone())
-            .unwrap_or_default()
+        self.request.account_name()
     }
 
     /// The go-live seam: the account's configured endpoint when set, else the

@@ -349,6 +349,22 @@ where
     }
 }
 
+fn batch_item_row<'r, R>(row: &'r R) -> BatchItemResult
+where
+    R: sqlx::Row,
+    usize: sqlx::ColumnIndex<R>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    BatchItemResult {
+        index: row.get::<i64, _>(0) as usize,
+        ok: row.get(1),
+        message: row.get(2),
+        total_tokens: row.get(3),
+    }
+}
+
 /// SQLite-backed store (sqlx, WAL). One database file holds the billing
 /// ledger, uploaded files, and batch jobs; ids are derived from rowids so they
 /// stay unique across restarts.
@@ -588,15 +604,7 @@ impl Store for SqliteStore {
             model: row.get(2),
             status: BatchStatus::parse(&status_text).unwrap_or(BatchStatus::Failed),
             total: row.get::<i64, _>(4) as usize,
-            results: results
-                .iter()
-                .map(|r| BatchItemResult {
-                    index: r.get::<i64, _>(0) as usize,
-                    ok: r.get(1),
-                    message: r.get(2),
-                    total_tokens: r.get(3),
-                })
-                .collect(),
+            results: results.iter().map(batch_item_row).collect(),
         }))
     }
 
@@ -867,15 +875,7 @@ impl Store for PostgresStore {
             model: row.get(2),
             status: BatchStatus::parse(&status_text).unwrap_or(BatchStatus::Failed),
             total: row.get::<i64, _>(4) as usize,
-            results: results
-                .iter()
-                .map(|r| BatchItemResult {
-                    index: r.get::<i64, _>(0) as usize,
-                    ok: r.get(1),
-                    message: r.get(2),
-                    total_tokens: r.get(3),
-                })
-                .collect(),
+            results: results.iter().map(batch_item_row).collect(),
         }))
     }
 

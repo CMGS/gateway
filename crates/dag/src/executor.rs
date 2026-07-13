@@ -84,10 +84,14 @@ fn topo_order(layer: &Layer) -> GResult<Vec<usize>> {
 }
 
 /// Run a precomputed plan; a node error aborts the whole run (fail-fast for
-/// online requests).
+/// online requests). A cache hit short-circuits every node after the one that
+/// set it — the cached response must not re-run limits, the engine, or billing.
 pub async fn run(plan: &Plan, ctx: &mut DagContext) -> GResult<()> {
     for (layer, order) in plan.layers.iter().zip(&plan.orders) {
         for &i in order {
+            if ctx.cache_hit {
+                return Ok(());
+            }
             let node = &layer.nodes[i];
             tracing::debug!(layer = layer.name, node = node.name(), "dag node start");
             let started = std::time::Instant::now();

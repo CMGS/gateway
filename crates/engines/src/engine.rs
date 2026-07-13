@@ -57,9 +57,14 @@ pub struct EngineOutcome {
 impl EngineOutcome {
     /// A successful (200, unblocked) outcome carrying `response`.
     pub fn ok(response: GatewayResponse) -> Self {
+        Self::with_status(response, 200)
+    }
+
+    /// A non-streaming, unblocked outcome carrying `response` at `http_code`.
+    pub fn with_status(response: GatewayResponse, http_code: u16) -> Self {
         Self {
             response,
-            http_code: 200,
+            http_code,
             block: Block::allow(),
             chunks: Vec::new(),
             streamed_live: false,

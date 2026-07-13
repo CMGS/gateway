@@ -541,22 +541,11 @@ impl GatewayConfig {
                     });
                 }
             }
-            for m in t.model_quotas.keys() {
-                if !self.model_exists(m) {
-                    return Err(ConfigError::UnknownQuotaModel {
-                        owner: format!("tenant {}", t.name),
-                        model: m.clone(),
-                    });
-                }
-            }
-            for m in t.model_prices.keys() {
-                if !self.model_exists(m) {
-                    return Err(ConfigError::UnknownQuotaModel {
-                        owner: format!("tenant {} (model_prices)", t.name),
-                        model: m.clone(),
-                    });
-                }
-            }
+            self.check_models_known(format!("tenant {}", t.name), t.model_quotas.keys())?;
+            self.check_models_known(
+                format!("tenant {} (model_prices)", t.name),
+                t.model_prices.keys(),
+            )?;
             if let Some(fb) = &t.fallback_model
                 && (!self.model_exists(fb)
                     || !t.models.as_ref().is_none_or(|allow| allow.contains(fb)))
@@ -568,14 +557,7 @@ impl GatewayConfig {
             }
         }
         for k in &self.access_keys {
-            for m in k.model_quotas.keys() {
-                if !self.model_exists(m) {
-                    return Err(ConfigError::UnknownQuotaModel {
-                        owner: format!("access key {}", k.ak),
-                        model: m.clone(),
-                    });
-                }
-            }
+            self.check_models_known(format!("access key {}", k.ak), k.model_quotas.keys())?;
         }
         // account health and failover exclusion key by name — duplicates would
         // cool down / exclude the wrong physical account.
@@ -599,6 +581,24 @@ impl GatewayConfig {
 
     fn model_exists(&self, name: &str) -> bool {
         self.models.iter().any(|c| c.name == name)
+    }
+
+    /// Every name in `names` must be a configured model, else the quota/price
+    /// entry under `owner` is a typo that would silently never apply.
+    fn check_models_known<'a>(
+        &self,
+        owner: String,
+        names: impl Iterator<Item = &'a String>,
+    ) -> Result<(), ConfigError> {
+        for m in names {
+            if !self.model_exists(m) {
+                return Err(ConfigError::UnknownQuotaModel {
+                    owner,
+                    model: m.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Whether `tenant` may call `model`: no tenant entry or no allowlist =

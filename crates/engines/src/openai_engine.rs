@@ -7,34 +7,21 @@
 //! usage subtree into `raw_usage_json` for the CommonUsage DAG node — the
 //! request→upstream→parse boundary this crate follows.
 
-use chrono::Utc;
-use gw_models::{
-    GResult, GatewayError, GatewayRequest, GatewayResponse, Recorder, SimpleRecorder, TypedParams,
-};
+use gw_models::{GResult, GatewayError, GatewayResponse, Recorder, TypedParams};
 use serde_json::{Map, Value, json};
 
+use crate::base::base_engine;
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
-use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest};
+use crate::transport::{UpstreamBody, UpstreamRequest};
 
-pub struct OpenAiEngine {
-    request: GatewayRequest,
-    transport: SharedTransport,
-    recorder: SimpleRecorder,
-}
+base_engine!(OpenAiEngine);
 
 impl OpenAiEngine {
-    pub fn new(request: GatewayRequest, transport: SharedTransport) -> Self {
-        Self {
-            request,
-            transport,
-            recorder: SimpleRecorder::new(Utc::now()),
-        }
-    }
-
     /// Rebuild the OpenAI wire message: multimodal parts win over flat text;
     /// assistant tool_calls and tool results pass through losslessly.
     fn wire_messages(&self) -> Vec<Value> {
-        self.request
+        self.base
+            .request
             .message
             .iter()
             .map(|m| {
@@ -64,18 +51,14 @@ impl OpenAiEngine {
     }
 
     fn build_upstream(&self) -> GResult<UpstreamRequest> {
-        let param = self
-            .request
-            .model_param_v2
-            .as_ref()
-            .ok_or_else(|| GatewayError::bad_request("missing model param"))?;
+        let param = self.base.param()?;
         let mut body = Map::new();
         body.insert("model".into(), param.model_name.clone().into());
         body.insert("messages".into(), Value::Array(self.wire_messages()));
-        body.insert("stream".into(), self.request.stream.into());
+        body.insert("stream".into(), self.base.request.stream.into());
         // OpenAI omits usage from streamed responses UNLESS this is set — without
         // it every streaming call would bill 0 tokens.
-        if self.request.stream {
+        if self.base.request.stream {
             body.insert("stream_options".into(), json!({"include_usage": true}));
         }
 
@@ -124,31 +107,17 @@ impl OpenAiEngine {
             }
         }
 
-        // route to the account's endpoint if configured, else the mock sentinel
-        let account = self.request.account.as_ref();
-        let base = account
-            .map(|a| a.base_url("mock://api.openai.com").to_owned())
-            .unwrap_or_else(|| "mock://api.openai.com".to_owned());
-        // real key read from the account's env var at call time; "mock" otherwise
-        let key = account
-            .and_then(|a| a.api_key())
-            .unwrap_or_else(|| "mock".to_owned());
         Ok(UpstreamRequest {
             protocol: param.protocol,
             method: "POST".to_owned(),
-            url: format!("{base}/v1/chat/completions"),
-            headers: vec![
-                ("content-type".into(), "application/json".into()),
-                ("authorization".into(), format!("Bearer {key}")),
-            ],
+            url: format!(
+                "{}/v1/chat/completions",
+                self.base.base_url("mock://api.openai.com")
+            ),
+            headers: self.base.bearer_headers(),
             body: Value::Object(body).to_string().into_bytes(),
-            stream: self.request.stream,
-            account: self
-                .request
-                .account
-                .as_ref()
-                .map(|a| a.name.clone())
-                .unwrap_or_default(),
+            stream: self.base.request.stream,
+            account: self.base.account(),
         })
     }
 
@@ -168,25 +137,17 @@ impl OpenAiEngine {
                 .as_str()
                 .unwrap_or_default()
                 .to_owned(),
-            http_code: status as i64,
             ..Default::default()
         };
         apply_openai_usage(&mut resp, &v["usage"]);
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     /// Buffered or live SSE reply through the shared pump.
     async fn run_sse(&self, status: u16, body: UpstreamBody) -> GResult<EngineOutcome> {
-        let mut resp = GatewayResponse {
-            http_code: status as i64,
-            ..Default::default()
-        };
+        let mut resp = GatewayResponse::default();
         let mut full = String::new();
-        let r = crate::pump::pump_sse("openai", body, self.request.stream_tx.clone(), |v| {
+        let r = crate::pump::pump_sse("openai", body, self.base.request.stream_tx.clone(), |v| {
             apply_sse_event(v, status, &mut resp, &mut full)
         })
         .await?;
@@ -206,7 +167,7 @@ impl OpenAiEngine {
 impl ModelEngine for OpenAiEngine {
     async fn run(&self) -> GResult<EngineOutcome> {
         let up = self.build_upstream()?;
-        let reply = self.transport.send(up).await?;
+        let reply = self.base.transport.send(up).await?;
         match reply.body {
             UpstreamBody::Json(bytes) => self.parse_json(reply.status, &bytes),
             body => self.run_sse(reply.status, body).await,
@@ -214,7 +175,7 @@ impl ModelEngine for OpenAiEngine {
     }
 
     fn recorder(&self) -> &dyn Recorder {
-        &self.recorder
+        &self.base.recorder
     }
 }
 
@@ -348,7 +309,7 @@ mod tests {
     use super::*;
     use crate::transport::MockTransport;
     use gw_consts::Protocol;
-    use gw_models::{ChatMsg, ChatParams, ModelParamV2};
+    use gw_models::{ChatMsg, ChatParams, GatewayRequest, ModelParamV2};
     use std::sync::Arc;
 
     fn req(stream: bool) -> GatewayRequest {

@@ -5,40 +5,22 @@
 //! content_block_delta → message_delta → message_stop). Marks `is_messages_protocol`
 //! so the usage extractor applies the Anthropic field map.
 
-use chrono::Utc;
-use gw_models::{
-    GResult, GatewayError, GatewayRequest, GatewayResponse, Recorder, SimpleRecorder, TypedParams,
-};
+use gw_models::{GResult, GatewayError, GatewayResponse, Recorder, TypedParams};
 use serde_json::{Map, Value, json};
 
+use crate::base::base_engine;
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
-use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest};
+use crate::transport::{UpstreamBody, UpstreamRequest};
 
-pub struct ClaudeEngine {
-    request: GatewayRequest,
-    transport: SharedTransport,
-    recorder: SimpleRecorder,
-}
+base_engine!(ClaudeEngine);
 
 impl ClaudeEngine {
-    pub fn new(request: GatewayRequest, transport: SharedTransport) -> Self {
-        Self {
-            request,
-            transport,
-            recorder: SimpleRecorder::new(Utc::now()),
-        }
-    }
-
     fn build_upstream(&self) -> GResult<UpstreamRequest> {
-        let param = self
-            .request
-            .model_param_v2
-            .as_ref()
-            .ok_or_else(|| GatewayError::bad_request("missing model param"))?;
+        let param = self.base.param()?;
         // system prompt: typed.system takes priority; system turns in messages are merged in too
         let mut system_text = String::new();
         let mut messages: Vec<Value> = Vec::new();
-        for m in &self.request.message {
+        for m in &self.base.request.message {
             if m.role == gw_consts::role::SYSTEM {
                 system_text.push_str(&m.content);
                 continue;
@@ -60,7 +42,7 @@ impl ClaudeEngine {
         let mut body = Map::new();
         body.insert("model".into(), param.model_name.clone().into());
         body.insert("messages".into(), Value::Array(messages));
-        body.insert("stream".into(), self.request.stream.into());
+        body.insert("stream".into(), self.base.request.stream.into());
         let mut max_tokens = 1024;
         if let Some(TypedParams::Chat(p)) = &param.typed {
             if let Some(mt) = p.max_tokens {
@@ -97,33 +79,22 @@ impl ClaudeEngine {
             }
         }
 
-        // go-live seam: real endpoint + key when the account is configured, else
-        // the inert mock sentinel (MockTransport routes by the `/v1/messages` path).
-        let account = self.request.account.as_ref();
-        let base = account
-            .map(|a| a.base_url("mock://api.anthropic.com").to_owned())
-            .unwrap_or_else(|| "mock://api.anthropic.com".to_owned());
-        let key = account
-            .and_then(|a| a.api_key())
-            .unwrap_or_else(|| "mock".to_owned());
         Ok(UpstreamRequest {
             protocol: param.protocol,
             method: "POST".to_owned(),
-            url: format!("{base}/v1/messages"),
+            url: format!(
+                "{}/v1/messages",
+                self.base.base_url("mock://api.anthropic.com")
+            ),
             headers: vec![
                 ("content-type".into(), "application/json".into()),
-                ("x-api-key".into(), key),
+                ("x-api-key".into(), self.base.api_key()),
                 // Anthropic API mandates this header; a real call 400s without it.
                 ("anthropic-version".into(), "2023-06-01".into()),
             ],
             body: Value::Object(body).to_string().into_bytes(),
-            stream: self.request.stream,
-            account: self
-                .request
-                .account
-                .as_ref()
-                .map(|a| a.name.clone())
-                .unwrap_or_default(),
+            stream: self.base.request.stream,
+            account: self.base.account(),
         })
     }
 
@@ -165,27 +136,24 @@ impl ClaudeEngine {
             } else {
                 usage.to_string().into_bytes()
             },
-            http_code: status as i64,
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     /// Buffered or live anthropic event sequence through the shared pump.
     async fn run_sse(&self, status: u16, body: UpstreamBody) -> GResult<EngineOutcome> {
         let mut resp = GatewayResponse {
             is_messages_protocol: true,
-            http_code: status as i64,
             ..Default::default()
         };
         let mut st = SseState::default();
-        let r = crate::pump::pump_sse("anthropic", body, self.request.stream_tx.clone(), |v| {
-            st.apply(v, status, &mut resp)
-        })
+        let r = crate::pump::pump_sse(
+            "anthropic",
+            body,
+            self.base.request.stream_tx.clone(),
+            |v| st.apply(v, status, &mut resp),
+        )
         .await?;
         st.finish(&mut resp);
         resp.aborted = r.aborted;
@@ -203,7 +171,7 @@ impl ClaudeEngine {
 impl ModelEngine for ClaudeEngine {
     async fn run(&self) -> GResult<EngineOutcome> {
         let up = self.build_upstream()?;
-        let reply = self.transport.send(up).await?;
+        let reply = self.base.transport.send(up).await?;
         match reply.body {
             UpstreamBody::Json(b) => self.parse_json(reply.status, &b),
             body => self.run_sse(reply.status, body).await,
@@ -211,7 +179,7 @@ impl ModelEngine for ClaudeEngine {
     }
 
     fn recorder(&self) -> &dyn Recorder {
-        &self.recorder
+        &self.base.recorder
     }
 }
 
@@ -345,7 +313,7 @@ mod tests {
     use super::*;
     use crate::transport::MockTransport;
     use gw_consts::Protocol;
-    use gw_models::{ChatMsg, ChatParams, ModelParamV2};
+    use gw_models::{ChatMsg, ChatParams, GatewayRequest, ModelParamV2};
     use std::sync::Arc;
 
     fn base_req() -> GatewayRequest {

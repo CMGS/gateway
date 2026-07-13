@@ -9,6 +9,9 @@ pub mod protocol;
 pub use error_code::{ErrCode, ErrorException};
 pub use protocol::Protocol;
 
+/// The per-minute governance window (QPM/TPM limits).
+pub const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Chat roles.
 pub mod role {
     pub const USER: &str = "user";

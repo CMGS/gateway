@@ -35,8 +35,6 @@ pub struct GatewayResponse {
     pub total_tokens: i64,
 
     pub upstream_latency_ms: i64,
-    /// upstream HTTP status.
-    pub http_code: i64,
     pub err_type: String,
     pub err_code: String,
 

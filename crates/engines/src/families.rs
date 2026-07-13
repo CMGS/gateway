@@ -128,7 +128,6 @@ impl VertexEngine {
         let status = reply.status;
         let mut resp = GatewayResponse {
             model: self.base.param()?.model_name.clone(),
-            http_code: status as i64,
             ..Default::default()
         };
         if let UpstreamBody::Json(b) = &reply.body {
@@ -192,7 +191,6 @@ impl ModelEngine for VertexEngine {
                 .as_str()
                 .unwrap_or_default()
                 .to_lowercase(),
-            http_code: status as i64,
             ..Default::default()
         };
         vertex_apply_usage(&v["usageMetadata"], &mut resp);
@@ -200,11 +198,7 @@ impl ModelEngine for VertexEngine {
             resp.total_tokens = resp.prompt_tokens + resp.completion_tokens;
         }
         resp.raw_usage_json = vertex_raw_usage(&resp);
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -339,15 +333,10 @@ impl ModelEngine for EmbeddingsEngine {
             total_tokens: pt,
             raw_usage_json: v["usage"].to_string().into_bytes(),
             response_v2: Some(v),
-            http_code: status as i64,
             finish_reason: "stop".to_owned(),
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -405,15 +394,10 @@ impl ModelEngine for ImageEngine {
             message: format!("{count} image(s) {verb}"),
             model: param.model_name.clone(),
             response_v2: Some(v),
-            http_code: status as i64,
             finish_reason: "stop".to_owned(),
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -506,15 +490,10 @@ impl ModelEngine for AudioEngine {
             message,
             model: param.model_name.clone(),
             response_v2: Some(v),
-            http_code: status as i64,
             finish_reason: "stop".to_owned(),
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -569,15 +548,10 @@ impl ModelEngine for VideoEngine {
             model: param.model_name.clone(),
             step: v["status"].as_str().unwrap_or_default().to_owned(),
             response_v2: Some(v),
-            http_code: status as i64,
             finish_reason: "stop".to_owned(),
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -627,15 +601,10 @@ impl ModelEngine for SearchEngine {
             message: titles.join("; "),
             model: param.model_name.clone(),
             response_v2: Some(v),
-            http_code: status as i64,
             finish_reason: "stop".to_owned(),
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -670,15 +639,10 @@ impl ModelEngine for PassthroughEngine {
             },
             model: param.model_name.clone(),
             response_v2: Some(v),
-            http_code: status as i64,
             finish_reason: "stop".to_owned(),
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -748,14 +712,9 @@ impl ModelEngine for CompletionsEngine {
             } else {
                 usage.to_string().into_bytes()
             },
-            http_code: status as i64,
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     fn recorder(&self) -> &dyn Recorder {
@@ -852,14 +811,9 @@ impl ResponsesEngine {
             total_tokens: input + output,
             raw_usage_json,
             response_v2: Some(v),
-            http_code: status as i64,
             ..Default::default()
         };
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::with_status(resp, status))
     }
 
     /// Streaming Responses reply: accumulate `response.output_text.delta` frames;
@@ -917,7 +871,6 @@ impl ResponsesEngine {
             completion_tokens: output,
             total_tokens: input + output,
             raw_usage_json,
-            http_code: status as i64,
             ..Default::default()
         };
         Ok(EngineOutcome {

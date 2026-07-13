@@ -240,9 +240,6 @@ impl DagNode for QuotaCheck {
         &["cache_lookup"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit {
-            return Ok(()); // cache hit doesn't consume quota
-        }
         let est = reserve_estimate(&ctx.request);
         if !ctx
             .state
@@ -271,9 +268,6 @@ impl DagNode for SelectAccount {
         "select_account"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit {
-            return Ok(());
-        }
         let mt = ctx
             .request
             .protocol()
@@ -307,9 +301,6 @@ impl DagNode for TenantRateLimit {
         "tenant_rate"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit {
-            return Ok(());
-        }
         let Some(qps) = ctx.cfg.find_tenant(&ctx.ak.tenant).and_then(|t| t.qps) else {
             return Ok(());
         };
@@ -344,9 +335,6 @@ impl DagNode for RateLimit {
         &["tenant_rate"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit {
-            return Ok(());
-        }
         if !ctx
             .state
             .governance
@@ -378,13 +366,10 @@ impl DagNode for ProductQpmLimit {
         &["rate_limit"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit {
-            return Ok(());
-        }
         let Some(qpm) = ctx.cfg.find_product(&ctx.ak.product).and_then(|p| p.qpm) else {
             return Ok(());
         };
-        let window = std::time::Duration::from_secs(60);
+        let window = gw_consts::MINUTE;
         if !ctx
             .state
             .governance
@@ -416,16 +401,13 @@ impl DagNode for ModelQpmLimit {
         &["product_qpm"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit {
-            return Ok(());
-        }
         let Some(param) = ctx.request.model_param_v2.as_ref() else {
             return Ok(());
         };
         let Some(qpm) = ctx.cfg.find_model(&param.model_name).and_then(|m| m.qpm) else {
             return Ok(());
         };
-        let window = std::time::Duration::from_secs(60);
+        let window = gw_consts::MINUTE;
         if !ctx
             .state
             .governance
@@ -457,13 +439,10 @@ impl DagNode for AkTpmLimit {
         &["model_qpm"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit {
-            return Ok(());
-        }
         let Some(tpm) = ctx.ak.tokens_per_minute else {
             return Ok(());
         };
-        let window = std::time::Duration::from_secs(60);
+        let window = gw_consts::MINUTE;
         let est = ctx
             .quota_reserved
             .unwrap_or_else(|| reserve_estimate(&ctx.request));
@@ -503,9 +482,6 @@ impl DagNode for CallEngine {
         &["ak_tpm"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit {
-            return Ok(());
-        }
         let threshold = ctx.cfg.stability.failure_threshold;
         let cooldown = std::time::Duration::from_secs(ctx.cfg.stability.cooldown_seconds);
         let engine = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
@@ -601,9 +577,6 @@ impl DagNode for CommonUsageNode {
         "common_usage"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit {
-            return Ok(());
-        }
         if let Some(outcome) = ctx.outcome.as_mut() {
             let resp = &mut outcome.response;
             resp.common_usage =
@@ -626,9 +599,6 @@ impl DagNode for CostCalc {
         &["common_usage"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit {
-            return Ok(()); // cache hit is not billed and doesn't consume quota
-        }
         let Some(outcome) = ctx.outcome.as_ref() else {
             return Ok(()); // nothing to bill
         };
@@ -736,7 +706,7 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
                 .await
         }
     }
-    let window = std::time::Duration::from_secs(60);
+    let window = gw_consts::MINUTE;
     match ctx.tpm_reserved.take() {
         Some(est) => {
             ctx.state
@@ -760,12 +730,7 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
         protocol: param
             .map(|p| p.protocol.as_str().to_owned())
             .unwrap_or_default(),
-        account: ctx
-            .request
-            .account
-            .as_ref()
-            .map(|a| a.name.clone())
-            .unwrap_or_default(),
+        account: ctx.request.account_name(),
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
@@ -794,7 +759,7 @@ impl DagNode for CacheStore {
         &["cost_calc"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if ctx.cache_hit || ctx.request.stream || !ctx.request.is_online {
+        if ctx.request.stream || !ctx.request.is_online {
             return Ok(());
         }
         let (Some(key), Some(outcome)) = (ctx.cache_key.as_ref(), ctx.outcome.as_ref()) else {

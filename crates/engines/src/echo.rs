@@ -44,7 +44,6 @@ impl ModelEngine for EchoEngine {
             prompt_tokens,
             completion_tokens: 0,
             total_tokens: prompt_tokens,
-            http_code: 200,
             finish_reason: "stop".to_owned(),
             ..Default::default()
         };

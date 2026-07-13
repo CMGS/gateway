@@ -264,9 +264,7 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo) -> Option<String> {
         return Some(format!("daily token quota exhausted for ak {}", ak.ak));
     }
     if let Some(tpm) = ak.tokens_per_minute
-        && !gov
-            .token_window_check(&ak.ak, tpm, std::time::Duration::from_secs(60))
-            .await
+        && !gov.token_window_check(&ak.ak, tpm, gw_consts::MINUTE).await
     {
         return Some(format!(
             "token-per-minute limit exceeded for ak {} (tpm {tpm})",
@@ -301,7 +299,7 @@ async fn bill_realtime_turn(
         .unwrap_or((0, 0));
     let gov = &s.handler.state().governance;
     gov.quota_consume(&ak.ak, it + ot).await;
-    gov.token_window_add(&ak.ak, it + ot, std::time::Duration::from_secs(60))
+    gov.token_window_add(&ak.ak, it + ot, gw_consts::MINUTE)
         .await;
     let record = gw_state::BillingRecord {
         ak: ak.ak.clone(),

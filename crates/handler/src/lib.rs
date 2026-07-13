@@ -71,7 +71,6 @@ impl OnlineHandler {
             let response = GatewayResponse {
                 message: block.message.clone(),
                 finish_reason: "content_filter".to_owned(),
-                http_code: 200,
                 ..Default::default()
             };
             ctx.outcome = Some(EngineOutcome {
@@ -102,7 +101,7 @@ impl OnlineHandler {
             if let Some(est) = ctx.tpm_reserved.take() {
                 ctx.state
                     .governance
-                    .token_window_settle(&ctx.ak.ak, -est, std::time::Duration::from_secs(60))
+                    .token_window_settle(&ctx.ak.ak, -est, gw_consts::MINUTE)
                     .await;
             }
             return Err(e);
