@@ -665,6 +665,13 @@ impl DagNode for CostCalc {
 
 /// Consume quota/TPM and write the ledger record for one served request.
 async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) -> GResult<()> {
+    // clamp before metering so a hostile usage report can't overflow a shared
+    // quota counter (see gw_state::MAX_METERED_TOKENS)
+    let (prompt, completion, total) = (
+        gw_state::clamp_tokens(prompt),
+        gw_state::clamp_tokens(completion),
+        gw_state::clamp_tokens(total),
+    );
     let ptu_spillover = ctx
         .outcome
         .as_ref()

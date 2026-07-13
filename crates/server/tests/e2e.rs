@@ -2648,20 +2648,27 @@ models:
     }
     assert_eq!(done1.unwrap()["response"]["usage"]["total_tokens"], 13);
 
-    // turn 2: over quota — the gateway must deny it (error frame), and it must
-    // not bill
+    // turn 2: over quota — the gateway must deny it (error frame), suppress its
+    // output entirely (no delta/done relayed), and not bill it
     ws.send(append()).await.unwrap();
     let mut saw_error = false;
+    let mut leaked_output = false;
     while let Some(Ok(msg)) = ws.next().await {
         let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-        if v["type"] == "error" {
-            saw_error = true;
-        }
-        if v["type"] == "response.done" {
-            break; // cancelled response.done ends turn 2
+        match v["type"].as_str() {
+            Some("error") => {
+                saw_error = true;
+                break; // the denied turn's own frames are suppressed; error is all we get
+            }
+            Some("response.output_text.delta") | Some("response.done") => leaked_output = true,
+            _ => {}
         }
     }
     assert!(saw_error, "an over-quota server-VAD turn must be denied");
+    assert!(
+        !leaked_output,
+        "a denied turn's output must not reach the client"
+    );
 
     let (count, records) = state.store.ledger_snapshot(usize::MAX).await.unwrap();
     assert_eq!(

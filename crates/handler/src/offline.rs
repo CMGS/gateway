@@ -90,7 +90,11 @@ impl OfflineHandler {
             Ok(None) => return, // the batch row vanished; nothing to run
             Err(e) => {
                 tracing::error!(error = %e, batch = %id, "batch resume read failed; failing to avoid re-billing");
-                let _ = store.batch_set_status(id, BatchStatus::Failed).await;
+                // fenced: a reclaimed stale worker that trips this must not clobber
+                // the new owner's status
+                let _ = store
+                    .batch_set_status_owned(id, BatchStatus::Failed, claim)
+                    .await;
                 return;
             }
         };
@@ -194,12 +198,6 @@ impl OfflineHandler {
         if lost.load(Relaxed) {
             return; // the reclaiming instance owns the terminal status now
         }
-        // final ownership check right before the terminal write, so a reclaim
-        // during the last item can't be clobbered by our stale Completed/Failed;
-        // fail closed (skip the write) if ownership can't be confirmed
-        if claim != 0 && !matches!(store.batch_touch(id, claim).await, Ok(true)) {
-            return;
-        }
         // Completed only if every result persisted; a lost write means missing
         // results, so report Failed rather than a Completed-but-incomplete batch.
         let done = if any_fail || !writes_ok {
@@ -207,7 +205,9 @@ impl OfflineHandler {
         } else {
             BatchStatus::Completed
         };
-        if let Err(e) = store.batch_set_status(id, done).await {
+        // fenced terminal write: applies only if we still hold the claim, so a
+        // reclaim during the last item can't be clobbered by a stale status
+        if let Err(e) = store.batch_set_status_owned(id, done, claim).await {
             tracing::error!(error = %e, batch = %id, "batch status write failed");
         }
     }
@@ -230,7 +230,9 @@ impl OfflineHandler {
                         }
                         _ => {
                             tracing::warn!(batch = %job.id, ak = %job.ak, "claimed batch's key is gone or inactive; failing it");
-                            let _ = store.batch_set_status(&job.id, BatchStatus::Failed).await;
+                            let _ = store
+                                .batch_set_status_owned(&job.id, BatchStatus::Failed, claim)
+                                .await;
                             continue;
                         }
                     };
@@ -240,7 +242,9 @@ impl OfflineHandler {
                         Ok(items) => items,
                         Err(e) => {
                             tracing::error!(error = %e, batch = %job.id, "batch item load failed; failing the job");
-                            let _ = store.batch_set_status(&job.id, BatchStatus::Failed).await;
+                            let _ = store
+                                .batch_set_status_owned(&job.id, BatchStatus::Failed, claim)
+                                .await;
                             continue;
                         }
                     };

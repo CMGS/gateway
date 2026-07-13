@@ -418,7 +418,8 @@ async fn bill_realtime_turn(
     ot: i64,
 ) {
     let ak = &admit.ak;
-    let (it, ot) = (it.max(0), ot.max(0));
+    // clamp so a hostile upstream usage report can't overflow a shared counter
+    let (it, ot) = (gw_state::clamp_tokens(it), gw_state::clamp_tokens(ot));
     let total = it.saturating_add(ot);
     let state = s.handler.state();
     let gov = &state.governance;
@@ -667,6 +668,9 @@ async fn realtime_bridge(
     // response at a time keeps this FIFO; drained on each turn-boundary frame,
     // refunded on exit so a dropped turn's reserves never leak.
     let mut pending: std::collections::VecDeque<RealtimeAdmit> = std::collections::VecDeque::new();
+    // set when a server-VAD turn is denied: swallow that turn's upstream frames
+    // (its output must not reach the client) until its terminal frame arrives.
+    let mut suppress = false;
     loop {
         tokio::select! {
             m = cl_rx.next() => match m {
@@ -722,13 +726,22 @@ async fn realtime_bridge(
             },
             m = up_rx.next() => match m {
                 Some(Ok(UMsg::Text(t))) => {
+                    let mut relay = true;
                     if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                        if suppress {
+                            // swallow the denied turn's output until its boundary
+                            relay = false;
+                            if realtime_usage(&account.provider, &v).is_some() {
+                                suppress = false; // turn ended; resume relaying
+                            }
+                        }
                         // Server-VAD: OpenAI auto-starts a turn (`response.created`)
                         // with no client `response.create`, so gate it here when no
                         // manually-gated turn is pending. This gives automatic turns
                         // the same admission + fresh-key attribution as manual ones;
-                        // a denied turn is cancelled upstream and error'd downstream.
-                        if v["type"] == "response.created" && pending.is_empty() {
+                        // a denied turn is cancelled upstream, error'd downstream, and
+                        // its output frames are suppressed so nothing leaks.
+                        else if v["type"] == "response.created" && pending.is_empty() {
                             match realtime_gate(&s, &ak, &model).await {
                                 Ok(admit) => pending.push_back(admit),
                                 Err(denied) => {
@@ -738,6 +751,8 @@ async fn realtime_bridge(
                                     let _ = cl_tx
                                         .send(CMsg::Text(send_err(denied).to_string().into()))
                                         .await;
+                                    suppress = true;
+                                    relay = false;
                                 }
                             }
                         } else if let Some((it, ot)) = realtime_usage(&account.provider, &v) {
@@ -786,12 +801,13 @@ async fn realtime_bridge(
                             recognized += 1;
                         }
                     }
-                    if cl_tx.send(CMsg::Text(t.to_string().into())).await.is_err() {
+                    if relay && cl_tx.send(CMsg::Text(t.to_string().into())).await.is_err() {
                         break;
                     }
                 }
                 Some(Ok(UMsg::Binary(b))) => {
-                    if cl_tx.send(CMsg::Binary(b)).await.is_err() {
+                    // a denied turn's binary output (e.g. audio deltas) is dropped too
+                    if !suppress && cl_tx.send(CMsg::Binary(b)).await.is_err() {
                         break;
                     }
                 }

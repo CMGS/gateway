@@ -129,10 +129,29 @@ pub struct BillingInput<'a> {
     pub ptu_spillover: bool,
 }
 
+/// Per-call token ceiling. Usage is floored at 0 upstream but not capped, so a
+/// hostile/buggy upstream can report i64::MAX; clamping each metered count here
+/// keeps every downstream accumulator (Redis INCRBY reservations, SQL `SUM`
+/// rollups, in-memory counters) far from overflow. Far above any real response
+/// (largest model context is ~2M tokens), so real traffic is never clamped.
+pub const MAX_METERED_TOKENS: i64 = 1_000_000_000;
+
+/// Clamp a metered token count into `[0, MAX_METERED_TOKENS]`.
+pub fn clamp_tokens(n: i64) -> i64 {
+    n.clamp(0, MAX_METERED_TOKENS)
+}
+
 /// Price one call into a [`BillingRecord`]: charged at the tenant's price for the
 /// served model, vendor cost from the serving account. Shared by the request
-/// pipeline and the realtime surface so the two pricing paths can't drift.
+/// pipeline and the realtime surface so the two pricing paths can't drift. Token
+/// counts are clamped (see [`MAX_METERED_TOKENS`]) so a hostile usage report
+/// can't overflow the ledger rollup.
 pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
+    let (prompt, completion, total) = (
+        clamp_tokens(b.prompt),
+        clamp_tokens(b.completion),
+        clamp_tokens(b.total),
+    );
     let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
     let vendor = cfg
         .accounts
@@ -153,11 +172,11 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         served_model: b.served_model.to_owned(),
         protocol: b.protocol.to_owned(),
         account: b.account.to_owned(),
-        prompt_tokens: b.prompt,
-        completion_tokens: b.completion,
-        total_tokens: b.total,
-        cost_micros: gw_models::cost_micros(b.prompt, b.completion, charged),
-        vendor_cost_micros: gw_models::cost_micros(b.prompt, b.completion, vendor),
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: total,
+        cost_micros: gw_models::cost_micros(prompt, completion, charged),
+        vendor_cost_micros: gw_models::cost_micros(prompt, completion, vendor),
         ptu_spillover: b.ptu_spillover,
     }
 }
@@ -201,6 +220,18 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>>;
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()>;
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()>;
+    /// Set status only if `claim` still matches the batch's fence token (see
+    /// [`Store::batch_claim_pending`]); returns whether the write applied. So a
+    /// reclaimed stale executor can't clobber the new owner's status. Unfenced
+    /// backends apply unconditionally and return `true`.
+    async fn batch_set_status_owned(
+        &self,
+        id: &str,
+        status: BatchStatus,
+        _claim: i64,
+    ) -> GResult<bool> {
+        self.batch_set_status(id, status).await.map(|()| true)
+    }
 
     /// Whether this backend runs a fleet work queue (any instance drains
     /// submitted batches). Local backends execute on the submitting instance.
@@ -1010,6 +1041,22 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    async fn batch_set_status_owned(
+        &self,
+        id: &str,
+        status: BatchStatus,
+        claim: i64,
+    ) -> GResult<bool> {
+        let r = sqlx::query("UPDATE batches SET status = $1 WHERE id = $2 AND claim_seq = $3")
+            .bind(status.as_str())
+            .bind(id)
+            .bind(claim)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("update batch status (fenced)", e))?;
+        Ok(r.rows_affected() > 0)
+    }
+
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
         sqlx::query(
             "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens)
@@ -1146,6 +1193,31 @@ impl Store for PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn billing_record_clamps_hostile_usage() {
+        let cfg = gw_config::GatewayConfig::embedded_default().unwrap();
+        let rec = billing_record(
+            &cfg,
+            &BillingInput {
+                ak: "k",
+                product: "demo",
+                tenant: "default",
+                requested_model: "gpt-4o",
+                served_model: "gpt-4o",
+                protocol: "openai-chat",
+                account: "acc",
+                prompt: i64::MAX,
+                completion: i64::MAX,
+                total: i64::MAX,
+                ptu_spillover: false,
+            },
+        );
+        assert_eq!(rec.prompt_tokens, MAX_METERED_TOKENS);
+        assert_eq!(rec.completion_tokens, MAX_METERED_TOKENS);
+        assert_eq!(rec.total_tokens, MAX_METERED_TOKENS);
+        assert!(rec.cost_micros >= 0, "cost must not overflow negative");
+    }
 
     fn record(model: &str) -> BillingRecord {
         BillingRecord {
