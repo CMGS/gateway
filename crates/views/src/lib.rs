@@ -413,10 +413,41 @@ fn is_response_create(payload: &[u8]) -> bool {
 
 /// Bridge one realtime session to a real upstream over WebSocket: a transparent
 /// relay plus the gateway's own concerns — auth, per-generation governance
-/// gates on `response.create`, and billing from the vendor's `response.done`
-/// usage. Gating and billing speak the OpenAI Realtime dialect; a vendor with
+/// gates on `response.create`, and billing per-dialect usage frames. Gating
+/// speaks the OpenAI Realtime dialect (`response.create`); billing recognizes
+/// several dialects (see `realtime_usage`); a vendor with
 /// a different wire shape needs its own adapter before it can be metered (the
 /// unmetered-session warning below is the operator's misconfiguration signal).
+/// Per-dialect realtime usage from one upstream server frame → (input, output)
+/// tokens, or `None` when the frame carries no usage. Keyed by the account's
+/// provider so non-OpenAI vendors are metered instead of relayed for free.
+fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
+    let usage = match provider {
+        // Gemini Live: `usageMetadata` rides server frames (notably turn-complete).
+        "google" | "gemini" | "vertex" => {
+            let u = &frame["usageMetadata"];
+            let it = u["promptTokenCount"].as_i64()?;
+            let ot = u["responseTokenCount"]
+                .as_i64()
+                .or_else(|| u["candidatesTokenCount"].as_i64())
+                .unwrap_or(0);
+            (it, ot)
+        }
+        // Default: OpenAI Realtime — usage in `response.done`.
+        _ => {
+            if frame["type"] != "response.done" {
+                return None;
+            }
+            let u = &frame["response"]["usage"];
+            (
+                u["input_tokens"].as_i64().unwrap_or(0),
+                u["output_tokens"].as_i64().unwrap_or(0),
+            )
+        }
+    };
+    (usage.0 + usage.1 > 0).then_some(usage)
+}
+
 async fn realtime_bridge(
     mut client: axum::extract::ws::WebSocket,
     s: AppState,
@@ -518,15 +549,10 @@ async fn realtime_bridge(
             m = up_rx.next() => match m {
                 Some(Ok(UMsg::Text(t))) => {
                     if let Ok(v) = serde_json::from_str::<Value>(&t)
-                        && v["type"] == "response.done"
+                        && let Some((it, ot)) = realtime_usage(&account.provider, &v)
                     {
-                        let usage = &v["response"]["usage"];
-                        let it = usage["input_tokens"].as_i64().unwrap_or(0);
-                        let ot = usage["output_tokens"].as_i64().unwrap_or(0);
-                        if it + ot > 0 {
-                            bill_realtime_turn(&s, &ak, &model, mt, &account.name, it, ot).await;
-                            billed_turns += 1;
-                        }
+                        bill_realtime_turn(&s, &ak, &model, mt, &account.name, it, ot).await;
+                        billed_turns += 1;
                     }
                     if cl_tx.send(CMsg::Text(t.to_string().into())).await.is_err() {
                         break;
@@ -2377,6 +2403,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn realtime_usage_per_dialect() {
+        // OpenAI Realtime: usage in response.done
+        let done = json!({"type":"response.done","response":{"usage":{"input_tokens":12,"output_tokens":34}}});
+        assert_eq!(realtime_usage("openai", &done), Some((12, 34)));
+        assert_eq!(realtime_usage("azure", &done), Some((12, 34)));
+        // non-done OpenAI frames carry no usage
+        assert_eq!(
+            realtime_usage("openai", &json!({"type":"response.delta","delta":"hi"})),
+            None
+        );
+        // Gemini Live: usageMetadata (responseTokenCount, else candidatesTokenCount)
+        let g = json!({"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}});
+        assert_eq!(realtime_usage("gemini", &g), Some((5, 9)));
+        let g2 = json!({"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":7}});
+        assert_eq!(realtime_usage("google", &g2), Some((5, 7)));
+        // a Gemini frame without usageMetadata is not billed
+        assert_eq!(realtime_usage("gemini", &json!({"serverContent":{}})), None);
+        // zero usage never bills
+        assert_eq!(
+            realtime_usage(
+                "openai",
+                &json!({"type":"response.done","response":{"usage":{"input_tokens":0,"output_tokens":0}}})
+            ),
+            None
+        );
     }
 
     #[test]
