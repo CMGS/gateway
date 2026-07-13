@@ -19,6 +19,7 @@ client ──► /v1/* (OpenAI + Anthropic surfaces, streaming SSE, realtime WS)
 - [Governance](governance.md) — access keys, rate limits, quotas, cache, safety
 - [Observability](observability.md) — `/metrics`, access logs, the ledger
 - [Deployment](deployment.md) — binary, Docker, env vars, multi-replica
+- [Running a fleet](multi-instance.md) — nginx LB, shared state, affinity
 - [Configuration](configuration.md) — the full `gateway.yaml` reference
 - [Architecture](architecture.md) — crate layout, pipeline, trait seams
 - [Development](development.md) — build, test, workspace map, contributing
