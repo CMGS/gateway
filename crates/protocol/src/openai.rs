@@ -152,18 +152,14 @@ impl ChatCompletionResponse {
         finish_reason: impl Into<String>,
         usage: Usage,
     ) -> Self {
-        Self {
-            id: id.into(),
-            object: "chat.completion".to_owned(),
+        Self::with_message(
+            id,
             created,
-            model: model.into(),
-            choices: vec![Choice {
-                index: 0,
-                message: ChatMessage::text("assistant", content),
-                finish_reason: finish_reason.into(),
-            }],
+            model,
+            ChatMessage::text("assistant", content),
+            finish_reason.into(),
             usage,
-        }
+        )
     }
 
     /// Assistant turn that is a tool call (content null, finish_reason=tool_calls).
@@ -174,6 +170,29 @@ impl ChatCompletionResponse {
         calls: Vec<ToolCall>,
         usage: Usage,
     ) -> Self {
+        Self::with_message(
+            id,
+            created,
+            model,
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: None,
+                tool_calls: Some(calls),
+                ..Default::default()
+            },
+            "tool_calls".to_owned(),
+            usage,
+        )
+    }
+
+    fn with_message(
+        id: impl Into<String>,
+        created: i64,
+        model: impl Into<String>,
+        message: ChatMessage,
+        finish_reason: String,
+        usage: Usage,
+    ) -> Self {
         Self {
             id: id.into(),
             object: "chat.completion".to_owned(),
@@ -181,20 +200,13 @@ impl ChatCompletionResponse {
             model: model.into(),
             choices: vec![Choice {
                 index: 0,
-                message: ChatMessage {
-                    role: "assistant".to_owned(),
-                    content: None,
-                    tool_calls: Some(calls),
-                    ..Default::default()
-                },
-                finish_reason: "tool_calls".to_owned(),
+                message,
+                finish_reason,
             }],
             usage,
         }
     }
 }
-
-// --- streaming (SSE chunk) shapes ---
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChunkDelta {
@@ -226,42 +238,52 @@ pub struct ChatCompletionChunk {
 
 impl ChatCompletionChunk {
     pub fn content(id: &str, created: i64, model: &str, text: impl Into<String>) -> Self {
-        Self {
-            id: id.to_owned(),
-            object: "chat.completion.chunk".to_owned(),
+        Self::with_delta(
+            id,
             created,
-            model: model.to_owned(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    content: Some(text.into()),
-                    ..Default::default()
-                },
-                finish_reason: None,
-            }],
-            usage: None,
-        }
+            model,
+            ChunkDelta {
+                content: Some(text.into()),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
     }
 
     pub fn tool_calls(id: &str, created: i64, model: &str, calls: Vec<Value>) -> Self {
-        Self {
-            id: id.to_owned(),
-            object: "chat.completion.chunk".to_owned(),
+        Self::with_delta(
+            id,
             created,
-            model: model.to_owned(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    tool_calls: Some(calls),
-                    ..Default::default()
-                },
-                finish_reason: None,
-            }],
-            usage: None,
-        }
+            model,
+            ChunkDelta {
+                tool_calls: Some(calls),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
     }
 
     pub fn finish(id: &str, created: i64, model: &str, usage: Option<Usage>) -> Self {
+        Self::with_delta(
+            id,
+            created,
+            model,
+            ChunkDelta::default(),
+            Some("stop".to_owned()),
+            usage,
+        )
+    }
+
+    fn with_delta(
+        id: &str,
+        created: i64,
+        model: &str,
+        delta: ChunkDelta,
+        finish_reason: Option<String>,
+        usage: Option<Usage>,
+    ) -> Self {
         Self {
             id: id.to_owned(),
             object: "chat.completion.chunk".to_owned(),
@@ -269,8 +291,8 @@ impl ChatCompletionChunk {
             model: model.to_owned(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: ChunkDelta::default(),
-                finish_reason: Some("stop".to_owned()),
+                delta,
+                finish_reason,
             }],
             usage,
         }

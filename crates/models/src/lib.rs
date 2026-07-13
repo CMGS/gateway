@@ -12,7 +12,7 @@ pub mod response;
 pub mod token_estimate;
 pub mod usage;
 
-pub use cost::{TokenInput, TokenRate, platform_input, platform_total};
+pub use cost::{TokenInput, TokenRate, cost_micros, platform_input, platform_total};
 pub use error::{GResult, GatewayError};
 pub use params::{
     ChatParams, EmbeddingParams, ImageParams, SearchParams, SttParams, TtsParams, TypedParams,

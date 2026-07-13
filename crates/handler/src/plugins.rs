@@ -17,11 +17,8 @@ pub fn security_check(sec: &SecurityConf, request: &GatewayRequest) -> Option<Bl
         let lower = msg.content.to_lowercase();
         for word in &sec.blocklist {
             if !word.is_empty() && lower.contains(&word.to_lowercase()) {
-                return Some(Block::blocked(
-                    // user-facing message for a blocked request
-                    "this content cannot be answered, please try a different request",
-                    4003,
-                ));
+                let e = gw_consts::error_code::exceptions::empty_resp_err();
+                return Some(Block::blocked(e.msg, e.code as i32));
             }
         }
     }

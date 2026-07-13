@@ -63,12 +63,8 @@ impl std::fmt::Debug for RedisHealth {
 
 impl RedisHealth {
     pub async fn connect(url: &str) -> Result<Self, String> {
-        let client = redis::Client::open(url).map_err(|e| format!("redis open: {e}"))?;
-        let conn = redis::aio::ConnectionManager::new(client)
-            .await
-            .map_err(|e| format!("redis connect: {e}"))?;
         Ok(Self {
-            conn,
+            conn: crate::redis_connect(url).await?,
             cache: moka::sync::Cache::builder()
                 .max_capacity(AVAILABLE_CACHE_MAX)
                 .time_to_live(AVAILABLE_CACHE_TTL)
@@ -164,14 +160,14 @@ mod tests {
         let name = format!("acc-{}", std::process::id());
         let cd = Duration::from_millis(300);
 
-        h.record_success(&name).await; // clean slate
+        h.record_success(&name).await;
         assert!(h.available(&name).await);
         assert!(!h.record_failure(&name, 2, cd).await);
         assert!(h.record_failure(&name, 2, cd).await, "threshold trips");
         assert!(!h.available(&name).await, "tripped account is unavailable");
 
         tokio::time::sleep(Duration::from_millis(350)).await;
-        h.cache.invalidate(&name); // skip the local-cache lag in the test
+        h.cache.invalidate(&name);
         assert!(h.available(&name).await, "cooldown auto-recovers");
         assert!(
             h.record_failure(&name, 2, cd).await,

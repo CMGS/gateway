@@ -58,6 +58,33 @@ impl AkInfo {
             _ => KeyStatus::Active,
         }
     }
+
+    /// Apply a partial quota/lifecycle patch: absent = leave, `Some(None)` =
+    /// clear, `Some(Some(v))` = set.
+    pub fn apply_patch(
+        &mut self,
+        qps: Option<f64>,
+        daily_token_quota: Option<i64>,
+        tokens_per_minute: Option<Option<i64>>,
+        expires_at_epoch_secs: Option<Option<i64>>,
+        banned: Option<bool>,
+    ) {
+        if let Some(v) = qps {
+            self.qps = v;
+        }
+        if let Some(v) = daily_token_quota {
+            self.daily_token_quota = v;
+        }
+        if let Some(v) = tokens_per_minute {
+            self.tokens_per_minute = v;
+        }
+        if let Some(v) = expires_at_epoch_secs {
+            self.expires_at_epoch_secs = v;
+        }
+        if let Some(v) = banned {
+            self.banned = v;
+        }
+    }
 }
 
 impl From<&gw_config::AkConf> for AkInfo {
@@ -82,19 +109,6 @@ pub enum KeyStatus {
     Active,
     Banned,
     Expired,
-}
-
-/// Wrap a sqlx error as an internal gateway error with context.
-pub(crate) fn sqlx_err(what: &str, e: sqlx::Error) -> gw_models::GatewayError {
-    gw_models::GatewayError::internal(what).with_source(e)
-}
-
-/// Current unix seconds (0 if the clock reads before the epoch).
-pub fn epoch_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// Where a key came from: the config file (re-applied on reload) or the admin
@@ -154,21 +168,13 @@ impl AkAuth {
         banned: Option<bool>,
     ) -> Option<AkInfo> {
         let mut e = self.keys.get_mut(ak)?;
-        if let Some(v) = qps {
-            e.0.qps = v;
-        }
-        if let Some(v) = daily_token_quota {
-            e.0.daily_token_quota = v;
-        }
-        if let Some(v) = tokens_per_minute {
-            e.0.tokens_per_minute = v;
-        }
-        if let Some(v) = expires_at_epoch_secs {
-            e.0.expires_at_epoch_secs = v;
-        }
-        if let Some(v) = banned {
-            e.0.banned = v;
-        }
+        e.0.apply_patch(
+            qps,
+            daily_token_quota,
+            tokens_per_minute,
+            expires_at_epoch_secs,
+            banned,
+        );
         Some(e.0.clone())
     }
 
@@ -266,6 +272,14 @@ impl RateLimiter {
     }
 }
 
+impl std::fmt::Debug for RateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RateLimiter")
+            .field("keys", &self.buckets.len())
+            .finish()
+    }
+}
+
 fn new_bucket(qps: f64) -> Arc<governor::DefaultDirectRateLimiter> {
     let quota = if qps < 1.0 {
         governor::Quota::with_period(Duration::from_secs_f64(1.0 / qps))
@@ -275,14 +289,6 @@ fn new_bucket(qps: f64) -> Arc<governor::DefaultDirectRateLimiter> {
         governor::Quota::per_second(NonZeroU32::new(per_sec).unwrap_or(NonZeroU32::MIN))
     };
     Arc::new(governor::RateLimiter::direct(quota))
-}
-
-impl std::fmt::Debug for RateLimiter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RateLimiter")
-            .field("keys", &self.buckets.len())
-            .finish()
-    }
 }
 
 /// Daily token quota accounting per AK; the daily reset is driven by
@@ -420,7 +426,6 @@ impl AccountPool {
                     && provider.is_none_or(|want| a.provider == want)
             })
             .collect();
-        // PTU first, spill to paygo only when no PTU slot remains
         let tier: Vec<&Account> = {
             let ptu: Vec<&Account> = candidates.iter().copied().filter(|a| a.is_ptu()).collect();
             if ptu.is_empty() { candidates } else { ptu }
@@ -476,31 +481,14 @@ pub struct TokenWindow {
 }
 
 impl TokenWindow {
-    fn rotate(&self, key: &str, window: std::time::Duration) -> i64 {
-        let mut e = self
-            .entries
-            .entry(key.to_owned())
-            .or_insert_with(|| (Instant::now(), 0));
-        if e.0.elapsed() >= window {
-            *e = (Instant::now(), 0);
-        }
-        e.1
-    }
-
     /// Pre-check: tokens already spent in this window are under the limit.
     pub fn check(&self, key: &str, limit: i64, window: std::time::Duration) -> bool {
-        self.rotate(key, window) < limit
+        self.slot(key, window).1 < limit
     }
 
     /// Windowed admission with reservation, atomic under the entry guard.
     pub fn reserve(&self, key: &str, amount: i64, limit: i64, window: std::time::Duration) -> bool {
-        let mut e = self
-            .entries
-            .entry(key.to_owned())
-            .or_insert_with(|| (Instant::now(), 0));
-        if e.0.elapsed() >= window {
-            *e = (Instant::now(), 0);
-        }
+        let mut e = self.slot(key, window);
         if e.1 >= limit {
             return false;
         }
@@ -510,20 +498,23 @@ impl TokenWindow {
 
     /// Apply the settle delta to the current window; never below zero.
     pub fn settle(&self, key: &str, delta: i64, window: std::time::Duration) {
-        let mut e = self
-            .entries
-            .entry(key.to_owned())
-            .or_insert_with(|| (Instant::now(), 0));
-        if e.0.elapsed() >= window {
-            *e = (Instant::now(), 0);
-        }
+        let mut e = self.slot(key, window);
         e.1 = (e.1 + delta).max(0);
     }
 
-    /// Post-add actual token usage. Rotation and increment happen under one
-    /// entry guard so a concurrent rollover cannot land the tokens in the
-    /// wrong window.
+    /// Post-add actual token usage.
     pub fn add(&self, key: &str, tokens: i64, window: std::time::Duration) {
+        self.slot(key, window).1 += tokens;
+    }
+
+    /// The current window's entry, rotated if elapsed. Rotation and the
+    /// caller's mutation happen under one entry guard so a concurrent rollover
+    /// cannot land tokens in the wrong window.
+    fn slot(
+        &self,
+        key: &str,
+        window: std::time::Duration,
+    ) -> dashmap::mapref::one::RefMut<'_, String, (Instant, i64)> {
         let mut e = self
             .entries
             .entry(key.to_owned())
@@ -531,7 +522,7 @@ impl TokenWindow {
         if e.0.elapsed() >= window {
             *e = (Instant::now(), 0);
         }
-        e.1 += tokens;
+        e
     }
 }
 
@@ -646,11 +637,9 @@ impl std::fmt::Debug for RedisResponseCache {
 
 impl RedisResponseCache {
     pub async fn connect(url: &str) -> Result<Self, String> {
-        let client = redis::Client::open(url).map_err(|e| format!("redis open: {e}"))?;
-        let conn = redis::aio::ConnectionManager::new(client)
-            .await
-            .map_err(|e| format!("redis connect: {e}"))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: redis_connect(url).await?,
+        })
     }
 }
 
@@ -898,12 +887,47 @@ impl std::fmt::Debug for SharedConfig {
     }
 }
 
+/// Wrap a sqlx error as an internal gateway error with context.
+pub(crate) fn sqlx_err(what: &str, e: sqlx::Error) -> gw_models::GatewayError {
+    gw_models::GatewayError::internal(what).with_source(e)
+}
+
+/// Open a Redis connection manager (the governance/health/cache backends).
+pub(crate) async fn redis_connect(url: &str) -> Result<redis::aio::ConnectionManager, String> {
+    let client = redis::Client::open(url).map_err(|e| format!("redis open: {e}"))?;
+    redis::aio::ConnectionManager::new(client)
+        .await
+        .map_err(|e| format!("redis connect: {e}"))
+}
+
+/// Current unix seconds (0 if the clock reads before the epoch).
+pub fn epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn state() -> GatewayState {
         GatewayState::from_config(&GatewayConfig::embedded_default().unwrap())
+    }
+
+    fn ak_info(ak: &str) -> AkInfo {
+        AkInfo {
+            ak: ak.into(),
+            product: "p".into(),
+            tenant: "default".into(),
+            qps: 1.0,
+            daily_token_quota: 10,
+            tokens_per_minute: None,
+            expires_at_epoch_secs: None,
+            banned: false,
+            model_quotas: Default::default(),
+        }
     }
 
     #[test]
@@ -964,34 +988,8 @@ mod tests {
     #[test]
     fn admin_keys_survive_reload_config_keys_do_not() {
         let auth = AkAuth::default();
-        auth.put(
-            AkInfo {
-                ak: "ak-config".into(),
-                product: "p".into(),
-                tenant: "default".into(),
-                qps: 1.0,
-                daily_token_quota: 10,
-                tokens_per_minute: None,
-                expires_at_epoch_secs: None,
-                banned: false,
-                model_quotas: Default::default(),
-            },
-            KeySource::Config,
-        );
-        auth.put(
-            AkInfo {
-                ak: "ak-admin".into(),
-                product: "p".into(),
-                tenant: "default".into(),
-                qps: 1.0,
-                daily_token_quota: 10,
-                tokens_per_minute: None,
-                expires_at_epoch_secs: None,
-                banned: false,
-                model_quotas: Default::default(),
-            },
-            KeySource::Admin,
-        );
+        auth.put(ak_info("ak-config"), KeySource::Config);
+        auth.put(ak_info("ak-admin"), KeySource::Admin);
         let new = GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-config2, product: p, qps: 2, daily_token_quota: 20}]",
         )
@@ -1023,20 +1021,7 @@ mod tests {
     #[test]
     fn reload_never_briefly_drops_a_surviving_config_key() {
         let auth = AkAuth::default();
-        auth.put(
-            AkInfo {
-                ak: "ak-keep".into(),
-                product: "p".into(),
-                tenant: "default".into(),
-                qps: 1.0,
-                daily_token_quota: 10,
-                tokens_per_minute: None,
-                expires_at_epoch_secs: None,
-                banned: false,
-                model_quotas: Default::default(),
-            },
-            KeySource::Config,
-        );
+        auth.put(ak_info("ak-keep"), KeySource::Config);
         let cfg = GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-keep, product: p, qps: 2, daily_token_quota: 20}, {ak: ak-add, product: p, qps: 1, daily_token_quota: 5}]",
         )
@@ -1050,19 +1035,8 @@ mod tests {
     #[test]
     fn admin_overwrite_of_a_config_key_stays_revocable_by_config() {
         let auth = AkAuth::default();
-        let info = |ak: &str| AkInfo {
-            ak: ak.into(),
-            product: "p".into(),
-            tenant: "default".into(),
-            qps: 1.0,
-            daily_token_quota: 10,
-            tokens_per_minute: None,
-            expires_at_epoch_secs: None,
-            banned: false,
-            model_quotas: Default::default(),
-        };
-        auth.put(info("ak-x"), KeySource::Config);
-        auth.put(info("ak-x"), KeySource::Admin);
+        auth.put(ak_info("ak-x"), KeySource::Config);
+        auth.put(ak_info("ak-x"), KeySource::Admin);
         let cfg = GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-other, product: p, qps: 1, daily_token_quota: 5}]",
         )
@@ -1072,7 +1046,7 @@ mod tests {
             auth.authenticate("ak-x").is_none(),
             "config revocation must not be defeated by a prior admin overwrite"
         );
-        auth.put(info("ak-adm"), KeySource::Admin);
+        auth.put(ak_info("ak-adm"), KeySource::Admin);
         let cfg2 = GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-adm, product: p, qps: 1, daily_token_quota: 5}]",
         )
@@ -1119,9 +1093,7 @@ mod tests {
         );
         let cfg = GatewayConfig::from_yaml(&yaml).unwrap();
         let st = GatewayState::build(&cfg).await.unwrap();
-        // config keys seeded into the in-memory table (no postgres)
         assert!(st.auth.authenticate("k1").await.is_some());
-        // sqlite store selected and durable
         let f = st.store.file_put("batch", "x".into()).await.unwrap();
         assert!(st.store.file_get(&f.id).await.unwrap().is_some());
         assert!(!st.store.distributed_batches());
@@ -1129,17 +1101,7 @@ mod tests {
 
     #[test]
     fn key_status_lifecycle() {
-        let mut info = AkInfo {
-            ak: "k".into(),
-            product: "p".into(),
-            tenant: "default".into(),
-            qps: 1.0,
-            daily_token_quota: 10,
-            tokens_per_minute: None,
-            expires_at_epoch_secs: None,
-            banned: false,
-            model_quotas: Default::default(),
-        };
+        let mut info = ak_info("k");
         assert_eq!(info.status_at(i64::MAX), KeyStatus::Active);
         info.expires_at_epoch_secs = Some(100);
         assert_eq!(info.status_at(99), KeyStatus::Active);
@@ -1174,7 +1136,7 @@ mod tests {
         let a = s.pool.select(Protocol::OpenaiChat, Some("openai")).unwrap();
         let b = s.pool.select(Protocol::OpenaiChat, Some("openai")).unwrap();
         assert_eq!(a.name, "mock-openai-1");
-        assert_eq!(b.name, "mock-openai-1"); // only one slot at best priority
+        assert_eq!(b.name, "mock-openai-1");
         assert_eq!(
             s.pool
                 .select(Protocol::AnthropicMessages, None)

@@ -38,7 +38,7 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use gw_config::GatewayConfig;
 use gw_dag::DagContext;
-use gw_engines::{SharedTransport, is_implemented};
+use gw_engines::SharedTransport;
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
     ChatMsg, ChatParams, EmbeddingParams, GResult, GatewayError, GatewayRequest, ImageParams,
@@ -56,8 +56,6 @@ const STREAM_CHANNEL_CAP: usize = 64;
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// Produces a fresh `GatewayConfig` from the config source (file or embedded),
-/// so a reload re-reads what's on disk. Errors are returned as a message.
 /// A boxed future resolving to a freshly loaded config.
 pub type ConfigFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<GatewayConfig, String>> + Send>>;
@@ -289,8 +287,8 @@ async fn bill_realtime_turn(
     ot: i64,
 ) {
     let cfg = s.handler.cfg();
-    let (p_in, p_out) = cfg.prices_for_tenant(&ak.tenant, model);
-    let (c_in, c_out) = cfg
+    let charged = cfg.prices_for_tenant(&ak.tenant, model);
+    let vendor = cfg
         .accounts
         .iter()
         .find(|a| a.name == account)
@@ -316,8 +314,8 @@ async fn bill_realtime_turn(
         prompt_tokens: it,
         completion_tokens: ot,
         total_tokens: it + ot,
-        cost_micros: it * p_in / 1000 + ot * p_out / 1000,
-        vendor_cost_micros: it * c_in / 1000 + ot * c_out / 1000,
+        cost_micros: gw_models::cost_micros(it, ot, charged),
+        vendor_cost_micros: gw_models::cost_micros(it, ot, vendor),
         ptu_spillover: false,
     };
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it.max(0) as u64);
@@ -648,12 +646,11 @@ async fn list_models(State(s): State<AppState>, headers: HeaderMap) -> Response 
         .iter()
         .filter(|m| cfg.tenant_allows_model(&ak.tenant, &m.name))
         .map(|m| {
-            let implemented = m.protocol().map(is_implemented).unwrap_or(false);
             json!({
                 "id": m.name,
                 "object": "model",
                 "protocol": m.protocol,
-                "implemented": implemented,
+                "implemented": m.protocol().is_some(),
             })
         })
         .collect();
@@ -1246,7 +1243,7 @@ async fn chat_completions(
     };
 
     let id = next_id("chatcmpl");
-    let created = chrono_now();
+    let created = gw_state::epoch_secs();
     let usage = Usage {
         prompt_tokens: outcome.response.prompt_tokens,
         completion_tokens: outcome.response.completion_tokens,
@@ -1348,7 +1345,7 @@ fn chat_stream_response(
         rx,
         queue: std::collections::VecDeque::new(),
         id: next_id("chatcmpl"),
-        created: chrono_now(),
+        created: gw_state::epoch_secs(),
         model,
         pending_finish: None,
         ended: false,
@@ -1851,7 +1848,7 @@ async fn completions(
     let resp = json!({
         "id": next_id("cmpl"),
         "object": "text_completion",
-        "created": chrono_now(),
+        "created": gw_state::epoch_secs(),
         "model": r.model,
         "choices": [{"text": r.message, "index": 0, "finish_reason": finish}],
         "usage": {
@@ -2156,7 +2153,6 @@ async fn audio_transcriptions(
     }
 }
 
-/// POST /v1/batches (in-memory version: submit runs in background immediately)
 /// Parse the `messages` array of a batch request object into engine messages.
 fn parse_batch_messages(v: &Value) -> Vec<ChatMsg> {
     v["messages"]
@@ -2174,6 +2170,7 @@ fn parse_batch_messages(v: &Value) -> Vec<ChatMsg> {
         .unwrap_or_default()
 }
 
+/// POST /v1/batches (inline `items` or an uploaded JSONL `input_file_id`).
 async fn batches_submit(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -2267,7 +2264,7 @@ async fn files_upload(
         StatusCode::OK,
         Json(json!({
             "id": f.id, "object": "file", "bytes": f.bytes,
-            "purpose": f.purpose, "created_at": chrono_now(),
+            "purpose": f.purpose, "created_at": gw_state::epoch_secs(),
         })),
     )
         .into_response()
@@ -2324,13 +2321,6 @@ async fn batches_get(
         Ok(None) => error_response(404, format!("batch {id} not found")),
         Err(e) => gateway_error(e),
     }
-}
-
-fn chrono_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -2415,44 +2405,41 @@ mod tests {
 
     #[test]
     fn realtime_usage_per_dialect() {
-        // OpenAI Realtime: usage in response.done
         let done = json!({"type":"response.done","response":{"usage":{"input_tokens":12,"output_tokens":34}}});
         assert_eq!(realtime_usage("openai", &done), Some((12, 34)));
         assert_eq!(realtime_usage("azure", &done), Some((12, 34)));
-        // non-done OpenAI frames carry no usage
         assert_eq!(
             realtime_usage("openai", &json!({"type":"response.delta","delta":"hi"})),
             None
         );
-        // Gemini Live bills only the turn-complete frame (usageMetadata is cumulative)
         let g = json!({"serverContent":{"turnComplete":true},"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}});
         assert_eq!(realtime_usage("gemini", &g), Some((5, 9)));
         let g2 = json!({"serverContent":{"turnComplete":true},"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":7}});
         assert_eq!(realtime_usage("google", &g2), Some((5, 7)));
-        // generationComplete alone (no turnComplete) is an interim frame — not billed
         assert_eq!(
             realtime_usage(
                 "gemini",
                 &json!({"serverContent":{"generationComplete":true},"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}})
             ),
-            None
+            None,
+            "generationComplete alone is an interim frame — not billed"
         );
-        // an interim Gemini frame carrying cumulative usage is NOT billed
         assert_eq!(
             realtime_usage(
                 "gemini",
                 &json!({"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}})
             ),
-            None
+            None,
+            "interim cumulative usage is not billed"
         );
         assert_eq!(realtime_usage("gemini", &json!({"serverContent":{}})), None);
-        // zero usage never bills
         assert_eq!(
             realtime_usage(
                 "openai",
                 &json!({"type":"response.done","response":{"usage":{"input_tokens":0,"output_tokens":0}}})
             ),
-            None
+            None,
+            "zero usage never bills"
         );
     }
 
@@ -2460,7 +2447,7 @@ mod tests {
     fn finish_reason_mapping_both_directions() {
         assert_eq!(finish_openai("end_turn"), "stop");
         assert_eq!(finish_openai("stop_sequence"), "stop");
-        assert_eq!(finish_openai(""), "stop"); // absent → stop
+        assert_eq!(finish_openai(""), "stop");
         assert_eq!(finish_openai("max_tokens"), "length");
         assert_eq!(finish_openai("tool_use"), "tool_calls");
         assert_eq!(finish_openai("refusal"), "refusal");

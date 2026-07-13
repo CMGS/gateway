@@ -123,11 +123,6 @@ fn three() -> i64 {
     3
 }
 
-/// Vendor-untyped passthrough helper: anything not covered by the typed layer.
-pub fn passthrough(raw: Value) -> Value {
-    raw
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

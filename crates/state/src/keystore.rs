@@ -167,21 +167,13 @@ impl KeyStore for PostgresKeyStore {
         .map_err(|e| crate::sqlx_err("read key for patch", e))?;
         let Some(row) = row else { return Ok(None) };
         let mut info = row_to_info(&row);
-        if let Some(v) = qps {
-            info.qps = v;
-        }
-        if let Some(v) = daily_token_quota {
-            info.daily_token_quota = v;
-        }
-        if let Some(v) = tokens_per_minute {
-            info.tokens_per_minute = v;
-        }
-        if let Some(v) = expires_at_epoch_secs {
-            info.expires_at_epoch_secs = v;
-        }
-        if let Some(v) = banned {
-            info.banned = v;
-        }
+        info.apply_patch(
+            qps,
+            daily_token_quota,
+            tokens_per_minute,
+            expires_at_epoch_secs,
+            banned,
+        );
         sqlx::query(
             "UPDATE access_keys SET qps = $2, daily_token_quota = $3,
              tokens_per_minute = $4, expires_at_epoch_secs = $5, banned = $6

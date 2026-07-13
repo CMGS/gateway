@@ -57,6 +57,11 @@ pub fn platform_input(input: &TokenInput, rate: &TokenRate) -> i64 {
     normalize_prompt(input, rate)
 }
 
+/// Cost in micro-dollars for one call at per-1k-token prices.
+pub fn cost_micros(prompt: i64, completion: i64, price_per_1k: (i64, i64)) -> i64 {
+    prompt * price_per_1k.0 / 1000 + completion * price_per_1k.1 / 1000
+}
+
 /// Weighted platform-total token count.
 pub fn platform_total(input: &TokenInput, rate: &TokenRate) -> i64 {
     let prompt = normalize_prompt(input, rate) as f64;

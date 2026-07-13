@@ -5,153 +5,13 @@
 //! answers in the same shapes). AWS engines compute a real SigV4 Authorization
 //! header (pure computation; inert against the mock, live over real HTTP).
 
-use chrono::Utc;
-use gw_models::{
-    GResult, GatewayError, GatewayRequest, GatewayResponse, Recorder, SimpleRecorder, TypedParams,
-};
+use gw_models::{GResult, GatewayError, GatewayResponse, Recorder};
 use serde_json::{Value, json};
 
+use crate::base::base_engine;
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::sigv4::{SigV4Params, sign};
-use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
-
-struct Base {
-    request: GatewayRequest,
-    transport: SharedTransport,
-    recorder: SimpleRecorder,
-}
-
-impl Base {
-    fn new(request: GatewayRequest, transport: SharedTransport) -> Self {
-        Self {
-            request,
-            transport,
-            recorder: SimpleRecorder::new(Utc::now()),
-        }
-    }
-
-    fn account(&self) -> String {
-        self.request
-            .account
-            .as_ref()
-            .map(|a| a.name.clone())
-            .unwrap_or_default()
-    }
-
-    /// The go-live seam: the account's configured endpoint when set, else the
-    /// `mock_sentinel` (offline); same seam as the OpenAI/family engines.
-    fn base_url(&self, mock_sentinel: &str) -> String {
-        self.request
-            .account
-            .as_ref()
-            .map(|a| a.base_url(mock_sentinel).to_owned())
-            .unwrap_or_else(|| mock_sentinel.to_owned())
-    }
-
-    /// The account's API key (env var at call time when live), else inert "mock".
-    fn api_key(&self) -> String {
-        self.request
-            .account
-            .as_ref()
-            .and_then(|a| a.api_key())
-            .unwrap_or_else(|| "mock".to_owned())
-    }
-
-    /// AWS `(access_key, secret_key)` from the account's env-var pair, if both set.
-    fn aws_credentials(&self) -> Option<(String, String)> {
-        self.request
-            .account
-            .as_ref()
-            .and_then(|a| a.aws_credentials())
-    }
-
-    fn model_name(&self) -> GResult<&str> {
-        self.request
-            .model_param_v2
-            .as_ref()
-            .map(|p| p.model_name.as_str())
-            .ok_or_else(|| GatewayError::bad_request("missing model param"))
-    }
-
-    fn chat_params(&self) -> Option<&gw_models::ChatParams> {
-        match self.request.model_param_v2.as_ref()?.typed.as_ref()? {
-            TypedParams::Chat(p) => Some(p),
-            _ => None,
-        }
-    }
-
-    /// Build and send an upstream POST, returning the raw reply (no buffering)
-    /// so streaming engines can pump it incrementally.
-    async fn post_raw(
-        &self,
-        url: &str,
-        mut headers: Vec<(String, String)>,
-        mut body: Value,
-        stream: bool,
-    ) -> GResult<UpstreamResponse> {
-        let param = self
-            .request
-            .model_param_v2
-            .as_ref()
-            .ok_or_else(|| GatewayError::bad_request("missing model param"))?;
-        // Forward caller-set passthrough params the per-vendor extraction didn't
-        // cover: some vendor SDKs serialize the whole param object, so every
-        // field the caller set reaches the vendor. We cherry-pick a few typed
-        // fields per engine, then let `raw` carry the rest — matching the
-        // openai/claude engines. `or_insert` keeps typed fields authoritative.
-        if let (Some(obj), Value::Object(extra)) = (body.as_object_mut(), &param.raw) {
-            for (k, v) in extra {
-                obj.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-        }
-        // ensure JSON content-type (real vendors reject POST without it). For the
-        // AWS engines this is currently an unsigned header — signing content-type
-        // into SigV4 is a live-integration refinement.
-        if !headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        {
-            headers.insert(0, ("content-type".into(), "application/json".into()));
-        }
-        let up = UpstreamRequest {
-            protocol: param.protocol,
-            method: "POST".to_owned(),
-            url: url.to_owned(),
-            headers,
-            body: body.to_string().into_bytes(),
-            stream,
-            account: self.account(),
-        };
-        self.transport.send(up).await
-    }
-
-    async fn post_json(
-        &self,
-        url: &str,
-        headers: Vec<(String, String)>,
-        body: Value,
-    ) -> GResult<(u16, Value)> {
-        let reply = self
-            .post_raw(url, headers, body, false)
-            .await?
-            .buffered()
-            .await?;
-        let bytes = match &reply.body {
-            UpstreamBody::Json(b) => b,
-            UpstreamBody::Sse(_) | UpstreamBody::SseStream(_) => {
-                return Err(GatewayError::internal("unexpected sse body"));
-            }
-        };
-        let v: Value = serde_json::from_slice(bytes)
-            .map_err(|e| GatewayError::internal("parse vendor response").with_source(e))?;
-        // generic vendor-error safety net (bespoke engines add their own vendor-
-        // specific checks, e.g. minimax base_resp, on top of this).
-        if let Some(err) = crate::engine::vendor_error(reply.status, &v) {
-            return Err(err);
-        }
-        Ok((reply.status, v))
-    }
-}
+use crate::transport::UpstreamBody;
 
 /// SigV4 headers for a bedrock-style call. `creds` = real `(access_key, secret_key)`
 /// at go-live (from the account's env-var pair), else the inert mock credentials.
@@ -184,22 +44,7 @@ fn aws_headers(
     ]
 }
 
-macro_rules! bespoke_engine {
-    ($name:ident) => {
-        pub struct $name {
-            base: Base,
-        }
-        impl $name {
-            pub fn new(request: GatewayRequest, transport: SharedTransport) -> Self {
-                Self {
-                    base: Base::new(request, transport),
-                }
-            }
-        }
-    };
-}
-
-bespoke_engine!(ErnieEngine);
+base_engine!(ErnieEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for ErnieEngine {
@@ -264,7 +109,7 @@ impl ModelEngine for ErnieEngine {
     }
 }
 
-bespoke_engine!(MinimaxV1Engine);
+base_engine!(MinimaxV1Engine);
 
 #[async_trait::async_trait]
 impl ModelEngine for MinimaxV1Engine {
@@ -324,7 +169,7 @@ impl ModelEngine for MinimaxV1Engine {
     }
 }
 
-bespoke_engine!(CohereEngine);
+base_engine!(CohereEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for CohereEngine {
@@ -407,7 +252,7 @@ impl ModelEngine for CohereEngine {
     }
 }
 
-bespoke_engine!(LlamaEngine);
+base_engine!(LlamaEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for LlamaEngine {
@@ -484,7 +329,7 @@ impl ModelEngine for LlamaEngine {
     }
 }
 
-bespoke_engine!(DashScopeEngine);
+base_engine!(DashScopeEngine);
 
 impl DashScopeEngine {
     fn build_body(&self, stream: bool) -> GResult<Value> {
@@ -703,9 +548,9 @@ fn dashscope_raw_usage(resp: &GatewayResponse) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::MockTransport;
+    use crate::transport::{MockTransport, SharedTransport};
     use gw_consts::Protocol;
-    use gw_models::{ChatMsg, ModelParamV2};
+    use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
     use std::sync::Arc;
 
     fn req(mt: Protocol, name: &str) -> GatewayRequest {

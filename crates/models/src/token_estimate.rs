@@ -108,10 +108,7 @@ impl TokenEncoder for HeuristicEncoder {
                 }
             } else {
                 run.flush(&mut tokens);
-                if c.is_whitespace() {
-                    // folds into the adjacent word; no standalone token
-                } else {
-                    // ASCII punctuation/symbol OR a non-ASCII char → ~1 token
+                if !c.is_whitespace() {
                     tokens += 1;
                 }
             }
@@ -213,7 +210,6 @@ pub fn estimate_prompt_tokens(
         }
     }
 
-    // tool/function definitions: encode their serialized schema as text.
     if let Some(t) = tools
         && !t.is_null()
     {

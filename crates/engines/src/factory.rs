@@ -16,13 +16,6 @@ use crate::families::{
 use crate::openai_engine::OpenAiEngine;
 use crate::transport::SharedTransport;
 
-/// Whether the gateway serves `p`. Every protocol is served: chat-pipeline
-/// protocols through `get_engine`, Realtime on the /v1/realtime WebSocket
-/// surface.
-pub fn is_implemented(_p: Protocol) -> bool {
-    true
-}
-
 /// Build the engine for a request.
 pub fn get_engine(
     request: GatewayRequest,

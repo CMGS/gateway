@@ -121,11 +121,9 @@ impl std::fmt::Debug for RedisGovernance {
 
 impl RedisGovernance {
     pub async fn connect(url: &str) -> Result<Self, String> {
-        let client = redis::Client::open(url).map_err(|e| format!("redis open: {e}"))?;
-        let conn = redis::aio::ConnectionManager::new(client)
-            .await
-            .map_err(|e| format!("redis connect: {e}"))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: crate::redis_connect(url).await?,
+        })
     }
 
     /// Increment `key` and set its TTL on first use; returns the post-increment
@@ -153,37 +151,6 @@ impl RedisGovernance {
                 0
             }
         }
-    }
-}
-
-/// Apply a settle delta and floor the counter at 0 in one atomic step, so a
-/// key reset or window rollover between reserve and settle can't plant a
-/// negative value that over-admits. Preserves an existing TTL, or arms one
-/// when `window` is given and the key was absent.
-async fn settle_floored(
-    conn: &redis::aio::ConnectionManager,
-    key: &str,
-    delta: i64,
-    window: Option<Duration>,
-) {
-    let mut conn = conn.clone();
-    let script = redis::Script::new(
-        "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
-         if v < 0 then redis.call('SET', KEYS[1], 0); v = 0 end
-         if ARGV[2] ~= '0' and redis.call('PTTL', KEYS[1]) < 0 then
-           redis.call('PEXPIRE', KEYS[1], ARGV[2])
-         end
-         return v",
-    );
-    let px = window.map(|w| w.as_millis() as i64).unwrap_or(0);
-    if let Err(e) = script
-        .key(key)
-        .arg(delta)
-        .arg(px)
-        .invoke_async::<i64>(&mut conn)
-        .await
-    {
-        tracing::warn!(error = %e, key, "redis settle failed");
     }
 }
 
@@ -291,7 +258,7 @@ impl Governance for RedisGovernance {
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.incr_window(&format!("gw:qpm:{key}"), 1, window).await <= limit
     }
-    async fn token_window_check(&self, key: &str, limit: i64, window: Duration) -> bool {
+    async fn token_window_check(&self, key: &str, limit: i64, _window: Duration) -> bool {
         let mut conn = self.conn.clone();
         let used = redis::cmd("GET")
             .arg(format!("gw:tpm:{key}"))
@@ -300,7 +267,6 @@ impl Governance for RedisGovernance {
             .ok()
             .flatten()
             .unwrap_or(0);
-        let _ = window;
         used < limit
     }
     async fn token_window_reserve(
@@ -344,6 +310,37 @@ impl Governance for RedisGovernance {
     async fn token_window_add(&self, key: &str, tokens: i64, window: Duration) {
         self.incr_window(&format!("gw:tpm:{key}"), tokens, window)
             .await;
+    }
+}
+
+/// Apply a settle delta and floor the counter at 0 in one atomic step, so a
+/// key reset or window rollover between reserve and settle can't plant a
+/// negative value that over-admits. Preserves an existing TTL, or arms one
+/// when `window` is given and the key was absent.
+async fn settle_floored(
+    conn: &redis::aio::ConnectionManager,
+    key: &str,
+    delta: i64,
+    window: Option<Duration>,
+) {
+    let mut conn = conn.clone();
+    let script = redis::Script::new(
+        "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+         if v < 0 then redis.call('SET', KEYS[1], 0); v = 0 end
+         if ARGV[2] ~= '0' and redis.call('PTTL', KEYS[1]) < 0 then
+           redis.call('PEXPIRE', KEYS[1], ARGV[2])
+         end
+         return v",
+    );
+    let px = window.map(|w| w.as_millis() as i64).unwrap_or(0);
+    if let Err(e) = script
+        .key(key)
+        .arg(delta)
+        .arg(px)
+        .invoke_async::<i64>(&mut conn)
+        .await
+    {
+        tracing::warn!(error = %e, key, "redis settle failed");
     }
 }
 

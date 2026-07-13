@@ -149,6 +149,20 @@ mod tests {
         h.state().auth.authenticate("ak-demo-123").await.unwrap()
     }
 
+    async fn wait_terminal(h: &OnlineHandler, id: &str) {
+        for _ in 0..100 {
+            if let Some(j) = h.state().store.batch_get(id).await.unwrap()
+                && matches!(
+                    j.status,
+                    gw_state::BatchStatus::Completed | gw_state::BatchStatus::Failed
+                )
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     fn chat_req(name: &str, content: &str) -> GatewayRequest {
         GatewayRequest {
             is_online: true,
@@ -205,7 +219,7 @@ mod tests {
                 .unwrap()
                 .1
                 .is_empty()
-        ); // not billed
+        );
     }
 
     #[tokio::test]
@@ -362,17 +376,7 @@ mod tests {
             .submit(ak(&h).await, "cached-mini".into(), items)
             .await
             .unwrap();
-        for _ in 0..100 {
-            if let Some(j) = h.state().store.batch_get(&job.id).await.unwrap()
-                && matches!(
-                    j.status,
-                    gw_state::BatchStatus::Completed | gw_state::BatchStatus::Failed
-                )
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_terminal(&h, &job.id).await;
         let (count, _) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(count, 2, "every batch item bills, cache hits or not");
     }
@@ -396,17 +400,7 @@ mod tests {
             )
             .await
             .unwrap();
-        for _ in 0..100 {
-            if let Some(j) = h.state().store.batch_get(&job.id).await.unwrap()
-                && matches!(
-                    j.status,
-                    gw_state::BatchStatus::Completed | gw_state::BatchStatus::Failed
-                )
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_terminal(&h, &job.id).await;
         let j = h.state().store.batch_get(&job.id).await.unwrap().unwrap();
         assert_eq!(j.status, gw_state::BatchStatus::Completed);
         assert_eq!(j.results.len(), 2);
@@ -455,11 +449,9 @@ mod tests {
             )
             .await
             .unwrap();
-        // submit only persisted; no local execution ran it yet
         let pending = state.store.batch_get(&job.id).await.unwrap().unwrap();
         assert_eq!(pending.status, gw_state::BatchStatus::Pending);
 
-        // a separate drain loop claims and executes it
         let drainer = OfflineHandler::new(online);
         let drain = tokio::spawn(async move {
             drainer

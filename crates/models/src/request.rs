@@ -57,7 +57,6 @@ pub mod domain {
     /// `protocol` is the dispatch key; `model_name` is the public model name the
     /// caller sent (e.g. "gpt-4o") which config maps to a Protocol; `typed` holds
     /// the family-typed params; vendor extras ride in `raw`.
-    /// (No derived `Default` — `Protocol` has none; a manual impl lives in the parent module.)
     #[derive(Debug, Clone)]
     pub struct ModelParamV2 {
         pub protocol: gw_consts::Protocol,
@@ -76,10 +75,7 @@ pub mod domain {
         pub fn new(protocol: gw_consts::Protocol) -> Self {
             Self {
                 protocol,
-                model_name: String::new(),
-                fallback_from: None,
-                typed: None,
-                raw: Value::Null,
+                ..Default::default()
             }
         }
 
@@ -87,15 +83,26 @@ pub mod domain {
             Self {
                 protocol,
                 model_name: name.into(),
-                fallback_from: None,
-                typed: None,
-                raw: Value::Null,
+                ..Default::default()
             }
         }
 
         pub fn with_typed(mut self, typed: TypedParams) -> Self {
             self.typed = Some(typed);
             self
+        }
+    }
+
+    // `Protocol` has no Default, so the struct's Default is manual.
+    impl Default for ModelParamV2 {
+        fn default() -> Self {
+            Self {
+                protocol: gw_consts::Protocol::OpenaiChat,
+                model_name: String::new(),
+                fallback_from: None,
+                typed: None,
+                raw: Value::Null,
+            }
         }
     }
 
@@ -266,34 +273,16 @@ pub mod domain {
         pub extra: Value,
     }
 
-    macro_rules! stub {
-        ($(#[$m:meta])* $name:ident) => {
-            $(#[$m])*
-            #[derive(Debug, Default, Clone)]
-            pub struct $name {
-                /// long-tail field passthrough; upstream realtime bridging is future work.
-                pub raw: Value,
-            }
-        };
+    /// Storage collection; local build has no external storage to write.
+    #[derive(Debug, Default, Clone)]
+    pub struct StorageInfoCollect {
+        pub raw: Value,
     }
 
-    stub!(/// Storage collection; local build has no external storage to write.
-        StorageInfoCollect);
-    stub!(/// Upstream realtime bridging is future work.
-        RealtimeParam);
-}
-
-// gw_consts::Protocol has no Default; give ModelParamV2's field a sensible one
-// via a wrapper Default on the whole struct instead.
-impl Default for ModelParamV2 {
-    fn default() -> Self {
-        Self {
-            protocol: gw_consts::Protocol::OpenaiChat,
-            model_name: String::new(),
-            fallback_from: None,
-            typed: None,
-            raw: serde_json::Value::Null,
-        }
+    /// Upstream realtime bridging is future work.
+    #[derive(Debug, Default, Clone)]
+    pub struct RealtimeParam {
+        pub raw: Value,
     }
 }
 
@@ -335,6 +324,6 @@ mod tests {
         assert_eq!(a.api_key().as_deref(), Some("sk-secret-123"));
         // SAFETY: same unique var; no concurrent reader.
         unsafe { std::env::remove_var(var) };
-        assert!(a.api_key().is_none()); // unset env → back to mock path
+        assert!(a.api_key().is_none());
     }
 }

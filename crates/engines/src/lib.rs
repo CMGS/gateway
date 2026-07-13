@@ -5,6 +5,8 @@
 //! decoder, usage normalization, the dispatch factory,
 //! and engine implementations.
 
+mod base;
+
 pub mod bespoke;
 pub mod claude_engine;
 pub mod echo;
@@ -23,7 +25,7 @@ pub use bespoke::{CohereEngine, DashScopeEngine, ErnieEngine, LlamaEngine, Minim
 pub use claude_engine::ClaudeEngine;
 pub use echo::EchoEngine;
 pub use engine::{EngineOutcome, ModelEngine, StreamChunk, vendor_error};
-pub use factory::{get_engine, is_implemented};
+pub use factory::get_engine;
 pub use families::{
     AudioEngine, AudioKind, CompletionsEngine, EmbeddingsEngine, ImageEngine, PassthroughEngine,
     ResponsesEngine, SearchEngine, VertexEngine, VideoEngine,

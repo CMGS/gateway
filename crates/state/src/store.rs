@@ -11,6 +11,13 @@ use dashmap::DashMap;
 use gw_models::GResult;
 use sqlx::Row;
 
+/// Consuming the sequence explicitly keeps id and n on one atomic value —
+/// concurrent PG writers would race a MAX(n)+1 subselect.
+const PG_INSERT_BATCH: &str = "INSERT INTO batches (n, id, ak, model, status, total)
+     SELECT v, 'batch-' || v, $1, $2, $3, $4
+     FROM nextval(pg_get_serial_sequence('batches', 'n')) AS v
+     RETURNING id";
+
 /// One billing entry (recorded locally only; no reporting upstream).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BillingRecord {
@@ -475,6 +482,7 @@ impl Store for SqliteStore {
     }
 
     async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
+        // sqlx's SqlSafeStr guard wants static SQL, so the two variants stay spelled out
         let rows =
             match tenant {
                 Some(t) => sqlx::query(
@@ -748,6 +756,7 @@ impl Store for PostgresStore {
     }
 
     async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
+        // sqlx's SqlSafeStr guard wants static SQL, so the two variants stay spelled out
         let rows = match tenant {
             Some(t) => {
                 sqlx::query(
@@ -818,19 +827,14 @@ impl Store for PostgresStore {
     }
 
     async fn batch_create(&self, ak: &str, model: &str, total: usize) -> GResult<BatchJob> {
-        let id: String = sqlx::query_scalar(
-            "INSERT INTO batches (n, id, ak, model, status, total)
-             SELECT v, 'batch-' || v, $1, $2, $3, $4
-             FROM nextval(pg_get_serial_sequence('batches', 'n')) AS v
-             RETURNING id",
-        )
-        .bind(ak)
-        .bind(model)
-        .bind(BatchStatus::Pending.as_str())
-        .bind(total as i64)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("insert batch", e))?;
+        let id: String = sqlx::query_scalar(PG_INSERT_BATCH)
+            .bind(ak)
+            .bind(model)
+            .bind(BatchStatus::Pending.as_str())
+            .bind(total as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("insert batch", e))?;
         Ok(BatchJob {
             id,
             ak: ak.to_owned(),
@@ -921,19 +925,14 @@ impl Store for PostgresStore {
             .begin()
             .await
             .map_err(|e| crate::sqlx_err("begin batch enqueue", e))?;
-        let id: String = sqlx::query_scalar(
-            "INSERT INTO batches (n, id, ak, model, status, total)
-             SELECT v, 'batch-' || v, $1, $2, $3, $4
-             FROM nextval(pg_get_serial_sequence('batches', 'n')) AS v
-             RETURNING id",
-        )
-        .bind(ak)
-        .bind(model)
-        .bind(BatchStatus::Pending.as_str())
-        .bind(items.len() as i64)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| crate::sqlx_err("insert batch", e))?;
+        let id: String = sqlx::query_scalar(PG_INSERT_BATCH)
+            .bind(ak)
+            .bind(model)
+            .bind(BatchStatus::Pending.as_str())
+            .bind(items.len() as i64)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| crate::sqlx_err("insert batch", e))?;
         for (idx, msgs) in items.iter().enumerate() {
             let json = serde_json::to_string(msgs).unwrap_or_else(|_| "[]".into());
             sqlx::query("INSERT INTO batch_items (batch_id, idx, messages) VALUES ($1, $2, $3)")
@@ -1094,7 +1093,7 @@ mod tests {
         }
         let (total, page) = mem.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(total, 2);
-        assert_eq!(page[0].model, "b"); // oldest pruned first
+        assert_eq!(page[0].model, "b");
 
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open_with_cap(dir.path().join("r.db").to_str().unwrap(), 2)
@@ -1219,7 +1218,6 @@ mod tests {
         assert_eq!(got.status, BatchStatus::Running);
         assert_eq!(got.results.len(), 1);
 
-        // distributed queue: save items, claim (loop to ours), requeue-on-stale
         assert!(store.distributed_batches());
         let qmsgs = vec![
             vec![gw_models::ChatMsg::text("user", "one")],
@@ -1248,8 +1246,6 @@ mod tests {
         let loaded = store.batch_load_items(&qjob.id).await.unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[1][0].content, "two");
-        // our completed batch is never re-claimed even at zero staleness
-        // (other runs' leftover pending batches may still surface — drain them)
         while let Some(c) = store.batch_claim_pending(0).await.unwrap() {
             assert_ne!(c.id, qjob.id, "completed batch must stay terminal");
             store

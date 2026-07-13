@@ -7,160 +7,13 @@
 //! The mock protocol flags byte-level vendor differences as deferred to a later
 //! fidelity pass.
 
-use chrono::Utc;
-use gw_models::{
-    GResult, GatewayError, GatewayRequest, GatewayResponse, Recorder, SimpleRecorder, TypedParams,
-};
+use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse, Recorder, TypedParams};
 use serde_json::{Value, json};
 
+use crate::base::{Base, base_engine};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::sse::SseDecoder;
-use crate::transport::{SharedTransport, UpstreamBody, UpstreamRequest, UpstreamResponse};
-
-/// Shared scaffolding: request + transport + recorder + one JSON round trip.
-struct Base {
-    request: GatewayRequest,
-    transport: SharedTransport,
-    recorder: SimpleRecorder,
-}
-
-impl Base {
-    fn new(request: GatewayRequest, transport: SharedTransport) -> Self {
-        Self {
-            request,
-            transport,
-            recorder: SimpleRecorder::new(Utc::now()),
-        }
-    }
-
-    fn account(&self) -> String {
-        self.request
-            .account
-            .as_ref()
-            .map(|a| a.name.clone())
-            .unwrap_or_default()
-    }
-
-    /// Base URL for the upstream call: the account's configured endpoint when set
-    /// (go-live), else the `mock_sentinel` (offline — MockTransport
-    /// routes by the path in this sentinel); same seam as OpenAiEngine.
-    fn base_url(&self, mock_sentinel: &str) -> String {
-        self.request
-            .account
-            .as_ref()
-            .map(|a| a.base_url(mock_sentinel).to_owned())
-            .unwrap_or_else(|| mock_sentinel.to_owned())
-    }
-
-    /// The account's API key (read from its env var at call time when live), else
-    /// the inert "mock" sentinel.
-    fn api_key(&self) -> String {
-        self.request
-            .account
-            .as_ref()
-            .and_then(|a| a.api_key())
-            .unwrap_or_else(|| "mock".to_owned())
-    }
-
-    fn param(&self) -> GResult<&gw_models::ModelParamV2> {
-        self.request
-            .model_param_v2
-            .as_ref()
-            .ok_or_else(|| GatewayError::bad_request("missing model param"))
-    }
-
-    /// Bearer auth headers (the OpenAI-shaped families); real key when the
-    /// account is live, inert "mock" otherwise.
-    fn bearer_headers(&self) -> Vec<(String, String)> {
-        vec![
-            ("content-type".into(), "application/json".into()),
-            ("authorization".into(), format!("Bearer {}", self.api_key())),
-        ]
-    }
-
-    /// Build and send an upstream POST with explicit headers, returning the raw
-    /// reply (Json or Sse). Engines that stream dispatch on the body type themselves.
-    async fn send_upstream(
-        &self,
-        url: &str,
-        headers: Vec<(String, String)>,
-        body: Value,
-        stream: bool,
-    ) -> GResult<UpstreamResponse> {
-        self.send_upstream_raw(url, headers, body, stream)
-            .await?
-            .buffered()
-            .await
-    }
-
-    /// Like [`Self::send_upstream`] but leaves a live SSE stream undrained so
-    /// the caller can pump it incrementally.
-    async fn send_upstream_raw(
-        &self,
-        url: &str,
-        headers: Vec<(String, String)>,
-        body: Value,
-        stream: bool,
-    ) -> GResult<UpstreamResponse> {
-        let param = self.param()?;
-        let up = UpstreamRequest {
-            protocol: param.protocol,
-            method: "POST".to_owned(),
-            url: url.to_owned(),
-            headers,
-            body: body.to_string().into_bytes(),
-            stream,
-            account: self.account(),
-        };
-        self.transport.send(up).await
-    }
-
-    /// POST body to `url` with Bearer auth, expect JSON back (non-streaming).
-    async fn round_trip(&self, url: &str, body: Value) -> GResult<(u16, Value)> {
-        self.round_trip_with(url, self.bearer_headers(), body).await
-    }
-
-    /// POST body to `url` with explicit headers, expect JSON back (non-streaming).
-    async fn round_trip_with(
-        &self,
-        url: &str,
-        headers: Vec<(String, String)>,
-        body: Value,
-    ) -> GResult<(u16, Value)> {
-        let reply = self.send_upstream(url, headers, body, false).await?;
-        let bytes = match &reply.body {
-            UpstreamBody::Json(b) => b,
-            UpstreamBody::Sse(_) | UpstreamBody::SseStream(_) => {
-                return Err(GatewayError::internal(
-                    "unexpected sse body for json engine",
-                ));
-            }
-        };
-        let v: Value = serde_json::from_slice(bytes)
-            .map_err(|e| GatewayError::internal("parse upstream response").with_source(e))?;
-        // surface vendor error envelopes instead of parsing them as broken success
-        if let Some(err) = crate::engine::vendor_error(reply.status, &v) {
-            return Err(err);
-        }
-        Ok((reply.status, v))
-    }
-}
-
-macro_rules! family_engine {
-    ($name:ident) => {
-        pub struct $name {
-            base: Base,
-        }
-
-        impl $name {
-            pub fn new(request: GatewayRequest, transport: SharedTransport) -> Self {
-                Self {
-                    base: Base::new(request, transport),
-                }
-            }
-        }
-    };
-}
+use crate::transport::{SharedTransport, UpstreamBody};
 
 /// Build Gemini `parts` from a unified message. Text → `{"text":…}`; data-URI
 /// images → `{"inlineData":{"mimeType","data"}}` (Gemini's inline-image shape).
@@ -210,7 +63,7 @@ fn parse_data_uri(url: &str) -> Option<(&str, &str)> {
     Some((mime, data))
 }
 
-family_engine!(VertexEngine);
+base_engine!(VertexEngine);
 
 impl VertexEngine {
     /// Gemini API auth: the x-goog-api-key header — an API key is not an OAuth
@@ -430,7 +283,7 @@ fn vertex_raw_usage(resp: &GatewayResponse) -> Vec<u8> {
     .into_bytes()
 }
 
-family_engine!(EmbeddingsEngine);
+base_engine!(EmbeddingsEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for EmbeddingsEngine {
@@ -502,7 +355,7 @@ impl ModelEngine for EmbeddingsEngine {
     }
 }
 
-family_engine!(ImageEngine);
+base_engine!(ImageEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for ImageEngine {
@@ -669,7 +522,7 @@ impl ModelEngine for AudioEngine {
     }
 }
 
-family_engine!(VideoEngine);
+base_engine!(VideoEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for VideoEngine {
@@ -732,7 +585,7 @@ impl ModelEngine for VideoEngine {
     }
 }
 
-family_engine!(SearchEngine);
+base_engine!(SearchEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for SearchEngine {
@@ -790,7 +643,7 @@ impl ModelEngine for SearchEngine {
     }
 }
 
-family_engine!(PassthroughEngine);
+base_engine!(PassthroughEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for PassthroughEngine {
@@ -833,7 +686,7 @@ impl ModelEngine for PassthroughEngine {
     }
 }
 
-family_engine!(CompletionsEngine);
+base_engine!(CompletionsEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for CompletionsEngine {
@@ -910,7 +763,7 @@ impl ModelEngine for CompletionsEngine {
     }
 }
 
-family_engine!(ResponsesEngine);
+base_engine!(ResponsesEngine);
 
 /// Extract assistant text from a Responses `output` array (message items'
 /// `output_text` content), plus any function_call items.
@@ -1108,8 +961,6 @@ impl ModelEngine for ResponsesEngine {
                 body,
                 self.base.request.stream,
             )
-            .await?
-            .buffered()
             .await?;
         match &reply.body {
             UpstreamBody::Json(b) => self.parse_json(reply.status, b),

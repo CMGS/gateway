@@ -914,7 +914,7 @@ async fn embeddings_images_audio_families() {
         .to_owned();
     assert!(ct.starts_with("audio/"), "content-type: {ct}");
     let bytes = body_bytes(resp).await;
-    assert_eq!(bytes, b"MOCKBYTES"); // MOCK_B64 decoded
+    assert_eq!(bytes, b"MOCKBYTES");
 
     let resp = app
         .oneshot(post(
@@ -1033,7 +1033,7 @@ async fn security_block_and_dlp_redaction() {
     let j = body_json(resp).await;
     assert_eq!(j["choices"][0]["finish_reason"], "content_filter");
     let resp = app.clone().oneshot(get("/internal/ledger")).await.unwrap();
-    assert_eq!(body_json(resp).await["count"], 0); // blocked → no billing
+    assert_eq!(body_json(resp).await["count"], 0, "blocked is not billed");
 
     let resp = app
         .oneshot(post(
@@ -1176,12 +1176,12 @@ async fn chat_stream_tools_emit_tool_call_chunks() {
     assert_eq!(finish, "tool_calls");
 }
 
-#[tokio::test]
-async fn gemini_stream_emits_incremental_deltas() {
-    let app = app();
-    let body = r#"{"model":"gemini-pro","stream":true,"messages":[{"role":"user","content":"stream me gemini"}]}"#;
-    let resp = app
-        .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), body))
+async fn assert_incremental_stream(model: &str, content: &str) {
+    let body = format!(
+        r#"{{"model":"{model}","stream":true,"messages":[{{"role":"user","content":"{content}"}}]}}"#
+    );
+    let resp = app()
+        .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), &body))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1203,39 +1203,18 @@ async fn gemini_stream_emits_incremental_deltas() {
         }
     }
     assert!(deltas >= 2, "expected incremental deltas, got {deltas}");
-    assert!(assembled.contains("you said: stream me gemini"));
+    assert!(assembled.contains(&format!("you said: {content}")));
     assert!(saw_usage, "final frame must carry usage");
 }
 
 #[tokio::test]
+async fn gemini_stream_emits_incremental_deltas() {
+    assert_incremental_stream("gemini-pro", "stream me gemini").await;
+}
+
+#[tokio::test]
 async fn dashscope_stream_emits_incremental_deltas() {
-    let app = app();
-    let body = r#"{"model":"qwen-max","stream":true,"messages":[{"role":"user","content":"stream me dashscope"}]}"#;
-    let resp = app
-        .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), body))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let text = String::from_utf8(body_bytes(resp).await).unwrap();
-    let mut deltas = 0;
-    let mut assembled = String::new();
-    let mut saw_usage = false;
-    for f in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
-        if f == "[DONE]" {
-            continue;
-        }
-        let v: Value = serde_json::from_str(f).unwrap();
-        if let Some(d) = v["choices"][0]["delta"]["content"].as_str() {
-            deltas += 1;
-            assembled.push_str(d);
-        }
-        if v["usage"]["total_tokens"].as_i64().unwrap_or(0) > 0 {
-            saw_usage = true;
-        }
-    }
-    assert!(deltas >= 2, "expected incremental deltas, got {deltas}");
-    assert!(assembled.contains("you said: stream me dashscope"));
-    assert!(saw_usage, "final frame must carry usage");
+    assert_incremental_stream("qwen-max", "stream me dashscope").await;
 }
 
 #[tokio::test]
@@ -1543,7 +1522,7 @@ async fn cross_protocol_exchanger_both_ways() {
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     assert_eq!(j["type"], "message");
-    assert_eq!(j["stop_reason"], "end_turn"); // openai "stop" → anthropic "end_turn"
+    assert_eq!(j["stop_reason"], "end_turn");
     assert!(
         j["content"][0]["text"]
             .as_str()
@@ -1560,7 +1539,7 @@ async fn cross_protocol_exchanger_both_ways() {
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     assert_eq!(j["object"], "chat.completion");
-    assert_eq!(j["choices"][0]["finish_reason"], "stop"); // anthropic "end_turn" → openai "stop"
+    assert_eq!(j["choices"][0]["finish_reason"], "stop");
     assert!(
         j["choices"][0]["message"]["content"]
             .as_str()
@@ -1910,7 +1889,7 @@ async fn ak_tpm_limit_second_call_429() {
         .oneshot(post("/v1/chat/completions", Some("ak-tpm-tiny"), body))
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK); // first call consumes > 10 tokens
+    assert_eq!(r.status(), StatusCode::OK);
     let r = app
         .oneshot(post("/v1/chat/completions", Some("ak-tpm-tiny"), body))
         .await
