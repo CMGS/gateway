@@ -57,9 +57,11 @@ pub fn platform_input(input: &TokenInput, rate: &TokenRate) -> i64 {
     normalize_prompt(input, rate)
 }
 
-/// Cost in micro-dollars for one call at per-1k-token prices.
+/// Cost in micro-dollars for one call at per-1k-token prices. Saturating, so a
+/// malformed/hostile token count can't overflow the multiply into a wrong bill.
 pub fn cost_micros(prompt: i64, completion: i64, price_per_1k: (i64, i64)) -> i64 {
-    prompt * price_per_1k.0 / 1000 + completion * price_per_1k.1 / 1000
+    (prompt.saturating_mul(price_per_1k.0) / 1000)
+        .saturating_add(completion.saturating_mul(price_per_1k.1) / 1000)
 }
 
 /// Weighted platform-total token count.

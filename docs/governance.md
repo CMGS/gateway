@@ -38,7 +38,7 @@ unconfigured (key, model) pairs never touch a counter.
 |-------|-------|--------|
 | QPS | per access key | `access_keys[].qps` |
 | QPS | pooled per tenant | `tenants[].qps` |
-| Daily tokens | per access key | `access_keys[].daily_token_quota` (reset by a background task) |
+| Daily tokens | per access key | `access_keys[].daily_token_quota` (rolls over at UTC midnight) |
 | Daily tokens | per (key, model) | `tenants[].model_quotas` default, `access_keys[].model_quotas` override |
 | TPM | per access key | `access_keys[].tokens_per_minute` |
 | QPM | per model | `models[].qpm` |
@@ -79,8 +79,9 @@ models:
 
 ## Content safety
 
-`security.dlp_redact` redacts emails and phone numbers from inbound and
-outbound content; `security.blocklist` rejects requests containing listed terms
+`security.dlp_redact` redacts emails and phone numbers from inbound content
+(chat messages, the Responses body, and the family typed params) and from the
+outbound message; `security.blocklist` rejects requests containing listed terms
 with a `content_filter` finish (not billed).
 
 ```yaml
@@ -88,3 +89,9 @@ security:
   dlp_redact: true
   blocklist: ["badword"]
 ```
+
+Outbound redaction needs the whole message (a masked span may straddle two SSE
+deltas), so **with `dlp_redact` enabled a streaming response is buffered and the
+redacted text replayed** rather than forwarded token-by-token — DLP trades
+incremental delivery for a guarantee that no unmasked text reaches the client.
+Leave `dlp_redact` off (the streaming default) to keep incremental delivery.

@@ -1177,10 +1177,21 @@ async fn chat_stream_tools_emit_tool_call_chunks() {
 }
 
 async fn assert_incremental_stream(model: &str, content: &str) {
+    // incremental deltas are only observable with outbound DLP off — the shipped
+    // default enables it, which (correctly) buffers the stream before redacting.
+    let yaml = gw_config::DEFAULT_YAML.replace("dlp_redact: true", "dlp_redact: false");
+    let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+
     let body = format!(
         r#"{{"model":"{model}","stream":true,"messages":[{{"role":"user","content":"{content}"}}]}}"#
     );
-    let resp = app()
+    let resp = app
         .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), &body))
         .await
         .unwrap();
@@ -1660,6 +1671,183 @@ async fn files_upload_then_batch_from_file() {
     let j = done.expect("batch finished");
     assert_eq!(j["status"], "completed");
     assert_eq!(j["results"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn files_and_batches_are_tenant_isolated() {
+    let app = app();
+    let get_as = |uri: &str, ak: &str| {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", format!("Bearer {ak}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // ak-demo-123 (tenant default) uploads a file
+    let upload = json!({"purpose": "batch", "file": "secret default-tenant content"}).to_string();
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/files", Some("ak-demo-123"), &upload))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let file_id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+
+    // ak-acme-1 (tenant acme) must not read metadata, content, or reuse the file
+    for uri in [
+        format!("/v1/files/{file_id}"),
+        format!("/v1/files/{file_id}/content"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(get_as(&uri, "ak-acme-1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "cross-tenant file access must 404: {uri}"
+        );
+    }
+    let steal = json!({"input_file_id": file_id, "model": "gpt-4o"}).to_string();
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/batches", Some("ak-acme-1"), &steal))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "cross-tenant input_file_id must 404"
+    );
+
+    // the owner still sees its own file
+    let resp = app
+        .clone()
+        .oneshot(get_as(&format!("/v1/files/{file_id}"), "ak-demo-123"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // a batch submitted by default is invisible to acme
+    let submit = json!({"model":"gpt-4o-mini","items":[
+        {"messages":[{"role":"user","content":"one"}]}]})
+    .to_string();
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/batches", Some("ak-demo-123"), &submit))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let batch_id = body_json(resp).await["id"].as_str().unwrap().to_owned();
+    let resp = app
+        .clone()
+        .oneshot(get_as(&format!("/v1/batches/{batch_id}"), "ak-acme-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "cross-tenant batch access must 404"
+    );
+    let resp = app
+        .oneshot(get_as(&format!("/v1/batches/{batch_id}"), "ak-demo-123"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn realtime_entitlement_blocks_unentitled_tenant() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let application = app();
+    tokio::spawn(async move {
+        axum::serve(listener, application).await.unwrap();
+    });
+
+    // ak-acme-1 (tenant acme) is entitled only to gpt-4o; a realtime session
+    // for a non-entitled model must be refused at accept, not admitted.
+    let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer ak-acme-1".parse().unwrap());
+    assert!(
+        tokio_tungstenite::connect_async(req).await.is_err(),
+        "unentitled tenant must not open a realtime session"
+    );
+
+    // the unrestricted default tenant still connects
+    let mut ok = format!("ws://{addr}/v1/realtime?model=realtime")
+        .into_client_request()
+        .unwrap();
+    ok.headers_mut()
+        .insert("authorization", "Bearer ak-demo-123".parse().unwrap());
+    assert!(tokio_tungstenite::connect_async(ok).await.is_ok());
+}
+
+#[tokio::test]
+async fn dlp_redacts_streaming_output_from_the_vendor() {
+    use futures::StreamExt;
+
+    // a vendor that streams PII the (already-redacted) request never contained,
+    // to isolate OUTBOUND streaming DLP.
+    #[derive(Debug)]
+    struct PiiStream;
+    #[async_trait::async_trait]
+    impl gw_engines::transport::Transport for PiiStream {
+        async fn send(
+            &self,
+            _req: gw_engines::transport::UpstreamRequest,
+        ) -> gw_models::GResult<gw_engines::transport::UpstreamResponse> {
+            let frames: Vec<Result<bytes::Bytes, String>> = vec![
+                Ok(bytes::Bytes::from(
+                    "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"reach me at leak@evil.com now\"},\"finish_reason\":null}]}\n\n",
+                )),
+                Ok(bytes::Bytes::from(
+                    "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n",
+                )),
+                Ok(bytes::Bytes::from("data: [DONE]\n\n")),
+            ];
+            Ok(gw_engines::transport::UpstreamResponse {
+                status: 200,
+                body: gw_engines::transport::UpstreamBody::SseStream(
+                    futures::stream::iter(frames).boxed(),
+                ),
+            })
+        }
+    }
+
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+security: {dlp_redact: true}
+access_keys: [{ak: ak-dlp, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: gpt-4o, protocol: openai-chat}]
+accounts: [{name: a, provider: openai, protocols: ["openai-chat"]}]
+"#;
+    let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(GatewayState::from_config(&cfg));
+    let app = gw_views::app(AppState::new(cfg, state, Arc::new(PiiStream)));
+
+    let body = r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = app
+        .oneshot(post("/v1/chat/completions", Some("ak-dlp"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(
+        text.contains("[REDACTED_EMAIL]"),
+        "streamed output must be redacted: {text}"
+    );
+    assert!(
+        !text.contains("leak@evil.com"),
+        "raw PII must never reach the client over the stream: {text}"
+    );
 }
 
 #[tokio::test]

@@ -956,7 +956,7 @@ mod tests {
         let boot = Arc::new(GatewayState::from_config(&cfg));
         let file_id = boot
             .store
-            .file_put("batch", "keep me".into())
+            .file_put("default", "batch", "keep me".into())
             .await
             .unwrap()
             .id;
@@ -1094,7 +1094,11 @@ mod tests {
         let cfg = GatewayConfig::from_yaml(&yaml).unwrap();
         let st = GatewayState::build(&cfg).await.unwrap();
         assert!(st.auth.authenticate("k1").await.is_some());
-        let f = st.store.file_put("batch", "x".into()).await.unwrap();
+        let f = st
+            .store
+            .file_put("default", "batch", "x".into())
+            .await
+            .unwrap();
         assert!(st.store.file_get(&f.id).await.unwrap().is_some());
         assert!(!st.store.distributed_batches());
     }

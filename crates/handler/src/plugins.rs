@@ -2,8 +2,11 @@
 //! come from config.security.
 //!
 //! The pre-stage runs before the DAG: a blocklist hit -> Block (the request skips
-//! the engine and billing); DLP redacts inbound messages. The post-stage redacts
-//! outbound messages again (in case the upstream echoes sensitive text back).
+//! the engine and billing); DLP redacts inbound messages, the Responses native
+//! body, and the family typed params. The post-stage redacts the outbound
+//! message. Outbound DLP needs the whole message, so when it is enabled the
+//! streaming surfaces buffer the response and replay the redacted text (see
+//! `spawn_stream_pipeline`) instead of forwarding raw deltas.
 
 use gw_config::SecurityConf;
 use gw_models::{Block, GatewayRequest, GatewayResponse};
@@ -44,7 +47,55 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
             hits += redact_parts_text(parts);
         }
     }
+    // Non-chat surfaces carry user text outside `message`: the Responses native
+    // body (`raw.input`, instructions, …) and the family typed params
+    // (embeddings/tts/image/video/search). Scrub those too or they reach the
+    // vendor unredacted.
+    if let Some(param) = request.model_param_v2.as_mut() {
+        hits += redact_value(&mut param.raw);
+        if let Some(typed) = param.typed.as_mut() {
+            hits += redact_typed(typed);
+        }
+    }
     hits
+}
+
+/// Redact every string leaf in a JSON value in place (only PII patterns change;
+/// non-text values pass through). Used for the Responses native passthrough body.
+fn redact_value(v: &mut serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::String(s) => {
+            let (redacted, n) = redact(s);
+            if n > 0 {
+                *s = redacted;
+            }
+            n
+        }
+        serde_json::Value::Array(a) => a.iter_mut().map(redact_value).sum(),
+        serde_json::Value::Object(o) => o.values_mut().map(redact_value).sum(),
+        _ => 0,
+    }
+}
+
+/// Redact the free-text fields of the family typed params.
+fn redact_typed(typed: &mut gw_models::TypedParams) -> usize {
+    use gw_models::TypedParams as T;
+    let mut redact_str = |s: &mut String| {
+        let (redacted, n) = redact(s);
+        if n > 0 {
+            *s = redacted;
+        }
+        n
+    };
+    match typed {
+        T::Chat(p) => p.system.as_mut().map(&mut redact_str).unwrap_or(0),
+        T::Embeddings(p) => p.input.iter_mut().map(&mut redact_str).sum(),
+        T::AudioTts(p) => redact_str(&mut p.input),
+        T::Image(p) => redact_str(&mut p.prompt),
+        T::Video(p) => redact_str(&mut p.prompt),
+        T::Search(p) => redact_str(&mut p.query),
+        T::AudioStt(_) => 0,
+    }
 }
 
 /// Redact PII inside a multimodal `parts` array's text blocks, in place.

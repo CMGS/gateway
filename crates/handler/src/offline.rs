@@ -41,9 +41,11 @@ impl OfflineHandler {
         let msgs: Vec<Vec<ChatMsg>> = items.into_iter().map(|i| i.messages).collect();
         if store.distributed_batches() {
             // atomic: the job becomes claimable only once all items are saved
-            store.batch_enqueue(&ak.ak, &model, &msgs).await
+            store.batch_enqueue(&ak.ak, &ak.tenant, &model, &msgs).await
         } else {
-            let job = store.batch_create(&ak.ak, &model, msgs.len()).await?;
+            let job = store
+                .batch_create(&ak.ak, &ak.tenant, &model, msgs.len())
+                .await?;
             let this = self.clone();
             let (id, model) = (job.id.clone(), model.clone());
             tokio::spawn(async move { this.execute(&id, &ak, &model, msgs).await });
@@ -158,15 +160,30 @@ impl OfflineHandler {
         loop {
             match store.batch_claim_pending(stale_secs).await {
                 Ok(Some(job)) => {
+                    // a key revoked/banned/expired since submit stops its queued work
                     let ak = match self.online.state().auth.authenticate(&job.ak).await {
-                        Some(ak) => ak,
-                        None => {
-                            tracing::warn!(batch = %job.id, ak = %job.ak, "claimed batch's key is gone; failing it");
+                        Some(ak)
+                            if ak.status_at(gw_state::epoch_secs())
+                                == gw_state::KeyStatus::Active =>
+                        {
+                            ak
+                        }
+                        _ => {
+                            tracing::warn!(batch = %job.id, ak = %job.ak, "claimed batch's key is gone or inactive; failing it");
                             let _ = store.batch_set_status(&job.id, BatchStatus::Failed).await;
                             continue;
                         }
                     };
-                    let items = store.batch_load_items(&job.id).await.unwrap_or_default();
+                    // a load failure must fail the job, not silently complete it
+                    // with zero results (unwrap_or_default would).
+                    let items = match store.batch_load_items(&job.id).await {
+                        Ok(items) => items,
+                        Err(e) => {
+                            tracing::error!(error = %e, batch = %job.id, "batch item load failed; failing the job");
+                            let _ = store.batch_set_status(&job.id, BatchStatus::Failed).await;
+                            continue;
+                        }
+                    };
                     self.execute(&job.id, &ak, &job.model, items).await;
                 }
                 Ok(None) => tokio::time::sleep(poll).await,

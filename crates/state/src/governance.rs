@@ -11,6 +11,17 @@ use async_trait::async_trait;
 
 use crate::{QuotaStore, RateLimiter, TokenWindow, WindowCounter};
 
+/// Day-keyed quota buckets linger at most this long before self-expiring.
+const QUOTA_TTL_MS: i64 = 2 * 24 * 60 * 60 * 1000;
+
+/// The Redis daily-quota key for `key`, stamped with the UTC day index (unix
+/// epoch is UTC-midnight aligned, so `epoch_secs / 86400` increments exactly at
+/// midnight). Rollover is implicit and identical across replicas — no reset job,
+/// no shared-keyspace wipe.
+fn quota_key(key: &str) -> String {
+    format!("gw:quota:{}:{key}", crate::epoch_secs() / 86_400)
+}
+
 /// The governance operations the request pipeline calls.
 #[async_trait]
 pub trait Governance: Send + Sync + std::fmt::Debug {
@@ -175,7 +186,7 @@ impl Governance for RedisGovernance {
     async fn quota_used(&self, ak: &str) -> i64 {
         let mut conn = self.conn.clone();
         match redis::cmd("GET")
-            .arg(format!("gw:quota:{ak}"))
+            .arg(quota_key(ak))
             .query_async::<Option<i64>>(&mut conn)
             .await
         {
@@ -189,9 +200,11 @@ impl Governance for RedisGovernance {
     async fn quota_reserve(&self, key: &str, amount: i64, limit: i64) -> bool {
         let mut conn = self.conn.clone();
         // admit while spent-before < limit; the reservation itself may cross
-        // the limit (same one-request overshoot the settle corrects)
+        // the limit (same one-request overshoot the settle corrects). The
+        // date-stamped key self-expires, so arm a TTL on first use.
         let script = redis::Script::new(
             "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+             if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
              if v - tonumber(ARGV[1]) >= tonumber(ARGV[2]) then
                redis.call('DECRBY', KEYS[1], ARGV[1])
                return 0
@@ -199,9 +212,10 @@ impl Governance for RedisGovernance {
              return 1",
         );
         match script
-            .key(format!("gw:quota:{key}"))
+            .key(quota_key(key))
             .arg(amount)
             .arg(limit)
+            .arg(QUOTA_TTL_MS)
             .invoke_async::<i64>(&mut conn)
             .await
         {
@@ -217,43 +231,29 @@ impl Governance for RedisGovernance {
             return;
         }
         // floor at 0 atomically: a reset/rollover between reserve and settle
-        // must not leave a negative counter that over-admits.
-        settle_floored(&self.conn, &format!("gw:quota:{key}"), delta, None).await;
+        // must not leave a negative counter that over-admits. Re-arm the TTL in
+        // case the day-key was created by this settle.
+        settle_floored(
+            &self.conn,
+            &quota_key(key),
+            delta,
+            Some(Duration::from_millis(QUOTA_TTL_MS as u64)),
+        )
+        .await;
     }
     async fn quota_consume(&self, ak: &str, tokens: i64) {
-        let mut conn = self.conn.clone();
-        let _ = redis::cmd("INCRBY")
-            .arg(format!("gw:quota:{ak}"))
-            .arg(tokens)
-            .query_async::<i64>(&mut conn)
-            .await;
+        self.incr_window(
+            &quota_key(ak),
+            tokens,
+            Duration::from_millis(QUOTA_TTL_MS as u64),
+        )
+        .await;
     }
     async fn quota_reset_all(&self) {
-        // SCAN (non-blocking) + UNLINK (async free), unlike KEYS+DEL which
-        // block the single-threaded server on a large keyspace.
-        let mut conn = self.conn.clone();
-        let mut cursor = 0u64;
-        loop {
-            let res: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg("gw:quota:*")
-                .arg("COUNT")
-                .arg(512)
-                .query_async(&mut conn)
-                .await;
-            let Ok((next, keys)) = res else { return };
-            if !keys.is_empty() {
-                let _ = redis::cmd("UNLINK")
-                    .arg(keys)
-                    .query_async::<i64>(&mut conn)
-                    .await;
-            }
-            cursor = next;
-            if cursor == 0 {
-                break;
-            }
-        }
+        // No-op: quota keys are date-stamped by UTC day (see `quota_key`), so the
+        // daily counter rolls over automatically at midnight for every replica.
+        // The old per-instance sweep wiped the whole shared keyspace, so staggered
+        // instances reset each other's counters multiple times a day.
     }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.incr_window(&format!("gw:qpm:{key}"), 1, window).await <= limit

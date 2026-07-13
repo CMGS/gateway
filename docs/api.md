@@ -72,6 +72,11 @@ Each JSONL line is `{"body": {"model": ..., "messages": [...]}}`. A batch runs
 every item through the same pipeline as a live request (auth, quota, limits,
 billing all apply per item).
 
+Files and batches are owned by the uploading key's tenant. A file or batch
+belonging to another tenant answers `404` (not `403`, so sequential ids can't be
+probed for cross-tenant existence), and an `input_file_id` from another tenant
+is rejected the same way.
+
 ## Realtime
 
 `GET /v1/realtime` upgrades to a WebSocket; select the model with
@@ -79,11 +84,13 @@ billing all apply per item).
 `Authorization: Bearer <ak>` header, or — for browser clients that cannot set
 headers — a `gw-api-key.<ak>` entry in the `Sec-WebSocket-Protocol` list.
 
+The session is refused at accept if the tenant is not entitled to the model.
 A realtime model bound to an account with a real `endpoint` bridges the session
 to that vendor's realtime WebSocket: a transparent relay, with the gateway
 still enforcing auth, per-generation rate/quota limits, and billing from the
-vendor's usage. An endpoint-less account serves a local mock session (OpenAI
-Realtime event shape) for offline development.
+vendor's usage. Each generation re-checks the key (a key banned, expired, or
+revoked mid-session stops generating). An endpoint-less account serves a local
+mock session (OpenAI Realtime event shape) for offline development.
 
 ## Introspection
 

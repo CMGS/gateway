@@ -13,8 +13,8 @@ use sqlx::Row;
 
 /// Consuming the sequence explicitly keeps id and n on one atomic value —
 /// concurrent PG writers would race a MAX(n)+1 subselect.
-const PG_INSERT_BATCH: &str = "INSERT INTO batches (n, id, ak, model, status, total)
-     SELECT v, 'batch-' || v, $1, $2, $3, $4
+const PG_INSERT_BATCH: &str = "INSERT INTO batches (n, id, ak, tenant, model, status, total)
+     SELECT v, 'batch-' || v, $1, $2, $3, $4, $5
      FROM nextval(pg_get_serial_sequence('batches', 'n')) AS v
      RETURNING id";
 
@@ -88,6 +88,8 @@ pub struct BatchItemResult {
 pub struct BatchJob {
     pub id: String,
     pub ak: String,
+    /// Owning tenant; reads are gated on it so one tenant can't see another's jobs.
+    pub tenant: String,
     pub model: String,
     pub status: BatchStatus,
     pub total: usize,
@@ -98,6 +100,8 @@ pub struct BatchJob {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StoredFile {
     pub id: String,
+    /// Owning tenant; reads are gated on it so one tenant can't read another's files.
+    pub tenant: String,
     pub bytes: usize,
     pub purpose: String,
     /// raw content (not serialized in metadata views; fetched via /content).
@@ -130,11 +134,17 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// aggregate server-side instead of paging the whole ledger out.
     async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>>;
 
-    /// Store `content` under a fresh id; returns the file metadata.
-    async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile>;
+    /// Store `content` under a fresh id owned by `tenant`; returns the metadata.
+    async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile>;
     async fn file_get(&self, id: &str) -> GResult<Option<StoredFile>>;
 
-    async fn batch_create(&self, ak: &str, model: &str, total: usize) -> GResult<BatchJob>;
+    async fn batch_create(
+        &self,
+        ak: &str,
+        tenant: &str,
+        model: &str,
+        total: usize,
+    ) -> GResult<BatchJob>;
     async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>>;
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()>;
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()>;
@@ -150,10 +160,11 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn batch_enqueue(
         &self,
         ak: &str,
+        tenant: &str,
         model: &str,
         items: &[Vec<gw_models::ChatMsg>],
     ) -> GResult<BatchJob> {
-        self.batch_create(ak, model, items.len()).await
+        self.batch_create(ak, tenant, model, items.len()).await
     }
     /// Load a batch's input items for execution.
     async fn batch_load_items(&self, _id: &str) -> GResult<Vec<Vec<gw_models::ChatMsg>>> {
@@ -248,13 +259,14 @@ impl Store for MemoryStore {
         Ok(rollup.into_values().collect())
     }
 
-    async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
+    async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
         let id = format!(
             "file-local-{}",
             self.seq.fetch_add(1, Ordering::Relaxed) + 1
         );
         let f = StoredFile {
             id: id.clone(),
+            tenant: tenant.to_owned(),
             bytes: content.len(),
             purpose: purpose.to_owned(),
             content,
@@ -267,7 +279,13 @@ impl Store for MemoryStore {
         Ok(self.files.get(id).map(|f| f.value().clone()))
     }
 
-    async fn batch_create(&self, ak: &str, model: &str, total: usize) -> GResult<BatchJob> {
+    async fn batch_create(
+        &self,
+        ak: &str,
+        tenant: &str,
+        model: &str,
+        total: usize,
+    ) -> GResult<BatchJob> {
         let id = format!(
             "batch-local-{}",
             self.seq.fetch_add(1, Ordering::Relaxed) + 1
@@ -275,6 +293,7 @@ impl Store for MemoryStore {
         let job = BatchJob {
             id: id.clone(),
             ak: ak.to_owned(),
+            tenant: tenant.to_owned(),
             model: model.to_owned(),
             status: BatchStatus::Pending,
             total,
@@ -403,10 +422,11 @@ impl SqliteStore {
                 ptu_spillover INTEGER NOT NULL DEFAULT 0)",
             "CREATE TABLE IF NOT EXISTS files (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
+                tenant TEXT NOT NULL DEFAULT 'default',
                 purpose TEXT NOT NULL, bytes INTEGER NOT NULL, content TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS batches (
                 n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
-                ak TEXT NOT NULL, model TEXT NOT NULL,
+                ak TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
                 status TEXT NOT NULL, total INTEGER NOT NULL)",
             "CREATE TABLE IF NOT EXISTS batch_results (
                 batch_id TEXT NOT NULL, idx INTEGER NOT NULL, ok INTEGER NOT NULL,
@@ -423,6 +443,8 @@ impl SqliteStore {
             "ALTER TABLE billing ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE billing ADD COLUMN served_model TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN vendor_cost_micros INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE files ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
+            "ALTER TABLE batches ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
         ] {
             if let Err(e) = sqlx::query(ddl).execute(&pool).await
                 && !e.to_string().contains("duplicate column name")
@@ -523,14 +545,15 @@ impl Store for SqliteStore {
         Ok(rows.iter().map(usage_row).collect())
     }
 
-    async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
+    async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
         let bytes = content.len();
         // SQLite serializes writers, so the MAX(n)+1 subselect is atomic with the insert
         let id: String = sqlx::query_scalar(
-            "INSERT INTO files (id, purpose, bytes, content)
-             VALUES ('file-' || (SELECT COALESCE(MAX(n), 0) + 1 FROM files), ?, ?, ?)
+            "INSERT INTO files (id, tenant, purpose, bytes, content)
+             VALUES ('file-' || (SELECT COALESCE(MAX(n), 0) + 1 FROM files), ?, ?, ?, ?)
              RETURNING id",
         )
+        .bind(tenant)
         .bind(purpose)
         .bind(bytes as i64)
         .bind(&content)
@@ -539,6 +562,7 @@ impl Store for SqliteStore {
         .map_err(|e| crate::sqlx_err("insert file", e))?;
         Ok(StoredFile {
             id,
+            tenant: tenant.to_owned(),
             bytes,
             purpose: purpose.to_owned(),
             content,
@@ -546,26 +570,34 @@ impl Store for SqliteStore {
     }
 
     async fn file_get(&self, id: &str) -> GResult<Option<StoredFile>> {
-        let row = sqlx::query("SELECT id, purpose, bytes, content FROM files WHERE id = ?")
+        let row = sqlx::query("SELECT id, tenant, purpose, bytes, content FROM files WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| crate::sqlx_err("read file", e))?;
         Ok(row.map(|row| StoredFile {
             id: row.get(0),
-            purpose: row.get(1),
-            bytes: row.get::<i64, _>(2) as usize,
-            content: row.get(3),
+            tenant: row.get(1),
+            purpose: row.get(2),
+            bytes: row.get::<i64, _>(3) as usize,
+            content: row.get(4),
         }))
     }
 
-    async fn batch_create(&self, ak: &str, model: &str, total: usize) -> GResult<BatchJob> {
+    async fn batch_create(
+        &self,
+        ak: &str,
+        tenant: &str,
+        model: &str,
+        total: usize,
+    ) -> GResult<BatchJob> {
         let id: String = sqlx::query_scalar(
-            "INSERT INTO batches (id, ak, model, status, total)
-             VALUES ('batch-' || (SELECT COALESCE(MAX(n), 0) + 1 FROM batches), ?, ?, ?, ?)
+            "INSERT INTO batches (id, ak, tenant, model, status, total)
+             VALUES ('batch-' || (SELECT COALESCE(MAX(n), 0) + 1 FROM batches), ?, ?, ?, ?, ?)
              RETURNING id",
         )
         .bind(ak)
+        .bind(tenant)
         .bind(model)
         .bind(BatchStatus::Pending.as_str())
         .bind(total as i64)
@@ -575,6 +607,7 @@ impl Store for SqliteStore {
         Ok(BatchJob {
             id,
             ak: ak.to_owned(),
+            tenant: tenant.to_owned(),
             model: model.to_owned(),
             status: BatchStatus::Pending,
             total,
@@ -583,11 +616,12 @@ impl Store for SqliteStore {
     }
 
     async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>> {
-        let row = sqlx::query("SELECT id, ak, model, status, total FROM batches WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("read batch", e))?;
+        let row =
+            sqlx::query("SELECT id, ak, tenant, model, status, total FROM batches WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read batch", e))?;
         let Some(row) = row else { return Ok(None) };
         let results = sqlx::query(
             "SELECT idx, ok, message, total_tokens FROM batch_results
@@ -597,13 +631,14 @@ impl Store for SqliteStore {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("read batch results", e))?;
-        let status_text: String = row.get(3);
+        let status_text: String = row.get(4);
         Ok(Some(BatchJob {
             id: row.get(0),
             ak: row.get(1),
-            model: row.get(2),
+            tenant: row.get(2),
+            model: row.get(3),
             status: BatchStatus::parse(&status_text).unwrap_or(BatchStatus::Failed),
-            total: row.get::<i64, _>(4) as usize,
+            total: row.get::<i64, _>(5) as usize,
             results: results.iter().map(batch_item_row).collect(),
         }))
     }
@@ -671,10 +706,11 @@ impl PostgresStore {
                 ptu_spillover BOOLEAN NOT NULL DEFAULT FALSE)",
             "CREATE TABLE IF NOT EXISTS files (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
+                tenant TEXT NOT NULL DEFAULT 'default',
                 purpose TEXT NOT NULL, bytes BIGINT NOT NULL, content TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS batches (
                 n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
-                ak TEXT NOT NULL, model TEXT NOT NULL,
+                ak TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
                 status TEXT NOT NULL, total BIGINT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS batch_results (
                 batch_id TEXT NOT NULL, idx BIGINT NOT NULL, ok BOOLEAN NOT NULL,
@@ -683,6 +719,8 @@ impl PostgresStore {
                 batch_id TEXT NOT NULL, idx BIGINT NOT NULL, messages TEXT NOT NULL,
                 PRIMARY KEY (batch_id, idx))",
             "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ",
+            "ALTER TABLE files ADD COLUMN IF NOT EXISTS tenant TEXT NOT NULL DEFAULT 'default'",
+            "ALTER TABLE batches ADD COLUMN IF NOT EXISTS tenant TEXT NOT NULL DEFAULT 'default'",
             // dedup any (batch_id, idx) rows the pre-fix plain-INSERT could have
             // left, so the unique index below builds on an already-upgraded fleet
             "DELETE FROM batch_results a USING batch_results b
@@ -796,16 +834,17 @@ impl Store for PostgresStore {
         Ok(rows.iter().map(usage_row).collect())
     }
 
-    async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
+    async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
         let bytes = content.len();
         // concurrent PG writers race a MAX(n)+1 subselect; consume the
         // sequence explicitly so id and n share one atomic value
         let id: String = sqlx::query_scalar(
-            "INSERT INTO files (n, id, purpose, bytes, content)
-             SELECT v, 'file-' || v, $1, $2, $3
+            "INSERT INTO files (n, id, tenant, purpose, bytes, content)
+             SELECT v, 'file-' || v, $1, $2, $3, $4
              FROM nextval(pg_get_serial_sequence('files', 'n')) AS v
              RETURNING id",
         )
+        .bind(tenant)
         .bind(purpose)
         .bind(bytes as i64)
         .bind(&content)
@@ -814,6 +853,7 @@ impl Store for PostgresStore {
         .map_err(|e| crate::sqlx_err("insert file", e))?;
         Ok(StoredFile {
             id,
+            tenant: tenant.to_owned(),
             bytes,
             purpose: purpose.to_owned(),
             content,
@@ -821,22 +861,31 @@ impl Store for PostgresStore {
     }
 
     async fn file_get(&self, id: &str) -> GResult<Option<StoredFile>> {
-        let row = sqlx::query("SELECT id, purpose, bytes, content FROM files WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("read file", e))?;
+        let row =
+            sqlx::query("SELECT id, tenant, purpose, bytes, content FROM files WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read file", e))?;
         Ok(row.map(|row| StoredFile {
             id: row.get(0),
-            purpose: row.get(1),
-            bytes: row.get::<i64, _>(2) as usize,
-            content: row.get(3),
+            tenant: row.get(1),
+            purpose: row.get(2),
+            bytes: row.get::<i64, _>(3) as usize,
+            content: row.get(4),
         }))
     }
 
-    async fn batch_create(&self, ak: &str, model: &str, total: usize) -> GResult<BatchJob> {
+    async fn batch_create(
+        &self,
+        ak: &str,
+        tenant: &str,
+        model: &str,
+        total: usize,
+    ) -> GResult<BatchJob> {
         let id: String = sqlx::query_scalar(PG_INSERT_BATCH)
             .bind(ak)
+            .bind(tenant)
             .bind(model)
             .bind(BatchStatus::Pending.as_str())
             .bind(total as i64)
@@ -846,6 +895,7 @@ impl Store for PostgresStore {
         Ok(BatchJob {
             id,
             ak: ak.to_owned(),
+            tenant: tenant.to_owned(),
             model: model.to_owned(),
             status: BatchStatus::Pending,
             total,
@@ -854,11 +904,12 @@ impl Store for PostgresStore {
     }
 
     async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>> {
-        let row = sqlx::query("SELECT id, ak, model, status, total FROM batches WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("read batch", e))?;
+        let row =
+            sqlx::query("SELECT id, ak, tenant, model, status, total FROM batches WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read batch", e))?;
         let Some(row) = row else { return Ok(None) };
         let results = sqlx::query(
             "SELECT idx, ok, message, total_tokens FROM batch_results
@@ -868,13 +919,14 @@ impl Store for PostgresStore {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("read batch results", e))?;
-        let status_text: String = row.get(3);
+        let status_text: String = row.get(4);
         Ok(Some(BatchJob {
             id: row.get(0),
             ak: row.get(1),
-            model: row.get(2),
+            tenant: row.get(2),
+            model: row.get(3),
             status: BatchStatus::parse(&status_text).unwrap_or(BatchStatus::Failed),
-            total: row.get::<i64, _>(4) as usize,
+            total: row.get::<i64, _>(5) as usize,
             results: results.iter().map(batch_item_row).collect(),
         }))
     }
@@ -915,6 +967,7 @@ impl Store for PostgresStore {
     async fn batch_enqueue(
         &self,
         ak: &str,
+        tenant: &str,
         model: &str,
         items: &[Vec<gw_models::ChatMsg>],
     ) -> GResult<BatchJob> {
@@ -927,6 +980,7 @@ impl Store for PostgresStore {
             .map_err(|e| crate::sqlx_err("begin batch enqueue", e))?;
         let id: String = sqlx::query_scalar(PG_INSERT_BATCH)
             .bind(ak)
+            .bind(tenant)
             .bind(model)
             .bind(BatchStatus::Pending.as_str())
             .bind(items.len() as i64)
@@ -949,6 +1003,7 @@ impl Store for PostgresStore {
         Ok(BatchJob {
             id,
             ak: ak.to_owned(),
+            tenant: tenant.to_owned(),
             model: model.to_owned(),
             status: BatchStatus::Pending,
             total: items.len(),
@@ -984,7 +1039,7 @@ impl Store for PostgresStore {
             "UPDATE batches SET status = 'running', claimed_at = now()
              WHERE id = (SELECT id FROM batches WHERE status = 'pending'
                          ORDER BY n FOR UPDATE SKIP LOCKED LIMIT 1)
-             RETURNING id, ak, model, total",
+             RETURNING id, ak, tenant, model, total",
         )
         .fetch_optional(&self.pool)
         .await
@@ -992,9 +1047,10 @@ impl Store for PostgresStore {
         Ok(row.map(|r| BatchJob {
             id: r.get(0),
             ak: r.get(1),
-            model: r.get(2),
+            tenant: r.get(2),
+            model: r.get(3),
             status: BatchStatus::Running,
-            total: r.get::<i64, _>(3) as usize,
+            total: r.get::<i64, _>(4) as usize,
             results: Vec::new(),
         }))
     }
@@ -1044,16 +1100,21 @@ mod tests {
         assert_eq!(page[0].model, "m2");
 
         let f = store
-            .file_put("batch", "line1\nline2".into())
+            .file_put("default", "batch", "line1\nline2".into())
             .await
             .unwrap();
         assert_eq!(f.bytes, 11);
         let got = store.file_get(&f.id).await.unwrap().unwrap();
         assert_eq!(got.content, "line1\nline2");
+        assert_eq!(got.tenant, "default");
         assert!(store.file_get("file-nope").await.unwrap().is_none());
 
-        let job = store.batch_create("ak-t", "m1", 2).await.unwrap();
+        let job = store
+            .batch_create("ak-t", "default", "m1", 2)
+            .await
+            .unwrap();
         assert_eq!(job.status, BatchStatus::Pending);
+        assert_eq!(job.tenant, "default");
         store
             .batch_set_status(&job.id, BatchStatus::Running)
             .await
@@ -1119,7 +1180,7 @@ mod tests {
         for i in 0..10 {
             let s = store.clone();
             handles.push(tokio::spawn(async move {
-                s.file_put("batch", format!("content-{i}"))
+                s.file_put("default", "batch", format!("content-{i}"))
                     .await
                     .unwrap()
                     .id
@@ -1145,7 +1206,7 @@ mod tests {
         let path = path.to_str().unwrap();
         {
             let store = SqliteStore::open(path).await.unwrap();
-            let job = store.batch_create("ak", "m", 1).await.unwrap();
+            let job = store.batch_create("ak", "default", "m", 1).await.unwrap();
             store
                 .batch_set_status(&job.id, BatchStatus::Running)
                 .await
@@ -1191,12 +1252,18 @@ mod tests {
         let usage = store.ledger_usage(Some("default")).await.unwrap();
         assert!(usage.iter().any(|u| u.model == "gpt-4o" && u.requests >= 1));
 
-        let f = store.file_put("batch", "hello pg".into()).await.unwrap();
+        let f = store
+            .file_put("default", "batch", "hello pg".into())
+            .await
+            .unwrap();
         assert!(f.id.starts_with("file-"));
         let got = store.file_get(&f.id).await.unwrap().unwrap();
         assert_eq!(got.content, "hello pg");
 
-        let b = store.batch_create("ak-t", "gpt-4o", 2).await.unwrap();
+        let b = store
+            .batch_create("ak-t", "default", "gpt-4o", 2)
+            .await
+            .unwrap();
         assert!(b.id.starts_with("batch-"));
         store
             .batch_set_status(&b.id, BatchStatus::Running)
@@ -1223,7 +1290,10 @@ mod tests {
             vec![gw_models::ChatMsg::text("user", "one")],
             vec![gw_models::ChatMsg::text("user", "two")],
         ];
-        let qjob = store.batch_enqueue("ak-b", "gpt-4o", &qmsgs).await.unwrap();
+        let qjob = store
+            .batch_enqueue("ak-b", "default", "gpt-4o", &qmsgs)
+            .await
+            .unwrap();
         assert_eq!(qjob.total, 2);
         loop {
             let c = store
@@ -1258,9 +1328,9 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..8 {
             let s = store.clone();
-            handles.push(tokio::spawn(
-                async move { s.file_put("x", "y".into()).await },
-            ));
+            handles.push(tokio::spawn(async move {
+                s.file_put("default", "x", "y".into()).await
+            }));
         }
         let mut ids = std::collections::HashSet::new();
         for h in handles {

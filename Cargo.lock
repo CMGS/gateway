@@ -872,7 +872,9 @@ name = "gw-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "bytes",
  "futures",
  "gw-config",
  "gw-consts",

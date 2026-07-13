@@ -34,6 +34,9 @@ gw-protocol = { workspace = true }
 # ws e2e: loopback connection, zero egress
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
+# custom streaming transport for the outbound-DLP test
+async-trait = { workspace = true }
+bytes = { workspace = true }
 
 [package.metadata.dist]
 dist = true

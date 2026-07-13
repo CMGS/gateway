@@ -228,6 +228,14 @@ async fn realtime_ws(
     if mt != gw_consts::Protocol::Realtime {
         return error_response(400, format!("`{model}` is not a realtime model"));
     }
+    // same tenant entitlement gate the REST surfaces enforce (TenantEntitlement
+    // DAG node) — the realtime surface must not be an entitlement bypass.
+    if !snap.cfg.tenant_allows_model(&ak.tenant, &model) {
+        return error_response(
+            403,
+            format!("model `{model}` is not entitled for tenant `{}`", ak.tenant),
+        );
+    }
     let account = snap
         .state
         .pool
@@ -250,10 +258,19 @@ async fn realtime_ws(
     }
 }
 
-/// Same governance gates as the REST surfaces — the realtime surface bills,
-/// so it must also be rate/quota limited. `None` = admitted.
+/// Same governance gates as the REST surfaces — the realtime surface bills, so
+/// it must also be rate/quota limited. Re-fetches the key each generation (the
+/// handshake snapshot is stale), so a key banned/expired/revoked mid-session
+/// stops generating and current limit values apply. `None` = admitted.
 async fn realtime_gate(s: &AppState, ak: &AkInfo) -> Option<String> {
-    let gov = &s.handler.state().governance;
+    let state = s.handler.state();
+    let ak = match state.auth.authenticate(&ak.ak).await {
+        Some(fresh) if fresh.status_at(gw_state::epoch_secs()) == gw_state::KeyStatus::Active => {
+            fresh
+        }
+        _ => return Some(format!("access key {} is no longer valid", ak.ak)),
+    };
+    let gov = &state.governance;
     if !gov.rate_allow(&ak.ak, ak.qps).await {
         return Some(format!(
             "rate limit exceeded for ak {} (qps {})",
@@ -1272,6 +1289,12 @@ async fn chat_completions(
 /// bounded channel — the backpressure seam. Engines without live streaming
 /// yield their buffered chunks after the run; a final chunk carries the usage
 /// totals; billing stays in the pipeline tail either way.
+///
+/// When outbound DLP is enabled the response can't stream token-by-token —
+/// redaction needs the whole message (a masked span may straddle deltas), and a
+/// live delta would leave the client before the pipeline's post-stage scrubs it.
+/// So DLP forces buffering: no live channel, and the tail is synthesized from the
+/// already-redacted final message rather than the raw decoded deltas.
 fn spawn_stream_pipeline(
     s: &AppState,
     mut request: GatewayRequest,
@@ -1280,14 +1303,19 @@ fn spawn_stream_pipeline(
     started: Instant,
 ) -> tokio::sync::mpsc::Receiver<gw_engines::StreamChunk> {
     let (tx, rx) = tokio::sync::mpsc::channel::<gw_engines::StreamChunk>(STREAM_CHANNEL_CAP);
-    request.stream_tx = Some(tx.clone());
+    let dlp = s.handler.cfg().security.dlp_redact;
+    if !dlp {
+        request.stream_tx = Some(tx.clone());
+    }
     let handler = s.handler.clone();
     tokio::spawn(async move {
         match handler.run(request, ak).await {
             Ok(ctx) => {
                 log_access(surface, &ctx, started);
                 if let Some(outcome) = &ctx.outcome {
-                    let mut tail = if outcome.streamed_live {
+                    let mut tail = if dlp {
+                        redacted_stream_tail(outcome)
+                    } else if outcome.streamed_live {
                         Vec::new()
                     } else {
                         synth_chunks(outcome)
@@ -1446,6 +1474,34 @@ fn synth_chunks(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamCh
             ..Default::default()
         });
     }
+    chunks
+}
+
+/// The stream tail under outbound DLP: the whole redacted message as one delta,
+/// then tool calls and finish. Unlike [`synth_chunks`] it never replays the raw
+/// decoded deltas (which are pre-redaction), so no unmasked text ever leaves.
+fn redacted_stream_tail(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
+    let mut chunks = Vec::new();
+    if !outcome.response.message.is_empty() {
+        chunks.push(gw_engines::StreamChunk {
+            delta: outcome.response.message.clone(),
+            ..Default::default()
+        });
+    }
+    if let Some(tc) = &outcome.response.tool_calls {
+        chunks.push(gw_engines::StreamChunk {
+            tool_calls: Some(tc.clone()),
+            ..Default::default()
+        });
+    }
+    chunks.push(gw_engines::StreamChunk {
+        finish_reason: Some(if outcome.response.finish_reason.is_empty() {
+            "stop".to_owned()
+        } else {
+            outcome.response.finish_reason.clone()
+        }),
+        ..Default::default()
+    });
     chunks
 }
 
@@ -2183,9 +2239,10 @@ async fn batches_submit(
 
     // inline `items`, or an uploaded JSONL `input_file_id` (OpenAI batch pattern)
     if let Some(file_id) = body["input_file_id"].as_str() {
+        // another tenant's file answers 404, not 403 — don't leak its existence
         let file = match s.handler.state().store.file_get(file_id).await {
-            Ok(Some(f)) => f,
-            Ok(None) => return error_response(404, format!("input file {file_id} not found")),
+            Ok(Some(f)) if f.tenant == ak.tenant => f,
+            Ok(_) => return error_response(404, format!("input file {file_id} not found")),
             Err(e) => return gateway_error(e),
         };
         for line in file.content.lines().filter(|l| !l.trim().is_empty()) {
@@ -2237,10 +2294,10 @@ async fn files_upload(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    // gate on a valid AK (the file store isn't AK-scoped in this local subset).
-    if let Err((st, msg)) = authenticate(&s, &headers).await {
-        return error_response(st, msg);
-    }
+    let ak = match authenticate(&s, &headers).await {
+        Ok(ak) => ak,
+        Err((st, msg)) => return error_response(st, msg),
+    };
     let purpose = body["purpose"].as_str().unwrap_or("batch").to_owned();
     let Some(content) = body["file"].as_str() else {
         return error_response(400, "file content (string) is required");
@@ -2252,7 +2309,7 @@ async fn files_upload(
         .handler
         .state()
         .store
-        .file_put(&purpose, content.to_owned())
+        .file_put(&ak.tenant, &purpose, content.to_owned())
         .await
     {
         Ok(f) => f,
@@ -2268,23 +2325,24 @@ async fn files_upload(
         .into_response()
 }
 
-/// GET /v1/files/{id} (file metadata).
+/// GET /v1/files/{id} (file metadata). A file owned by another tenant answers
+/// 404 (not 403), so sequential ids can't be probed for cross-tenant existence.
 async fn files_get(
     State(s): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    // ids are sequential — without auth any client could enumerate all files.
-    if let Err((st, msg)) = authenticate(&s, &headers).await {
-        return error_response(st, msg);
-    }
+    let ak = match authenticate(&s, &headers).await {
+        Ok(ak) => ak,
+        Err((st, msg)) => return error_response(st, msg),
+    };
     match s.handler.state().store.file_get(&id).await {
-        Ok(Some(f)) => (
+        Ok(Some(f)) if f.tenant == ak.tenant => (
             StatusCode::OK,
             Json(json!({"id": f.id, "object": "file", "bytes": f.bytes, "purpose": f.purpose})),
         )
             .into_response(),
-        Ok(None) => error_response(404, format!("file {id} not found")),
+        Ok(_) => error_response(404, format!("file {id} not found")),
         Err(e) => gateway_error(e),
     }
 }
@@ -2295,28 +2353,32 @@ async fn files_content(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err((st, msg)) = authenticate(&s, &headers).await {
-        return error_response(st, msg);
-    }
+    let ak = match authenticate(&s, &headers).await {
+        Ok(ak) => ak,
+        Err((st, msg)) => return error_response(st, msg),
+    };
     match s.handler.state().store.file_get(&id).await {
-        Ok(Some(f)) => (StatusCode::OK, f.content).into_response(),
-        Ok(None) => error_response(404, format!("file {id} not found")),
+        Ok(Some(f)) if f.tenant == ak.tenant => (StatusCode::OK, f.content).into_response(),
+        Ok(_) => error_response(404, format!("file {id} not found")),
         Err(e) => gateway_error(e),
     }
 }
 
-/// GET /v1/batches/{id}
+/// GET /v1/batches/{id}. A batch owned by another tenant answers 404.
 async fn batches_get(
     State(s): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err((st, msg)) = authenticate(&s, &headers).await {
-        return error_response(st, msg);
-    }
+    let ak = match authenticate(&s, &headers).await {
+        Ok(ak) => ak,
+        Err((st, msg)) => return error_response(st, msg),
+    };
     match s.handler.state().store.batch_get(&id).await {
-        Ok(Some(job)) => (StatusCode::OK, Json(json!(job))).into_response(),
-        Ok(None) => error_response(404, format!("batch {id} not found")),
+        Ok(Some(job)) if job.tenant == ak.tenant => {
+            (StatusCode::OK, Json(json!(job))).into_response()
+        }
+        Ok(_) => error_response(404, format!("batch {id} not found")),
         Err(e) => gateway_error(e),
     }
 }

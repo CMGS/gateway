@@ -28,18 +28,23 @@ pub fn extract_common_usage(raw: &[u8], messages_protocol: bool) -> Option<Commo
     }
 
     Some(if messages_protocol {
-        // Anthropic: input/output (+ cache fields)
-        let input = get(&v, &["input_tokens"]);
-        let output = get(&v, &["output_tokens"]);
-        let read_cache = get(&v, &["cache_read_input_tokens"]);
-        let write_cache = get(&v, &["cache_creation_input_tokens"]);
+        // Anthropic: input/output (+ cache fields). Never trust upstream — floor
+        // each part at 0 and sum saturating, so a malformed/hostile usage can't
+        // go negative (which would refund quota) or overflow the total.
+        let input = get(&v, &["input_tokens"]).max(0);
+        let output = get(&v, &["output_tokens"]).max(0);
+        let read_cache = get(&v, &["cache_read_input_tokens"]).max(0);
+        let write_cache = get(&v, &["cache_creation_input_tokens"]).max(0);
         CommonUsage {
             platform_input: input,
             read_cache,
             write_cache,
             completion: output,
             reason: 0,
-            platform_total: input + output + read_cache + write_cache,
+            platform_total: input
+                .saturating_add(output)
+                .saturating_add(read_cache)
+                .saturating_add(write_cache),
         }
     } else {
         // OpenAI: prompt/completion/total (+ details)
@@ -62,7 +67,7 @@ pub fn extract_common_usage(raw: &[u8], messages_protocol: bool) -> Option<Commo
             platform_total: if total > 0 {
                 total
             } else {
-                prompt + completion
+                prompt.saturating_add(completion)
             },
         }
     })
@@ -110,6 +115,16 @@ mod tests {
         assert_eq!(u.completion, 6);
         assert_eq!(u.read_cache, 2);
         assert_eq!(u.platform_total, 16);
+    }
+
+    #[test]
+    fn anthropic_negative_usage_is_floored() {
+        let raw = br#"{"input_tokens":-5,"output_tokens":-3,"cache_read_input_tokens":-1}"#;
+        let u = extract_common_usage(raw, true).unwrap();
+        assert_eq!(u.platform_input, 0, "negative floored, no quota refund");
+        assert_eq!(u.completion, 0);
+        assert_eq!(u.read_cache, 0);
+        assert_eq!(u.platform_total, 0);
     }
 
     #[test]
