@@ -2,6 +2,15 @@
 
 ## Binary
 
+Install a tagged release (Linux/macOS, x86_64/arm64) with the generated script:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/CMGS/gateway/releases/latest/download/ap-server-installer.sh | sh
+```
+
+Or build from source:
+
 ```bash
 make release            # target/release/ap, built --locked
 AP_GATEWAY_CONF=/etc/gateway.yaml ./target/release/ap

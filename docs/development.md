@@ -13,7 +13,12 @@ make docker      # build the container image
 make run         # cargo run -p ap-server
 ```
 
-CI runs fmt/clippy/test and `cargo deny` on every push. Edition 2024; the
+CI runs fmt/clippy/test and `cargo deny` on every push. Releases are cut by
+[dist](https://opensource.axo.dev/cargo-dist/) on a `v*` tag — it
+cross-compiles the binaries, generates the install script and checksums, and
+publishes the GitHub release (`.github/workflows/release.yml` is generated;
+edit `dist-workspace.toml` and run `dist generate`). The container image is
+built separately on tags (`.github/workflows/docker.yml`). Edition 2024; the
 workspace denies `unwrap`/`expect`/undocumented `unsafe` outside tests.
 
 ## Workspace layout

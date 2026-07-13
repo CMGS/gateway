@@ -3,6 +3,7 @@ name = "ap-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 publish.workspace = true
 description = "HTTP entrypoint: config + state + mock transport + axum router."
 
@@ -31,6 +32,9 @@ ap-protocol = { workspace = true }
 # ws e2e: loopback connection, zero egress
 tokio-tungstenite = "0.26"
 futures = { workspace = true }
+
+[package.metadata.dist]
+dist = true
 
 [lints]
 workspace = true
