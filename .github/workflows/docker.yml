@@ -1,8 +1,10 @@
 name: Docker
 
+# Multi-arch image builds compile the Rust release for arm64 under QEMU, which
+# is slow — so build+push only on version tags, not every push. Main pushes are
+# covered by the CI workflow.
 on:
   push:
-    branches: [main]
     tags: ["v*"]
 
 permissions:
@@ -32,3 +34,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
