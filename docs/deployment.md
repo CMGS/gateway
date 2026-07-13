@@ -51,7 +51,7 @@ State that must be shared across replicas has a backend:
 
 ```yaml
 storage:
-  sqlite_path: /var/lib/ap/store.db    # durable ledger/files/batches
+  sqlite_path: /var/lib/gw/store.db    # durable ledger/files/batches
   ledger_max_rows: 1000000             # prune oldest billing rows past the cap
   redis_url: "redis://redis:6379"      # shared rate limits + quotas
 ```
@@ -60,5 +60,5 @@ storage:
   set (survives restarts), otherwise in-memory. Orphaned `running` batch jobs
   from a dead process are swept to `failed` on startup.
 - **Rate limits & quotas**: shared in Redis when `redis_url` is set (keys
-  namespaced under `ap:`, windows self-expire), otherwise in-process. Without
+  namespaced under `gw:`, windows self-expire), otherwise in-process. Without
   Redis, each replica limits independently.

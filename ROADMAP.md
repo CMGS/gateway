@@ -10,7 +10,7 @@ egress and the full suite runs without network or external services.
 
 ## M0 — Open-source bootstrap (done)
 
-- [x] Workspace renamed to `ap-*` crates, binary `ap`, env prefix `AP_`
+- [x] `gw-*` crates, binary `gw`, env prefix `GW_`
 - [x] Internal-heritage references scrubbed; all comments in English
 - [x] Concise `README.md`, `docs/`, MIT license, GitHub Actions CI
 
