@@ -264,6 +264,23 @@ impl OpenAiEngine {
     }
 }
 
+#[async_trait::async_trait]
+impl ModelEngine for OpenAiEngine {
+    async fn run(&self) -> GResult<EngineOutcome> {
+        let up = self.build_upstream()?;
+        let reply = self.transport.send(up).await?;
+        match reply.body {
+            UpstreamBody::Sse(bytes) => self.parse_sse(reply.status, &bytes),
+            UpstreamBody::Json(bytes) => self.parse_json(reply.status, &bytes),
+            UpstreamBody::SseStream(s) => self.pump_sse(reply.status, s).await,
+        }
+    }
+
+    fn recorder(&self) -> &dyn Recorder {
+        &self.recorder
+    }
+}
+
 /// Apply one decoded SSE event to the accumulating response; returns the
 /// chunks the event yields.
 fn apply_sse_event(
@@ -292,7 +309,11 @@ fn apply_sse_event(
         });
     }
     if let Some(tc) = delta.get("tool_calls").filter(|t| !t.is_null()) {
-        resp.tool_calls = Some(tc.clone());
+        merge_tool_call_fragments(&mut resp.tool_calls, tc);
+        chunks.push(StreamChunk {
+            tool_calls: Some(tc.clone()),
+            ..Default::default()
+        });
     }
     if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
         resp.finish_reason = fr.to_owned();
@@ -308,6 +329,48 @@ fn apply_sse_event(
     Ok(chunks)
 }
 
+/// OpenAI streams tool calls as fragments keyed by `index`: the first fragment
+/// of a call carries id/type/function.name, later ones append to
+/// function.arguments. Overwriting would keep only the last fragment.
+fn merge_tool_call_fragments(acc: &mut Option<Value>, fragment: &Value) {
+    let Some(frags) = fragment.as_array() else {
+        return;
+    };
+    let calls = acc.get_or_insert_with(|| Value::Array(Vec::new()));
+    let Some(calls) = calls.as_array_mut() else {
+        return;
+    };
+    for f in frags {
+        let idx = f["index"]
+            .as_u64()
+            .map(|i| i as usize)
+            .unwrap_or(calls.len());
+        while calls.len() <= idx {
+            calls.push(json!({"function": {}}));
+        }
+        let call = &mut calls[idx];
+        for key in ["id", "type"] {
+            if let Some(v) = f.get(key).filter(|v| !v.is_null())
+                && call.get(key).is_none()
+            {
+                call[key] = v.clone();
+            }
+        }
+        if let Some(name) = f["function"]["name"].as_str()
+            && call["function"].get("name").is_none()
+        {
+            call["function"]["name"] = json!(name);
+        }
+        if let Some(args) = f["function"]["arguments"].as_str() {
+            let joined = format!(
+                "{}{args}",
+                call["function"]["arguments"].as_str().unwrap_or("")
+            );
+            call["function"]["arguments"] = json!(joined);
+        }
+    }
+}
+
 /// Copy token fields + keep the raw usage subtree bytes for the DAG node.
 fn apply_openai_usage(resp: &mut GatewayResponse, usage: &Value) {
     if usage.is_null() {
@@ -317,23 +380,6 @@ fn apply_openai_usage(resp: &mut GatewayResponse, usage: &Value) {
     resp.completion_tokens = usage["completion_tokens"].as_i64().unwrap_or(0);
     resp.total_tokens = usage["total_tokens"].as_i64().unwrap_or(0);
     resp.raw_usage_json = usage.to_string().into_bytes();
-}
-
-#[async_trait::async_trait]
-impl ModelEngine for OpenAiEngine {
-    async fn run(&self) -> GResult<EngineOutcome> {
-        let up = self.build_upstream()?;
-        let reply = self.transport.send(up).await?;
-        match reply.body {
-            UpstreamBody::Sse(bytes) => self.parse_sse(reply.status, &bytes),
-            UpstreamBody::Json(bytes) => self.parse_json(reply.status, &bytes),
-            UpstreamBody::SseStream(s) => self.pump_sse(reply.status, s).await,
-        }
-    }
-
-    fn recorder(&self) -> &dyn Recorder {
-        &self.recorder
-    }
 }
 
 #[cfg(test)]
@@ -389,6 +435,44 @@ mod tests {
         assert_eq!(out.response.finish_reason, "tool_calls");
         let tc = out.response.tool_calls.expect("tool calls");
         assert_eq!(tc[0]["function"]["name"], "get_weather");
+    }
+
+    #[tokio::test]
+    async fn stream_tools_forward_tool_call_chunks() {
+        let mut r = req(true);
+        if let Some(p) = r.model_param_v2.as_mut() {
+            p.typed = Some(TypedParams::Chat(ChatParams {
+                tools: Some(json!([{"type":"function",
+                    "function":{"name":"get_weather","parameters":{}}}])),
+                ..Default::default()
+            }));
+        }
+        let e = OpenAiEngine::new(r, Arc::new(MockTransport));
+        let out = e.run().await.unwrap();
+        assert!(
+            out.chunks.iter().any(|c| c.tool_calls.is_some()),
+            "stream must carry tool_calls chunks"
+        );
+        let tc = out.response.tool_calls.expect("accumulated tool calls");
+        assert_eq!(tc[0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn tool_call_fragments_merge_by_index() {
+        let mut acc = None;
+        merge_tool_call_fragments(
+            &mut acc,
+            &json!([{"index":0,"id":"call_1","type":"function",
+                "function":{"name":"get_weather","arguments":"{\"ci"}}]),
+        );
+        merge_tool_call_fragments(
+            &mut acc,
+            &json!([{"index":0,"function":{"arguments":"ty\":\"sf\"}"}}]),
+        );
+        let calls = acc.unwrap();
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"sf\"}");
     }
 
     #[tokio::test]

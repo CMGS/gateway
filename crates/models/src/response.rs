@@ -85,6 +85,19 @@ pub struct GatewayResponse {
     pub raw_usage_json: Vec<u8>,
 }
 
+/// One streamed response fragment, forwarded to the client as it arrives.
+#[derive(Debug, Default, Clone)]
+pub struct StreamChunk {
+    pub delta: String,
+    /// tool-call delta fragment (vendor wire shape), forwarded as it arrives.
+    pub tool_calls: Option<Value>,
+    pub finish_reason: Option<String>,
+    /// final (prompt, completion, total) token counts; sent once at stream end.
+    pub usage_totals: Option<(i64, i64, i64)>,
+    /// set when the pipeline failed mid-stream; views emit it as an error frame.
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,15 +117,4 @@ mod tests {
         let j = serde_json::to_value(&r).unwrap();
         assert!(j.get("step").is_none());
     }
-}
-
-/// One streamed response fragment, forwarded to the client as it arrives.
-#[derive(Debug, Default, Clone)]
-pub struct StreamChunk {
-    pub delta: String,
-    pub finish_reason: Option<String>,
-    /// final (prompt, completion, total) token counts; sent once at stream end.
-    pub usage_totals: Option<(i64, i64, i64)>,
-    /// set when the pipeline failed mid-stream; views emit it as an error frame.
-    pub error: Option<String>,
 }

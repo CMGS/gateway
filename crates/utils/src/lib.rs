@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Local, Utc};
 
-/// Canonical timestamp layout `"2006-01-02 15:04:05"` as a chrono format string.
+/// Canonical timestamp layout used across the gateway.
 pub const TS_LAYOUT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// Current unix seconds plus the formatted local time.

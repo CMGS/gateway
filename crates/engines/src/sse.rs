@@ -7,7 +7,7 @@
 /// Incremental server-sent-events decoder (data-only, which is what LLM vendors use).
 #[derive(Debug, Default)]
 pub struct SseDecoder {
-    buf: String,
+    buf: Vec<u8>,
     done: bool,
 }
 
@@ -15,11 +15,15 @@ impl SseDecoder {
     /// Push bytes; returns the `data:` payloads of every event completed so far.
     /// `[DONE]` flips `is_done` and is not returned as a payload.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        // Buffer raw bytes and only decode complete events: a network chunk can
+        // end mid-way through a multi-byte UTF-8 character, and decoding each
+        // chunk separately would corrupt it permanently.
+        self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         // events are separated by a blank line
-        while let Some(pos) = self.buf.find("\n\n") {
-            let event: String = self.buf.drain(..pos + 2).collect();
+        while let Some(pos) = self.buf.windows(2).position(|w| w == b"\n\n") {
+            let event: Vec<u8> = self.buf.drain(..pos + 2).collect();
+            let event = String::from_utf8_lossy(&event);
             for line in event.lines() {
                 let line = line.strip_suffix('\r').unwrap_or(line);
                 if let Some(data) = line.strip_prefix("data:") {
@@ -68,6 +72,17 @@ mod tests {
         assert!(!d.is_done());
         assert!(d.feed(b"NE]\n\n").is_empty());
         assert!(d.is_done());
+    }
+
+    #[test]
+    fn multibyte_utf8_split_across_feeds_survives() {
+        let mut d = SseDecoder::default();
+        let payload = "data: {\"t\":\"你好😀\"}\n\n".as_bytes();
+        // split inside the first multi-byte character
+        let (a, b) = payload.split_at(13);
+        assert!(std::str::from_utf8(a).is_err(), "split must land mid-char");
+        assert!(d.feed(a).is_empty());
+        assert_eq!(d.feed(b), vec![r#"{"t":"你好😀"}"#]);
     }
 
     #[test]

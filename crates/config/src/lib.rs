@@ -386,7 +386,7 @@ impl GatewayConfig {
         Self::from_yaml(&text)
     }
 
-    /// The embedded rust/conf/gateway.yaml.
+    /// The embedded conf/gateway.yaml.
     pub fn embedded_default() -> Result<Self, ConfigError> {
         Self::from_yaml(DEFAULT_YAML)
     }
@@ -414,6 +414,10 @@ impl GatewayConfig {
         check_unique("model", self.models.iter().map(|m| m.name.as_str()))?;
         check_unique("access_key", self.access_keys.iter().map(|a| a.ak.as_str()))?;
         check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
+        check_unique("provider", self.providers.iter().map(|p| p.name.as_str()))?;
+        // account health and failover exclusion key by name — duplicates would
+        // cool down / exclude the wrong physical account.
+        check_unique("account", self.accounts.iter().map(|a| a.name.as_str()))?;
         Ok(())
     }
 
@@ -511,6 +515,36 @@ models:
         assert!(matches!(
             GatewayConfig::from_yaml(yaml),
             Err(ConfigError::DuplicateName { kind: "model", .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_account_and_provider_names_rejected() {
+        let dup_account = r#"
+listen: {host: h, port: 1}
+accounts:
+  - {name: same, provider: a, protocols: ["openai-chat"]}
+  - {name: same, provider: b, protocols: ["openai-chat"]}
+"#;
+        assert!(matches!(
+            GatewayConfig::from_yaml(dup_account),
+            Err(ConfigError::DuplicateName {
+                kind: "account",
+                ..
+            })
+        ));
+        let dup_provider = r#"
+listen: {host: h, port: 1}
+providers:
+  - {name: openai, kind: openai}
+  - {name: openai, kind: deepseek}
+"#;
+        assert!(matches!(
+            GatewayConfig::from_yaml(dup_provider),
+            Err(ConfigError::DuplicateName {
+                kind: "provider",
+                ..
+            })
         ));
     }
 

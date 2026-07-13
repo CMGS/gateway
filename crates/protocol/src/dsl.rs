@@ -254,7 +254,7 @@ mod tests {
 
     /// Asserts the scalar-op outputs: type=message, stop_reason=end_turn, usage renamed.
     #[test]
-    fn transform_matches_go_collect_test() {
+    fn transform_applies_scalar_and_collect_ops() {
         let input: Value = serde_json::from_str(
             r#"{"id":"chatcmpl-123","model":"gpt-4o",
                 "choices":[{"message":{"content":"Hello!","role":"assistant"},"finish_reason":"stop"}],

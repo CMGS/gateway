@@ -57,6 +57,15 @@ fn get(uri: &str) -> Request<Body> {
         .expect("request")
 }
 
+/// GET with the demo AK — the files/batches read surfaces require auth.
+fn get_authed(uri: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("authorization", "Bearer ak-demo-123")
+        .body(Body::empty())
+        .expect("request")
+}
+
 const CHAT_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello e2e"}]}"#;
 
 #[tokio::test]
@@ -258,7 +267,7 @@ async fn batch_submit_and_poll() {
     for _ in 0..100 {
         let resp = app
             .clone()
-            .oneshot(get(&format!("/v1/batches/{id}")))
+            .oneshot(get_authed(&format!("/v1/batches/{id}")))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -432,6 +441,88 @@ async fn chat_stream_emits_sse_chunks_and_done() {
         "assembled: {assembled}"
     );
     assert!(saw_finish_with_usage);
+}
+
+#[tokio::test]
+async fn chat_stream_tools_emit_tool_call_chunks() {
+    let app = app();
+    let body = r#"{"model":"gpt-4o","stream":true,
+        "messages":[{"role":"user","content":"call the tool"}],
+        "tools":[{"type":"function","function":{"name":"get_weather","parameters":{}}}]}"#;
+    let resp = app
+        .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    let mut saw_tool_chunk = false;
+    let mut finish = String::new();
+    for f in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        if f == "[DONE]" {
+            continue;
+        }
+        let v: Value = serde_json::from_str(f).unwrap();
+        let delta = &v["choices"][0]["delta"];
+        if delta["tool_calls"][0]["function"]["name"] == "get_weather" {
+            saw_tool_chunk = true;
+        }
+        if let Some(fr) = v["choices"][0]["finish_reason"].as_str() {
+            finish = fr.to_owned();
+        }
+    }
+    assert!(saw_tool_chunk, "stream must carry the tool_calls delta");
+    assert_eq!(finish, "tool_calls");
+}
+
+#[tokio::test]
+async fn messages_errors_are_anthropic_shaped() {
+    let app = app();
+    // no api key → authentication_error with the anthropic discriminator
+    let r = app
+        .clone()
+        .oneshot(post(
+            "/v1/messages",
+            None,
+            r#"{"model":"claude-sonnet","messages":[{"role":"user","content":"x"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let j = body_json(r).await;
+    assert_eq!(j["type"], "error");
+    assert_eq!(j["error"]["type"], "authentication_error");
+
+    // unknown model → not_found_error
+    let r = app
+        .oneshot(post(
+            "/v1/messages",
+            Some("ak-demo-123"),
+            r#"{"model":"nope","messages":[{"role":"user","content":"x"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let j = body_json(r).await;
+    assert_eq!(j["type"], "error");
+    assert_eq!(j["error"]["type"], "not_found_error");
+    assert!(j["error"]["message"].as_str().unwrap().contains("nope"));
+}
+
+#[tokio::test]
+async fn anthropic_streaming_carries_tool_use_blocks() {
+    let app = app();
+    let body = r#"{"model":"claude-sonnet","stream":true,"max_tokens":64,
+        "messages":[{"role":"user","content":"use the tool"}],
+        "tools":[{"name":"get_weather","description":"d","input_schema":{}}]}"#;
+    let resp = app
+        .oneshot(post("/v1/messages", Some("ak-demo-123"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(text.contains(r#""type":"tool_use""#), "sse: {text}");
+    assert!(text.contains("input_json_delta"), "sse: {text}");
+    assert!(text.contains("get_weather"), "sse: {text}");
 }
 
 #[tokio::test]
@@ -763,10 +854,16 @@ async fn files_upload_then_batch_from_file() {
     assert_eq!(j["purpose"], "batch");
     let file_id = j["id"].as_str().unwrap().to_owned();
 
-    // 2) content is retrievable
+    // 2) content requires auth (ids are sequential/enumerable) and is retrievable
     let resp = app
         .clone()
         .oneshot(get(&format!("/v1/files/{file_id}/content")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = app
+        .clone()
+        .oneshot(get_authed(&format!("/v1/files/{file_id}/content")))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -793,7 +890,7 @@ async fn files_upload_then_batch_from_file() {
     for _ in 0..100 {
         let resp = app
             .clone()
-            .oneshot(get(&format!("/v1/batches/{id}")))
+            .oneshot(get_authed(&format!("/v1/batches/{id}")))
             .await
             .unwrap();
         let j = body_json(resp).await;
@@ -1187,6 +1284,49 @@ async fn realtime_websocket_mock_session() {
     let last = ws.next().await.unwrap().unwrap();
     let v: Value = serde_json::from_str(last.to_text().unwrap()).unwrap();
     assert_eq!(v["type"], "session.closed");
+}
+
+#[tokio::test]
+async fn realtime_turns_are_rate_limited() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let application = app();
+    tokio::spawn(async move {
+        axum::serve(listener, application).await.unwrap();
+    });
+
+    // ak-limited: qps=1 → the second back-to-back turn must be denied
+    let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer ak-limited".parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws connect");
+    let first = ws.next().await.unwrap().unwrap();
+    let v: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    assert_eq!(v["type"], "session.created");
+
+    let turn = serde_json::json!({"type":"input_text","text":"one"}).to_string();
+    ws.send(Message::text(turn.clone())).await.unwrap();
+    // drain the first turn to its response.done
+    loop {
+        let msg = ws.next().await.unwrap().unwrap();
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        if v["type"] == "response.done" {
+            break;
+        }
+    }
+    ws.send(Message::text(turn)).await.unwrap();
+    let msg = ws.next().await.unwrap().unwrap();
+    let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    assert_eq!(v["type"], "error", "second turn must be rate limited: {v}");
+    assert!(v["message"].as_str().unwrap().contains("rate limit"));
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-# ap — local gateway config.
+# gw — local gateway config.
 # Local file only; there is no config center.
 
 listen:
@@ -8,7 +8,7 @@ listen:
 # Durable records (billing ledger, files, batches). Empty/absent = in-memory;
 # set a path to persist across restarts.
 # storage:
-#   sqlite_path: /var/lib/ap/store.db
+#   sqlite_path: /var/lib/gw/store.db
 
 # AK auth table (local key-table version)
 access_keys:

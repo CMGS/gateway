@@ -140,15 +140,19 @@ impl MessagesResponse {
 }
 
 /// One streaming event: `(event_name, data_payload)`. The standard sequence for
-/// a text reply — used by the /v1/messages SSE surface and mirrored by the mock.
+/// a text reply plus optional tool_use blocks — used by the /v1/messages SSE
+/// surface and mirrored by the mock. `tool_use` blocks stream the wire pattern
+/// real clients expect: empty `input` in the start frame, the full arguments as
+/// one `input_json_delta`, then the stop frame.
 pub fn stream_events(
     id: &str,
     model: &str,
     text_deltas: &[String],
+    tool_use: &[Value],
     stop_reason: &str,
     usage: &AnthUsage,
 ) -> Vec<(&'static str, Value)> {
-    let mut ev = Vec::with_capacity(text_deltas.len() + 5);
+    let mut ev = Vec::with_capacity(text_deltas.len() + tool_use.len() * 3 + 5);
     ev.push((
         "message_start",
         json!({"type":"message_start","message":{
@@ -171,6 +175,23 @@ pub fn stream_events(
         "content_block_stop",
         json!({"type":"content_block_stop","index":0}),
     ));
+    for (k, tb) in tool_use.iter().enumerate() {
+        let idx = k + 1; // the text block occupies index 0
+        ev.push((
+            "content_block_start",
+            json!({"type":"content_block_start","index":idx,
+                   "content_block":{"type":"tool_use","id":tb["id"],"name":tb["name"],"input":{}}}),
+        ));
+        ev.push((
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":idx,
+                   "delta":{"type":"input_json_delta","partial_json":tb["input"].to_string()}}),
+        ));
+        ev.push((
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":idx}),
+        ));
+    }
     ev.push((
         "message_delta",
         json!({"type":"message_delta","delta":{"stop_reason":stop_reason},
@@ -227,6 +248,7 @@ mod tests {
             "msg-1",
             "claude-test",
             &["he".into(), "llo".into()],
+            &[],
             "end_turn",
             &AnthUsage {
                 input_tokens: 3,
@@ -248,5 +270,40 @@ mod tests {
         );
         assert_eq!(ev[0].1["message"]["usage"]["input_tokens"], 3);
         assert_eq!(ev[5].1["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn stream_events_carry_tool_use_blocks() {
+        let tool = json!({"type":"tool_use","id":"tu_1","name":"get_weather",
+                          "input":{"city":"sf"}});
+        let ev = stream_events(
+            "msg-1",
+            "claude-test",
+            &[],
+            std::slice::from_ref(&tool),
+            "tool_use",
+            &AnthUsage {
+                input_tokens: 3,
+                output_tokens: 5,
+            },
+        );
+        let start = ev
+            .iter()
+            .find(|(n, v)| *n == "content_block_start" && v["index"] == 1)
+            .expect("tool_use start frame");
+        assert_eq!(start.1["content_block"]["type"], "tool_use");
+        assert_eq!(start.1["content_block"]["name"], "get_weather");
+        let delta = ev
+            .iter()
+            .find(|(n, v)| *n == "content_block_delta" && v["index"] == 1)
+            .expect("input_json_delta frame");
+        assert_eq!(
+            delta.1["delta"]["partial_json"].as_str().unwrap(),
+            r#"{"city":"sf"}"#
+        );
+        assert!(
+            ev.iter()
+                .any(|(n, v)| *n == "content_block_stop" && v["index"] == 1)
+        );
     }
 }

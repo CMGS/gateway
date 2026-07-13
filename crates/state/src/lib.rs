@@ -237,25 +237,31 @@ impl TokenWindow {
         self.rotate(key, window) < limit
     }
 
-    /// Post-add actual token usage.
+    /// Post-add actual token usage. Rotation and increment happen under one
+    /// entry guard so a concurrent rollover cannot land the tokens in the
+    /// wrong window.
     pub fn add(&self, key: &str, tokens: i64, window: std::time::Duration) {
-        self.rotate(key, window);
-        if let Some(mut e) = self.entries.get_mut(key) {
-            e.1 += tokens;
+        let mut e = self
+            .entries
+            .entry(key.to_owned())
+            .or_insert_with(|| (Instant::now(), 0));
+        if e.0.elapsed() >= window {
+            *e = (Instant::now(), 0);
         }
+        e.1 += tokens;
     }
-}
-
-/// Account health: consecutive-failure cooldown with auto-recovery.
-#[derive(Debug, Default)]
-pub struct AccountHealth {
-    entries: DashMap<String, HealthEntry>,
 }
 
 #[derive(Debug, Default)]
 struct HealthEntry {
     consecutive_failures: usize,
     cooldown_until: Option<Instant>,
+}
+
+/// Account health: consecutive-failure cooldown with auto-recovery.
+#[derive(Debug, Default)]
+pub struct AccountHealth {
+    entries: DashMap<String, HealthEntry>,
 }
 
 impl AccountHealth {
@@ -269,7 +275,10 @@ impl AccountHealth {
     ) -> bool {
         let mut e = self.entries.entry(name.to_owned()).or_default();
         e.consecutive_failures += 1;
-        if e.consecutive_failures >= threshold && e.cooldown_until.is_none() {
+        // An expired cooldown re-arms the breaker: a still-failing account must
+        // re-enter cooldown after its recovery probe fails, not latch open forever.
+        let armed = e.cooldown_until.is_none_or(|until| Instant::now() >= until);
+        if e.consecutive_failures >= threshold && armed {
             e.cooldown_until = Some(Instant::now() + cooldown);
             return true;
         }
@@ -487,6 +496,22 @@ mod tests {
                 .select(Protocol::Video, Some("nonexistent"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cooldown_rearms_after_expiry() {
+        let h = AccountHealth::default();
+        let cd = Duration::from_millis(10);
+        assert!(!h.record_failure("acc", 2, cd));
+        assert!(h.record_failure("acc", 2, cd), "threshold trips cooldown");
+        assert!(!h.available("acc"));
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(h.available("acc"), "cooldown auto-recovers");
+        // recovery probe fails again: the breaker must re-trip, not latch open
+        assert!(h.record_failure("acc", 2, cd), "expired cooldown re-arms");
+        assert!(!h.available("acc"));
+        h.record_success("acc");
+        assert!(h.available("acc"));
     }
 
     #[test]

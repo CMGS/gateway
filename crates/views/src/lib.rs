@@ -41,8 +41,8 @@ use gw_dag::DagContext;
 use gw_engines::{SharedTransport, is_implemented};
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
-    ChatMsg, ChatParams, EmbeddingParams, GatewayError, GatewayRequest, ImageParams, ModelParamV2,
-    SttParams, TtsParams, TypedParams,
+    ChatMsg, ChatParams, EmbeddingParams, GResult, GatewayError, GatewayRequest, ImageParams,
+    ModelParamV2, SttParams, TtsParams, TypedParams,
 };
 use gw_protocol::anthropic::{AnthUsage, MessagesRequest, MessagesResponse};
 use gw_protocol::openai::{
@@ -53,6 +53,8 @@ use serde_json::{Value, json};
 
 const LEDGER_PAGE_DEFAULT: usize = 100;
 const STREAM_CHANNEL_CAP: usize = 64;
+
+static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -131,12 +133,12 @@ async fn realtime_ws(
     // Auth: header or ?ak= (fallback when a ws client can't easily set headers)
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err(resp) => match q
+        Err((st, msg)) => match q
             .get("ak")
             .and_then(|k| s.handler.state.auth.authenticate(k))
         {
             Some(ak) => ak,
-            None => return *resp,
+            None => return error_response(st, msg),
         },
     };
     let Some(model) = q.get("model").cloned() else {
@@ -200,6 +202,33 @@ async fn realtime_session(
         };
         match ev["type"].as_str().unwrap_or_default() {
             "input_text" => {
+                // Same governance gates as the REST surfaces — this surface
+                // bills, so it must also be rate/quota limited.
+                let gov = &s.handler.state.governance;
+                if !gov.rate_allow(&ak.ak, ak.qps).await {
+                    let _ = socket
+                        .send(send(json!({"type":"error",
+                            "message": format!("rate limit exceeded for ak {} (qps {})", ak.ak, ak.qps)})))
+                        .await;
+                    continue;
+                }
+                if !gov.quota_check(&ak.ak, ak.daily_token_quota).await {
+                    let _ = socket
+                        .send(send(json!({"type":"error",
+                            "message": format!("daily token quota exhausted for ak {}", ak.ak)})))
+                        .await;
+                    continue;
+                }
+                let window = std::time::Duration::from_secs(60);
+                if let Some(tpm) = ak.tokens_per_minute
+                    && !gov.token_window_check(&ak.ak, tpm, window).await
+                {
+                    let _ = socket
+                        .send(send(json!({"type":"error",
+                            "message": format!("token-per-minute limit exceeded for ak {} (tpm {tpm})", ak.ak)})))
+                        .await;
+                    continue;
+                }
                 let input = ev["text"].as_str().unwrap_or_default().to_owned();
                 let reply = format!("[mock-realtime:{model}] you said: {input}");
                 let (it, ot) = (
@@ -224,6 +253,11 @@ async fn realtime_session(
                     .state
                     .governance
                     .quota_consume(&ak.ak, it + ot)
+                    .await;
+                s.handler
+                    .state
+                    .governance
+                    .token_window_add(&ak.ak, it + ot, window)
                     .await;
                 let record = gw_state::BillingRecord {
                     ak: ak.ak.clone(),
@@ -366,25 +400,25 @@ async fn accounts(State(s): State<AppState>) -> Json<Value> {
     Json(json!({ "count": data.len(), "accounts": data }))
 }
 
-/// AK auth: `Authorization: Bearer <ak>` or `x-api-key: <ak>`.
-/// (boxed Err keeps the Result small per clippy::result_large_err)
-fn authenticate(s: &AppState, headers: &HeaderMap) -> Result<AkInfo, Box<Response>> {
+/// AK auth: `Authorization: Bearer <ak>` or `x-api-key: <ak>`. The error is
+/// `(status, message)` so each surface can shape it to its own wire dialect.
+fn authenticate(s: &AppState, headers: &HeaderMap) -> Result<AkInfo, (u16, &'static str)> {
     let ak = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
     let Some(ak) = ak else {
-        return Err(Box::new(error_response(
+        return Err((
             401,
             "missing api key (Authorization: Bearer <ak> or x-api-key)",
-        )));
+        ));
     };
     s.handler
         .state
         .auth
         .authenticate(ak)
-        .ok_or_else(|| Box::new(error_response(401, "invalid api key")))
+        .ok_or((401, "invalid api key"))
 }
 
 fn error_response(status: u16, message: impl Into<String>) -> Response {
@@ -398,14 +432,56 @@ fn error_response(status: u16, message: impl Into<String>) -> Response {
 
 fn gateway_error(e: GatewayError) -> Response {
     let code = StatusCode::from_u16(e.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    // OpenAI's error schema types `code` as string-or-null, never a number.
     (
         code,
-        Json(json!({ "error": { "message": e.message, "code": e.code.value(), "type": "gateway_error" } })),
+        Json(json!({ "error": { "message": e.message, "code": e.code.value().to_string(), "type": "gateway_error" } })),
     )
         .into_response()
 }
 
-static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+/// Anthropic's error type string for an HTTP status.
+fn anthropic_error_type(status: u16) -> &'static str {
+    match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
+        _ => "api_error",
+    }
+}
+
+/// Anthropic-shaped error body: `{"type":"error","error":{"type","message"}}` —
+/// the discriminator the Anthropic SDKs key their exception dispatch on.
+fn anthropic_error(status: u16, message: impl Into<String>) -> Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (
+        code,
+        Json(json!({
+            "type": "error",
+            "error": { "type": anthropic_error_type(status), "message": message.into() },
+        })),
+    )
+        .into_response()
+}
+
+fn anthropic_gateway_error(e: GatewayError) -> Response {
+    anthropic_error(e.http_status, e.message)
+}
+
+/// Run the pipeline on its own task so a client disconnect cannot cancel it
+/// mid-billing: once a request is admitted, quota/ledger accounting runs to
+/// completion even if the response can no longer be delivered.
+async fn run_pipeline(s: &AppState, request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
+    let handler = s.handler.clone();
+    match tokio::spawn(async move { handler.run(request, ak).await }).await {
+        Ok(res) => res,
+        Err(e) => Err(GatewayError::internal(format!("pipeline task failed: {e}"))),
+    }
+}
 
 fn next_id(prefix: &str) -> String {
     format!("{prefix}-local-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
@@ -441,7 +517,7 @@ async fn chat_completions(
     let started = Instant::now();
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err(resp) => return *resp,
+        Err((st, msg)) => return error_response(st, msg),
     };
     if body.messages.is_empty() {
         return error_response(400, "messages must not be empty");
@@ -501,7 +577,7 @@ async fn chat_completions(
         return chat_stream_response(s, request, ak, model, started).into_response();
     }
 
-    let ctx = match s.handler.run(request, ak).await {
+    let ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
         Err(e) => return gateway_error(e),
     };
@@ -640,6 +716,14 @@ fn chat_stream_response(
                             st.queue.push_back(Event::default().data(payload));
                         }
                     }
+                    if let Some(tc) = &c.tool_calls {
+                        let calls = tc.as_array().cloned().unwrap_or_default();
+                        let chunk =
+                            ChatCompletionChunk::tool_calls(&st.id, st.created, &st.model, calls);
+                        if let Ok(payload) = serde_json::to_string(&chunk) {
+                            st.queue.push_back(Event::default().data(payload));
+                        }
+                    }
                     if let Some(fr) = c.finish_reason {
                         // held back until usage arrives so the final frame carries both
                         st.pending_finish = Some(fr);
@@ -676,7 +760,7 @@ fn chat_stream_response(
 }
 
 /// Chunks for engines that returned a buffered response: the full message as
-/// one delta plus a finish marker.
+/// one delta plus tool calls and a finish marker.
 fn synth_chunks(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
     let mut chunks = if outcome.chunks.is_empty() && !outcome.response.message.is_empty() {
         vec![gw_engines::StreamChunk {
@@ -686,6 +770,14 @@ fn synth_chunks(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamCh
     } else {
         outcome.chunks.clone()
     };
+    if let Some(tc) = &outcome.response.tool_calls
+        && !chunks.iter().any(|c| c.tool_calls.is_some())
+    {
+        chunks.push(gw_engines::StreamChunk {
+            tool_calls: Some(tc.clone()),
+            ..Default::default()
+        });
+    }
     if !chunks.iter().any(|c| c.finish_reason.is_some()) {
         chunks.push(gw_engines::StreamChunk {
             finish_reason: Some(if outcome.response.finish_reason.is_empty() {
@@ -708,10 +800,10 @@ async fn messages(
     let started = Instant::now();
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err(resp) => return *resp,
+        Err((st, msg)) => return anthropic_error(st, msg),
     };
     if body.messages.is_empty() {
-        return error_response(400, "messages must not be empty");
+        return anthropic_error(400, "messages must not be empty");
     }
 
     let typed = TypedParams::Chat(ChatParams {
@@ -752,13 +844,23 @@ async fn messages(
         ..Default::default()
     };
 
-    let ctx = match s.handler.run(request, ak).await {
+    let ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
-        Err(e) => return gateway_error(e),
+        Err(e) => return anthropic_gateway_error(e),
     };
     log_access("messages", &ctx, started);
     let Some(outcome) = ctx.outcome else {
-        return error_response(500, "pipeline produced no outcome");
+        return anthropic_error(500, "pipeline produced no outcome");
+    };
+
+    // tool_use blocks the engine produced (anthropic wire shape).
+    let tool_use: Vec<Value> = match &outcome.response.tool_calls {
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
     };
 
     // Streaming: standard anthropic event sequence (message_start → ... → message_stop)
@@ -784,6 +886,7 @@ async fn messages(
             &id,
             &outcome.response.model,
             &deltas,
+            &tool_use,
             &stop,
             &usage,
         )
@@ -801,16 +904,12 @@ async fn messages(
             text: outcome.response.message.clone(),
         });
     }
-    if let Some(Value::Array(blocks)) = &outcome.response.tool_calls {
-        for b in blocks {
-            if b["type"] == "tool_use" {
-                content.push(gw_protocol::anthropic::ContentBlock::ToolUse {
-                    id: b["id"].as_str().unwrap_or_default().to_owned(),
-                    name: b["name"].as_str().unwrap_or_default().to_owned(),
-                    input: b["input"].clone(),
-                });
-            }
-        }
+    for b in &tool_use {
+        content.push(gw_protocol::anthropic::ContentBlock::ToolUse {
+            id: b["id"].as_str().unwrap_or_default().to_owned(),
+            name: b["name"].as_str().unwrap_or_default().to_owned(),
+            input: b["input"].clone(),
+        });
     }
     let resp = MessagesResponse::new(
         next_id("msg"),
@@ -842,7 +941,7 @@ async fn run_family(
         model_param_v2: Some(param),
         ..Default::default()
     };
-    match s.handler.run(request, ak).await {
+    match run_pipeline(s, request, ak).await {
         Ok(ctx) => Ok(ctx),
         Err(e) => Err(gateway_error(e)),
     }
@@ -860,7 +959,7 @@ async fn completions(
     let started = Instant::now();
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err(resp) => return *resp,
+        Err((st, msg)) => return error_response(st, msg),
     };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     // prompt: string or [string] (OpenAI accepts both).
@@ -890,7 +989,7 @@ async fn completions(
         model_param_v2: Some(param),
         ..Default::default()
     };
-    let ctx = match s.handler.run(request, ak).await {
+    let ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
         Err(e) => return gateway_error(e),
     };
@@ -930,7 +1029,7 @@ async fn responses(
     let started = Instant::now();
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err(resp) => return *resp,
+        Err((st, msg)) => return error_response(st, msg),
     };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     if model.is_empty() {
@@ -951,7 +1050,7 @@ async fn responses(
         model_param_v2: Some(param),
         ..Default::default()
     };
-    let ctx = match s.handler.run(request, ak).await {
+    let ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
         Err(e) => return gateway_error(e),
     };
@@ -1032,7 +1131,7 @@ async fn embeddings(
     let started = Instant::now();
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err(resp) => return *resp,
+        Err((st, msg)) => return error_response(st, msg),
     };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     let input: Vec<String> = match &body["input"] {
@@ -1048,7 +1147,7 @@ async fn embeddings(
     }
     let typed = TypedParams::Embeddings(EmbeddingParams {
         input,
-        dimensions: None,
+        dimensions: body["dimensions"].as_i64(),
     });
     let ctx = match run_family(&s, ak, model, typed, vec![]).await {
         Ok(ctx) => ctx,
@@ -1074,7 +1173,7 @@ async fn images_generations(
     let started = Instant::now();
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err(resp) => return *resp,
+        Err((st, msg)) => return error_response(st, msg),
     };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     let prompt = body["prompt"].as_str().unwrap_or_default().to_owned();
@@ -1109,7 +1208,7 @@ async fn images_edits(
     let started = Instant::now();
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err(resp) => return *resp,
+        Err((st, msg)) => return error_response(st, msg),
     };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     let prompt = body["prompt"].as_str().unwrap_or_default().to_owned();
@@ -1144,17 +1243,18 @@ async fn audio_speech(
     let started = Instant::now();
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err(resp) => return *resp,
+        Err((st, msg)) => return error_response(st, msg),
     };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     let input = body["input"].as_str().unwrap_or_default().to_owned();
     if model.is_empty() || input.is_empty() {
         return error_response(400, "model and input are required");
     }
+    let format = body["response_format"].as_str().unwrap_or("mp3").to_owned();
     let typed = TypedParams::AudioTts(TtsParams {
         input,
         voice: body["voice"].as_str().map(str::to_owned),
-        response_format: body["response_format"].as_str().map(str::to_owned),
+        response_format: Some(format.clone()),
     });
     let ctx = match run_family(&s, ak, model, typed, vec![]).await {
         Ok(ctx) => ctx,
@@ -1168,8 +1268,16 @@ async fn audio_speech(
     else {
         return error_response(500, "tts engine returned no audio");
     };
+    let content_type = match format.as_str() {
+        "wav" => "audio/wav",
+        "pcm" => "audio/pcm",
+        "opus" => "audio/opus",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        _ => "audio/mpeg",
+    };
     match base64::engine::general_purpose::STANDARD.decode(&b64) {
-        Ok(bytes) => (StatusCode::OK, [("content-type", "audio/mpeg")], bytes).into_response(),
+        Ok(bytes) => (StatusCode::OK, [("content-type", content_type)], bytes).into_response(),
         Err(e) => error_response(500, format!("bad audio payload: {e}")),
     }
 }
@@ -1184,7 +1292,7 @@ async fn audio_transcriptions(
     let started = Instant::now();
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err(resp) => return *resp,
+        Err((st, msg)) => return error_response(st, msg),
     };
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     let audio = body["audio_b64"].as_str().unwrap_or_default().to_owned();
@@ -1231,7 +1339,7 @@ async fn batches_submit(
 ) -> Response {
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
-        Err(resp) => return *resp,
+        Err((st, msg)) => return error_response(st, msg),
     };
     let mut model = body["model"].as_str().unwrap_or_default().to_owned();
     let mut batch_items = Vec::new();
@@ -1294,8 +1402,8 @@ async fn files_upload(
     Json(body): Json<Value>,
 ) -> Response {
     // gate on a valid AK (the file store isn't AK-scoped in this local subset).
-    if let Err(resp) = authenticate(&s, &headers) {
-        return *resp;
+    if let Err((st, msg)) = authenticate(&s, &headers) {
+        return error_response(st, msg);
     }
     let purpose = body["purpose"].as_str().unwrap_or("batch").to_owned();
     let Some(content) = body["file"].as_str() else {
@@ -1325,7 +1433,15 @@ async fn files_upload(
 }
 
 /// GET /v1/files/{id} (file metadata).
-async fn files_get(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+async fn files_get(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    // ids are sequential — without auth any client could enumerate all files.
+    if let Err((st, msg)) = authenticate(&s, &headers) {
+        return error_response(st, msg);
+    }
     match s.handler.state.store.file_get(&id).await {
         Ok(Some(f)) => (
             StatusCode::OK,
@@ -1338,7 +1454,14 @@ async fn files_get(State(s): State<AppState>, Path(id): Path<String>) -> Respons
 }
 
 /// GET /v1/files/{id}/content (download raw content: batch output, etc).
-async fn files_content(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+async fn files_content(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err((st, msg)) = authenticate(&s, &headers) {
+        return error_response(st, msg);
+    }
     match s.handler.state.store.file_get(&id).await {
         Ok(Some(f)) => (StatusCode::OK, f.content).into_response(),
         Ok(None) => error_response(404, format!("file {id} not found")),
@@ -1347,7 +1470,14 @@ async fn files_content(State(s): State<AppState>, Path(id): Path<String>) -> Res
 }
 
 /// GET /v1/batches/{id}
-async fn batches_get(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+async fn batches_get(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err((st, msg)) = authenticate(&s, &headers) {
+        return error_response(st, msg);
+    }
     match s.handler.state.store.batch_get(&id).await {
         Ok(Some(job)) => (StatusCode::OK, Json(json!(job))).into_response(),
         Ok(None) => error_response(404, format!("batch {id} not found")),

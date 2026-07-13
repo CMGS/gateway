@@ -58,8 +58,14 @@ impl OfflineHandler {
                     )),
                     ..Default::default()
                 };
-                let result = match this.online.run(request, ak.clone()).await {
-                    Ok(ctx) => match ctx.outcome {
+                // Each item runs on its own task so a panic inside the pipeline
+                // fails that item instead of unwinding past the terminal
+                // status write and wedging the batch in Running forever.
+                let online = this.online.clone();
+                let item_ak = ak.clone();
+                let ran = tokio::spawn(async move { online.run(request, item_ak).await }).await;
+                let result = match ran {
+                    Ok(Ok(ctx)) => match ctx.outcome {
                         Some(out) => BatchItemResult {
                             index,
                             ok: true,
@@ -73,10 +79,16 @@ impl OfflineHandler {
                             total_tokens: 0,
                         },
                     },
-                    Err(e) => BatchItemResult {
+                    Ok(Err(e)) => BatchItemResult {
                         index,
                         ok: false,
                         message: e.to_string(),
+                        total_tokens: 0,
+                    },
+                    Err(join_err) => BatchItemResult {
+                        index,
+                        ok: false,
+                        message: format!("item task failed: {join_err}"),
                         total_tokens: 0,
                     },
                 };

@@ -28,7 +28,7 @@ impl ErrCode {
     pub const DB_READ: ErrCode = ErrCode(2001);
     pub const RPC: ErrCode = ErrCode(2002);
     pub const ID_GEN: ErrCode = ErrCode(2003);
-    pub const INTERNAL_UNKNOWN: ErrCode = ErrCode(2003);
+    pub const INTERNAL_UNKNOWN: ErrCode = ErrCode(2011);
     pub const BUILD_REQ: ErrCode = ErrCode(2004);
     pub const FED_RESP_UNKNOWN: ErrCode = ErrCode(2005);
     pub const FED_RESP_RPC_FAILED: ErrCode = ErrCode(2006);

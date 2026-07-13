@@ -43,19 +43,21 @@ pub fn extract_common_usage(raw: &[u8], messages_protocol: bool) -> Option<Commo
         }
     } else {
         // OpenAI: prompt/completion/total (+ details)
-        let prompt = get(&v, &["prompt_tokens"]);
-        let completion = get(&v, &["completion_tokens"]);
+        let prompt = get(&v, &["prompt_tokens"]).max(0);
+        let completion = get(&v, &["completion_tokens"]).max(0);
         let total = get(&v, &["total_tokens"]);
-        let read_cache = get(&v, &["prompt_tokens_details", "cached_tokens"]);
-        let reason = get(&v, &["completion_tokens_details", "reasoning_tokens"]);
+        // cached ⊆ prompt and reasoning ⊆ completion by the vendor contract,
+        // but never trust upstream: cap the parts so malformed usage can't go
+        // negative or make the parts sum past the vendor's own totals
+        // (billing recomputes the total from these parts).
+        let read_cache = get(&v, &["prompt_tokens_details", "cached_tokens"]).clamp(0, prompt);
+        let reason =
+            get(&v, &["completion_tokens_details", "reasoning_tokens"]).clamp(0, completion);
         CommonUsage {
-            // cached ⊆ prompt and reasoning ⊆ completion by the vendor contract,
-            // but never trust upstream: clamp so malformed usage can't emit
-            // negative token counts (→ negative billing).
-            platform_input: (prompt - read_cache).max(0),
+            platform_input: prompt - read_cache,
             read_cache,
             write_cache: 0,
-            completion: (completion - reason).max(0),
+            completion: completion - reason,
             reason,
             platform_total: if total > 0 {
                 total
@@ -84,17 +86,23 @@ mod tests {
     }
 
     #[test]
-    fn malformed_usage_never_bills_negative() {
+    fn malformed_usage_never_bills_negative_or_inflated() {
         // vendor contract violation: more cached than prompt, more reasoning than
-        // completion. Must clamp to 0, not emit negative token counts.
+        // completion. Parts must clamp so nothing goes negative AND the parts
+        // sum to the vendor totals — billing recomputes the total from them.
         let raw = br#"{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,
             "prompt_tokens_details":{"cached_tokens":9},
             "completion_tokens_details":{"reasoning_tokens":9}}"#;
         let u = extract_common_usage(raw, false).unwrap();
         assert_eq!(u.platform_input, 0, "clamped, not negative");
         assert_eq!(u.completion, 0, "clamped, not negative");
-        assert_eq!(u.read_cache, 9);
-        assert_eq!(u.reason, 9);
+        assert_eq!(u.read_cache, 3, "capped at prompt_tokens");
+        assert_eq!(u.reason, 2, "capped at completion_tokens");
+        assert_eq!(
+            u.platform_input + u.read_cache + u.write_cache + u.completion + u.reason,
+            5,
+            "parts sum to the vendor total — no overbilling"
+        );
     }
 
     #[test]

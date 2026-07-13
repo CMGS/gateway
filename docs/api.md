@@ -10,7 +10,14 @@ x-api-key: <ak>
 A missing or unknown key is `401`. Errors use a consistent envelope:
 
 ```json
-{"error": {"message": "...", "code": 3002, "type": "gateway_error"}}
+{"error": {"message": "...", "code": "3002", "type": "gateway_error"}}
+```
+
+The Anthropic-compatible surface (`/v1/messages`) instead emits Anthropic's
+error shape, so its SDKs can dispatch on it:
+
+```json
+{"type": "error", "error": {"type": "invalid_request_error", "message": "..."}}
 ```
 
 ## OpenAI-compatible
@@ -80,3 +87,7 @@ upstream is not implemented yet.
 | GET | `/metrics` | Prometheus registry (see [Observability](observability.md)) |
 | GET | `/internal/ledger` | billing records; `?limit=N` pages (newest first, `count` is the total) |
 | GET | `/internal/accounts` | account pool view with health |
+
+`/internal/*` is an operator surface: keep it off the public load balancer
+(the sample nginx config in [multi-instance](multi-instance.md) restricts it
+to the operator network).

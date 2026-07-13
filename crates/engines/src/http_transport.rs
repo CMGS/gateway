@@ -3,8 +3,8 @@
 //! Engines address accounts without a configured endpoint via `mock://` sentinel
 //! URLs. [`DispatchTransport`] — the server default — keeps those in-process
 //! ([`MockTransport`]) and sends real URLs over HTTP, so going live is purely an
-//! account-config change. Buffered SSE for now — incremental forwarding is
-//! future work.
+//! account-config change. SSE responses come back as a live byte stream;
+//! engines decode incrementally or drain via `UpstreamResponse::buffered`.
 
 use std::collections::HashMap;
 use std::time::Duration;
