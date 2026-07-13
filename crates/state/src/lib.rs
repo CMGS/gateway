@@ -13,11 +13,13 @@ use gw_config::GatewayConfig;
 use gw_consts::Protocol;
 use gw_models::Account;
 
+pub mod configstore;
 pub mod governance;
 pub mod health;
 pub mod keystore;
 pub mod store;
 
+pub use configstore::{CONFIG_CHANNEL, PostgresConfigStore};
 pub use governance::{Governance, MemoryGovernance, RedisGovernance};
 pub use health::{HealthStore, RedisHealth};
 pub use keystore::{KeyStore, PostgresKeyStore};

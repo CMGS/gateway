@@ -58,7 +58,11 @@ static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Produces a fresh `GatewayConfig` from the config source (file or embedded),
 /// so a reload re-reads what's on disk. Errors are returned as a message.
-pub type ConfigLoader = Arc<dyn Fn() -> Result<GatewayConfig, String> + Send + Sync>;
+/// A boxed future resolving to a freshly loaded config.
+pub type ConfigFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<GatewayConfig, String>> + Send>>;
+/// Reloads config from its source (file or the Postgres config store).
+pub type ConfigLoader = Arc<dyn Fn() -> ConfigFuture + Send + Sync>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -66,6 +70,8 @@ pub struct AppState {
     pub offline: OfflineHandler,
     /// Reloads config from its source; `None` = reload not wired (tests).
     pub loader: Option<ConfigLoader>,
+    /// Fleet config store; enables `PUT /admin/config`. `None` = file-based.
+    pub config_store: Option<Arc<gw_state::PostgresConfigStore>>,
 }
 
 impl AppState {
@@ -88,7 +94,14 @@ impl AppState {
             handler,
             offline,
             loader,
+            config_store: None,
         }
+    }
+
+    /// Attach the fleet config store (enables `PUT /admin/config`).
+    pub fn with_config_store(mut self, store: Arc<gw_state::PostgresConfigStore>) -> Self {
+        self.config_store = Some(store);
+        self
     }
 
     /// Reload config from source and atomically swap it in (derived state
@@ -96,7 +109,7 @@ impl AppState {
     /// URLs) need a restart and are ignored here.
     pub async fn reload(&self) -> Result<(), String> {
         let loader = self.loader.as_ref().ok_or("reload not configured")?;
-        let cfg = loader()?;
+        let cfg = loader().await?;
         self.handler
             .config
             .reload(cfg)
@@ -128,6 +141,7 @@ pub fn app(state: AppState) -> Router {
         .route("/internal/ledger", get(ledger))
         .route("/internal/accounts", get(accounts))
         .route("/admin/reload", post(admin_reload))
+        .route("/admin/config", axum::routing::put(admin_config_put))
         .route("/admin/keys", post(admin_key_create).get(admin_key_list))
         .route("/admin/usage", get(admin_usage))
         .route(
@@ -921,6 +935,44 @@ async fn admin_key_delete(
         )
             .into_response(),
         Ok(false) => error_response(404, format!("key {ak} not found")),
+    }
+}
+
+/// PUT /admin/config — validate and publish a new config document to the
+/// fleet config store, then reload this instance immediately (peers converge
+/// via the store's change feed). Global admin only; requires the Postgres
+/// config store.
+async fn admin_config_put(State(s): State<AppState>, headers: HeaderMap, body: String) -> Response {
+    match admin_auth(&s, &headers) {
+        Ok(AdminScope::Global) => {}
+        Ok(AdminScope::Tenant(_)) => {
+            return error_response(403, "config publish requires the global admin token");
+        }
+        Err((st, msg)) => return error_response(st, msg),
+    }
+    let Some(store) = &s.config_store else {
+        return error_response(
+            400,
+            "config store not configured (set storage.postgres_url)",
+        );
+    };
+    if let Err(e) = GatewayConfig::from_yaml(&body) {
+        return error_response(400, format!("invalid config: {e}"));
+    }
+    let version = match store.publish(&body).await {
+        Ok(v) => v,
+        Err(e) => return gateway_error(e),
+    };
+    match s.reload().await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "status": "published", "version": version })),
+        )
+            .into_response(),
+        Err(e) => error_response(
+            500,
+            format!("published v{version} but local reload failed: {e}"),
+        ),
     }
 }
 

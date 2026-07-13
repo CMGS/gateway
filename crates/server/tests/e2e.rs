@@ -56,8 +56,11 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
     unsafe { std::env::set_var("GW_TEST_ADMIN_TOKEN_E2E", "s3cret") };
     let v1 = GatewayConfig::from_yaml(V1).unwrap();
     let v2_yaml = V1.replace("ak-v1", "ak-v2");
-    let loader: gw_views::ConfigLoader =
-        Arc::new(move || GatewayConfig::from_yaml(&v2_yaml).map_err(|e| e.to_string()));
+    let loader: gw_views::ConfigLoader = Arc::new(move || {
+        let yaml = v2_yaml.clone();
+        Box::pin(async move { GatewayConfig::from_yaml(&yaml).map_err(|e| e.to_string()) })
+            as gw_views::ConfigFuture
+    });
     let state = Arc::new(GatewayState::from_config(&v1));
     let shared = gw_state::SharedConfig::new(Arc::new(v1), state);
     let app = gw_views::app(gw_views::AppState::with_config(

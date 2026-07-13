@@ -1,0 +1,133 @@
+//! Fleet-shared config source of truth: versioned YAML documents in Postgres.
+//! A publish inserts a new version and fires a `gw_config` NOTIFY, so every
+//! instance's listener reloads without a per-instance SIGHUP.
+
+use sqlx::Row;
+
+use gw_models::{GResult, GatewayError};
+
+/// Superseded versions kept for operator inspection/rollback.
+const KEEP_VERSIONS: i64 = 20;
+
+/// The Postgres NOTIFY channel a publish fires on (payload = version id).
+pub const CONFIG_CHANNEL: &str = "gw_config";
+
+/// Versioned gateway config in Postgres — the source of truth when
+/// `storage.postgres_url` is set (the local file only seeds an empty store).
+#[derive(Debug)]
+pub struct PostgresConfigStore {
+    pool: sqlx::PgPool,
+}
+
+impl PostgresConfigStore {
+    pub async fn connect(url: &str) -> GResult<Self> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect(url)
+            .await
+            .map_err(|e| cfg_err("connect postgres config store", e))?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS gw_config (
+                id BIGSERIAL PRIMARY KEY,
+                yaml TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| cfg_err("create gw_config schema", e))?;
+        Ok(Self { pool })
+    }
+
+    /// The latest published config document; `None` on a fresh store.
+    pub async fn load_latest(&self) -> GResult<Option<(i64, String)>> {
+        let row = sqlx::query("SELECT id, yaml FROM gw_config ORDER BY id DESC LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| cfg_err("read latest config", e))?;
+        Ok(row.map(|r| (r.get(0), r.get(1))))
+    }
+
+    /// Store a new version and notify every listening instance. The caller
+    /// validates the YAML first — the store never holds an unparsable config.
+    pub async fn publish(&self, yaml: &str) -> GResult<i64> {
+        let id: i64 = sqlx::query_scalar(
+            "WITH ins AS (INSERT INTO gw_config (yaml) VALUES ($1) RETURNING id)
+             SELECT id FROM ins, pg_notify($2, ins.id::text)",
+        )
+        .bind(yaml)
+        .bind(CONFIG_CHANNEL)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| cfg_err("publish config", e))?;
+        sqlx::query("DELETE FROM gw_config WHERE id <= (SELECT MAX(id) FROM gw_config) - $1")
+            .bind(KEEP_VERSIONS)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| cfg_err("prune config versions", e))?;
+        Ok(id)
+    }
+}
+
+/// Subscribe to the config change feed: yields each published version id.
+/// The channel closes when the Postgres connection drops — the caller loops
+/// and re-subscribes (missed versions don't matter; a reload reads latest).
+pub async fn subscribe(url: &str) -> GResult<tokio::sync::mpsc::Receiver<i64>> {
+    let mut listener = sqlx::postgres::PgListener::connect(url)
+        .await
+        .map_err(|e| cfg_err("connect config listener", e))?;
+    listener
+        .listen(CONFIG_CHANNEL)
+        .await
+        .map_err(|e| cfg_err("listen on config channel", e))?;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        loop {
+            match listener.recv().await {
+                Ok(n) => {
+                    let version = n.payload().parse().unwrap_or(0);
+                    if tx.send(version).await.is_err() {
+                        return; // subscriber gone
+                    }
+                }
+                Err(_) => return, // connection dropped; closing tx signals resubscribe
+            }
+        }
+    });
+    Ok(rx)
+}
+
+fn cfg_err(what: &str, e: sqlx::Error) -> GatewayError {
+    GatewayError::internal(what).with_source(e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Set GW_TEST_PG_URL (e.g. postgres://postgres:gwtest@127.0.0.1:15432/gw)
+    /// to run this.
+    #[tokio::test]
+    async fn publish_notifies_and_load_returns_latest() {
+        let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
+            return;
+        };
+        let store = PostgresConfigStore::connect(&url).await.expect("connect");
+
+        let mut listener = sqlx::postgres::PgListener::connect(&url)
+            .await
+            .expect("listener");
+        listener.listen(CONFIG_CHANNEL).await.expect("listen");
+
+        let v1 = store.publish("listen: {host: a, port: 1}").await.unwrap();
+        let v2 = store.publish("listen: {host: b, port: 2}").await.unwrap();
+        assert!(v2 > v1);
+        let (id, yaml) = store.load_latest().await.unwrap().expect("latest");
+        assert_eq!(id, v2);
+        assert!(yaml.contains("host: b"));
+
+        // the publish reached the change feed with the version id as payload
+        let n = listener.recv().await.expect("notify");
+        assert_eq!(n.channel(), CONFIG_CHANNEL);
+        assert_eq!(n.payload(), v1.to_string());
+    }
+}
