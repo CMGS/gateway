@@ -38,16 +38,17 @@ impl OfflineHandler {
         items: Vec<BatchItem>,
     ) -> gw_models::GResult<BatchJob> {
         let store = self.online.state().store.clone();
-        let job = store.batch_create(&ak.ak, &model, items.len()).await?;
         let msgs: Vec<Vec<ChatMsg>> = items.into_iter().map(|i| i.messages).collect();
         if store.distributed_batches() {
-            store.batch_save_items(&job.id, &msgs).await?;
+            // atomic: the job becomes claimable only once all items are saved
+            store.batch_enqueue(&ak.ak, &model, &msgs).await
         } else {
+            let job = store.batch_create(&ak.ak, &model, msgs.len()).await?;
             let this = self.clone();
             let (id, model) = (job.id.clone(), model.clone());
             tokio::spawn(async move { this.execute(&id, &ak, &model, msgs).await });
+            Ok(job)
         }
-        Ok(job)
     }
 
     /// Run every item of a claimed/submitted batch through the online DAG,
@@ -58,8 +59,28 @@ impl OfflineHandler {
         if let Err(e) = store.batch_set_status(id, BatchStatus::Running).await {
             tracing::error!(error = %e, batch = %id, "batch status write failed");
         }
+        // resume past items already recorded by a prior (crashed) executor, so
+        // a reclaim re-runs and re-bills at most the one item that was in flight
+        let done_indices = store.batch_result_indices(id).await.unwrap_or_default();
+        // heartbeat claimed_at while items run so a slow item isn't judged
+        // stale and reclaimed by another instance mid-execution
+        let hb = {
+            let store = store.clone();
+            let id = id.to_owned();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let _ = store.batch_touch(&id).await;
+                }
+            })
+        };
         let mut any_fail = false;
         for (index, messages) in items.into_iter().enumerate() {
+            if done_indices.contains(&index) {
+                continue; // already executed and billed before the reclaim
+            }
             let request = GatewayRequest {
                 is_online: false,
                 ak: ak.ak.clone(),
@@ -107,8 +128,8 @@ impl OfflineHandler {
             if let Err(e) = store.batch_push_result(id, result).await {
                 tracing::error!(error = %e, batch = %id, "batch result write failed");
             }
-            let _ = store.batch_touch(id).await;
         }
+        hb.abort();
         let done = if any_fail {
             BatchStatus::Failed
         } else {

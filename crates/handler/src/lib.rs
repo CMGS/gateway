@@ -416,4 +416,69 @@ mod tests {
             2
         );
     }
+
+    /// Set GW_TEST_PG_URL to run: a batch submitted on one handler is claimed,
+    /// executed, and billed by a separate drain loop (the distributed path).
+    #[tokio::test]
+    async fn distributed_batch_drained_by_a_separate_handler() {
+        let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
+            return;
+        };
+        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        let mut st = GatewayState::from_config(&cfg);
+        st.store = Arc::new(
+            gw_state::PostgresStore::connect(&url)
+                .await
+                .expect("pg store"),
+        );
+        let state = Arc::new(st);
+        let online = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state.clone()),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let submitter = OfflineHandler::new(online.clone());
+        let ak = state.auth.authenticate("ak-demo-123").await.unwrap();
+
+        assert!(state.store.distributed_batches());
+        let job = submitter
+            .submit(
+                ak,
+                "gpt-4o-mini".into(),
+                vec![
+                    BatchItem {
+                        messages: vec![ChatMsg::text("user", "alpha")],
+                    },
+                    BatchItem {
+                        messages: vec![ChatMsg::text("user", "beta")],
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        // submit only persisted; no local execution ran it yet
+        let pending = state.store.batch_get(&job.id).await.unwrap().unwrap();
+        assert_eq!(pending.status, gw_state::BatchStatus::Pending);
+
+        // a separate drain loop claims and executes it
+        let drainer = OfflineHandler::new(online);
+        let drain = tokio::spawn(async move {
+            drainer
+                .drain_forever(120, std::time::Duration::from_millis(50))
+                .await
+        });
+        let mut completed = None;
+        for _ in 0..200 {
+            if let Some(j) = state.store.batch_get(&job.id).await.unwrap()
+                && matches!(j.status, gw_state::BatchStatus::Completed)
+            {
+                completed = Some(j);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drain.abort();
+        let j = completed.expect("drain completed the batch");
+        assert_eq!(j.results.len(), 2, "both items executed exactly once");
+        assert!(j.results.iter().all(|r| r.ok && r.total_tokens > 0));
+    }
 }

@@ -12,7 +12,7 @@ shared, what stays local, and what the LB needs to do.
 | Config: keys/models/providers/tenants (`ConfigStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — versioned documents + a change feed |
 | Access-key table (`KeyStore`) | Postgres (`storage.postgres_url`) | ✅ when Postgres is set — admin key CRUD is fleet-wide within ~2s and survives restarts |
 | Billing ledger / files / batches (`Store`) | Postgres (`storage.postgres_url`), else SQLite | ✅ with Postgres; SQLite stays per-node |
-| Request cache | in-process (moka) | ❌ per-instance (a miss just recomputes) |
+| Request cache | in-process (moka), or Redis with `shared_cache: true` | ⚠️ per-instance by default; fleet-shared when `shared_cache` is set |
 
 **A correct fleet = one Postgres (`storage.postgres_url`) + one Redis
 (`storage.redis_url`) shared by every instance.** Without them each instance

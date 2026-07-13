@@ -43,6 +43,8 @@ pub enum ConfigError {
     UnknownQuotaModel { owner: String, model: String },
     #[error("tenant `{tenant}` fallback model `{model}` is unknown or not entitled")]
     BadFallbackModel { tenant: String, model: String },
+    #[error("storage.shared_cache needs storage.redis_url")]
+    SharedCacheNeedsRedis,
 }
 
 /// Build a name → slot-index map for O(1) lookups.
@@ -525,6 +527,9 @@ impl GatewayConfig {
 
     /// Every wire string must resolve to a known Protocol up front.
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.storage.shared_cache && self.storage.redis_url.is_empty() {
+            return Err(ConfigError::SharedCacheNeedsRedis);
+        }
         for m in &self.models {
             if m.protocol().is_none() {
                 return Err(ConfigError::UnknownModelMapping {
@@ -899,6 +904,18 @@ tenants: [{name: t1, models: [m1], fallback_model: m2}]
             GatewayConfig::from_yaml(bad_fallback),
             Err(ConfigError::BadFallbackModel { .. })
         ));
+    }
+
+    #[test]
+    fn shared_cache_requires_redis() {
+        let bad = "listen: {host: h, port: 1}\nstorage: {shared_cache: true}";
+        assert!(matches!(
+            GatewayConfig::from_yaml(bad),
+            Err(ConfigError::SharedCacheNeedsRedis)
+        ));
+        let ok =
+            "listen: {host: h, port: 1}\nstorage: {shared_cache: true, redis_url: 'redis://x'}";
+        assert!(GatewayConfig::from_yaml(ok).is_ok());
     }
 
     #[test]

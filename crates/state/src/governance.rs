@@ -156,6 +156,37 @@ impl RedisGovernance {
     }
 }
 
+/// Apply a settle delta and floor the counter at 0 in one atomic step, so a
+/// key reset or window rollover between reserve and settle can't plant a
+/// negative value that over-admits. Preserves an existing TTL, or arms one
+/// when `window` is given and the key was absent.
+async fn settle_floored(
+    conn: &redis::aio::ConnectionManager,
+    key: &str,
+    delta: i64,
+    window: Option<Duration>,
+) {
+    let mut conn = conn.clone();
+    let script = redis::Script::new(
+        "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+         if v < 0 then redis.call('SET', KEYS[1], 0); v = 0 end
+         if ARGV[2] ~= '0' and redis.call('PTTL', KEYS[1]) < 0 then
+           redis.call('PEXPIRE', KEYS[1], ARGV[2])
+         end
+         return v",
+    );
+    let px = window.map(|w| w.as_millis() as i64).unwrap_or(0);
+    if let Err(e) = script
+        .key(key)
+        .arg(delta)
+        .arg(px)
+        .invoke_async::<i64>(&mut conn)
+        .await
+    {
+        tracing::warn!(error = %e, key, "redis settle failed");
+    }
+}
+
 #[async_trait]
 impl Governance for RedisGovernance {
     async fn rate_allow(&self, key: &str, qps: f64) -> bool {
@@ -218,12 +249,9 @@ impl Governance for RedisGovernance {
         if delta == 0 {
             return;
         }
-        let mut conn = self.conn.clone();
-        let _ = redis::cmd("INCRBY")
-            .arg(format!("gw:quota:{key}"))
-            .arg(delta)
-            .query_async::<i64>(&mut conn)
-            .await;
+        // floor at 0 atomically: a reset/rollover between reserve and settle
+        // must not leave a negative counter that over-admits.
+        settle_floored(&self.conn, &format!("gw:quota:{key}"), delta, None).await;
     }
     async fn quota_consume(&self, ak: &str, tokens: i64) {
         let mut conn = self.conn.clone();
@@ -311,8 +339,7 @@ impl Governance for RedisGovernance {
         if delta == 0 {
             return;
         }
-        self.incr_window(&format!("gw:tpm:{key}"), delta, window)
-            .await;
+        settle_floored(&self.conn, &format!("gw:tpm:{key}"), delta, Some(window)).await;
     }
     async fn token_window_add(&self, key: &str, tokens: i64, window: Duration) {
         self.incr_window(&format!("gw:tpm:{key}"), tokens, window)

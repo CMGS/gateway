@@ -423,8 +423,16 @@ fn is_response_create(payload: &[u8]) -> bool {
 /// provider so non-OpenAI vendors are metered instead of relayed for free.
 fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
     let usage = match provider {
-        // Gemini Live: `usageMetadata` rides server frames (notably turn-complete).
+        // Gemini Live: `usageMetadata` is cumulative and rides multiple server
+        // frames, so bill only the turn/generation-complete frame — otherwise a
+        // turn is billed once per interim frame.
         "google" | "gemini" | "vertex" => {
+            let sc = &frame["serverContent"];
+            let complete = sc["turnComplete"] == Value::Bool(true)
+                || sc["generationComplete"] == Value::Bool(true);
+            if !complete {
+                return None;
+            }
             let u = &frame["usageMetadata"];
             let it = u["promptTokenCount"].as_i64()?;
             let ot = u["responseTokenCount"]
@@ -2416,12 +2424,19 @@ mod tests {
             realtime_usage("openai", &json!({"type":"response.delta","delta":"hi"})),
             None
         );
-        // Gemini Live: usageMetadata (responseTokenCount, else candidatesTokenCount)
-        let g = json!({"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}});
+        // Gemini Live bills only the turn-complete frame (usageMetadata is cumulative)
+        let g = json!({"serverContent":{"turnComplete":true},"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}});
         assert_eq!(realtime_usage("gemini", &g), Some((5, 9)));
-        let g2 = json!({"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":7}});
+        let g2 = json!({"serverContent":{"generationComplete":true},"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":7}});
         assert_eq!(realtime_usage("google", &g2), Some((5, 7)));
-        // a Gemini frame without usageMetadata is not billed
+        // an interim Gemini frame carrying cumulative usage is NOT billed
+        assert_eq!(
+            realtime_usage(
+                "gemini",
+                &json!({"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}})
+            ),
+            None
+        );
         assert_eq!(realtime_usage("gemini", &json!({"serverContent":{}})), None);
         // zero usage never bills
         assert_eq!(

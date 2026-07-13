@@ -137,9 +137,21 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     fn distributed_batches(&self) -> bool {
         false
     }
-    /// Persist a batch's input items so another instance can execute them.
-    async fn batch_save_items(&self, _id: &str, _items: &[Vec<gw_models::ChatMsg>]) -> GResult<()> {
-        Ok(())
+    /// Atomically enqueue a batch and its items for the fleet drain loop, so a
+    /// partial save never leaves a claimable job with missing items. Local
+    /// stores fall back to a plain create (items execute in-process).
+    async fn batch_enqueue(
+        &self,
+        ak: &str,
+        model: &str,
+        items: &[Vec<gw_models::ChatMsg>],
+    ) -> GResult<BatchJob> {
+        self.batch_create(ak, model, items.len()).await
+    }
+    /// Result indices already recorded for a batch — the drain loop resumes
+    /// past them after a reclaim instead of re-running (and re-billing) them.
+    async fn batch_result_indices(&self, _id: &str) -> GResult<std::collections::HashSet<usize>> {
+        Ok(std::collections::HashSet::new())
     }
     /// Load a batch's input items for execution.
     async fn batch_load_items(&self, _id: &str) -> GResult<Vec<Vec<gw_models::ChatMsg>>> {
@@ -660,6 +672,8 @@ impl PostgresStore {
                 batch_id TEXT NOT NULL, idx BIGINT NOT NULL, messages TEXT NOT NULL,
                 PRIMARY KEY (batch_id, idx))",
             "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ",
+            "CREATE UNIQUE INDEX IF NOT EXISTS batch_results_uidx
+             ON batch_results (batch_id, idx)",
         ] {
             sqlx::query(ddl)
                 .execute(&pool)
@@ -875,7 +889,10 @@ impl Store for PostgresStore {
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
         sqlx::query(
             "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens)
-             VALUES ($1, $2, $3, $4, $5)",
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (batch_id, idx) DO UPDATE SET
+               ok = EXCLUDED.ok, message = EXCLUDED.message,
+               total_tokens = EXCLUDED.total_tokens",
         )
         .bind(id)
         .bind(result.index as i64)
@@ -892,18 +909,62 @@ impl Store for PostgresStore {
         true
     }
 
-    async fn batch_save_items(&self, id: &str, items: &[Vec<gw_models::ChatMsg>]) -> GResult<()> {
+    async fn batch_enqueue(
+        &self,
+        ak: &str,
+        model: &str,
+        items: &[Vec<gw_models::ChatMsg>],
+    ) -> GResult<BatchJob> {
+        // one transaction: the batch becomes claimable (pending) only once all
+        // its items are committed, so a partial save can't orphan a job.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("begin batch enqueue", e))?;
+        let id: String = sqlx::query_scalar(
+            "INSERT INTO batches (n, id, ak, model, status, total)
+             SELECT v, 'batch-' || v, $1, $2, $3, $4
+             FROM nextval(pg_get_serial_sequence('batches', 'n')) AS v
+             RETURNING id",
+        )
+        .bind(ak)
+        .bind(model)
+        .bind(BatchStatus::Pending.as_str())
+        .bind(items.len() as i64)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| crate::sqlx_err("insert batch", e))?;
         for (idx, msgs) in items.iter().enumerate() {
             let json = serde_json::to_string(msgs).unwrap_or_else(|_| "[]".into());
             sqlx::query("INSERT INTO batch_items (batch_id, idx, messages) VALUES ($1, $2, $3)")
-                .bind(id)
+                .bind(&id)
                 .bind(idx as i64)
                 .bind(json)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| crate::sqlx_err("save batch item", e))?;
         }
-        Ok(())
+        tx.commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit batch enqueue", e))?;
+        Ok(BatchJob {
+            id,
+            ak: ak.to_owned(),
+            model: model.to_owned(),
+            status: BatchStatus::Pending,
+            total: items.len(),
+            results: Vec::new(),
+        })
+    }
+
+    async fn batch_result_indices(&self, id: &str) -> GResult<std::collections::HashSet<usize>> {
+        let rows = sqlx::query("SELECT idx FROM batch_results WHERE batch_id = $1")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("read batch result indices", e))?;
+        Ok(rows.iter().map(|r| r.get::<i64, _>(0) as usize).collect())
     }
 
     async fn batch_load_items(&self, id: &str) -> GResult<Vec<Vec<gw_models::ChatMsg>>> {
@@ -1170,12 +1231,12 @@ mod tests {
 
         // distributed queue: save items, claim (loop to ours), requeue-on-stale
         assert!(store.distributed_batches());
-        let qjob = store.batch_create("ak-b", "gpt-4o", 2).await.unwrap();
         let qmsgs = vec![
             vec![gw_models::ChatMsg::text("user", "one")],
             vec![gw_models::ChatMsg::text("user", "two")],
         ];
-        store.batch_save_items(&qjob.id, &qmsgs).await.unwrap();
+        let qjob = store.batch_enqueue("ak-b", "gpt-4o", &qmsgs).await.unwrap();
+        assert_eq!(qjob.total, 2);
         loop {
             let c = store
                 .batch_claim_pending(120)

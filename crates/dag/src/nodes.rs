@@ -202,8 +202,12 @@ impl DagNode for CacheLookup {
 /// Completion tokens reserved when the caller sets no max_tokens; settle
 /// corrects to actuals, so the estimate only needs to be monotone.
 const DEFAULT_COMPLETION_RESERVE: i64 = 256;
+/// Cap on the reservation regardless of a caller's `max_tokens`, so a hostile
+/// `max_tokens: i64::MAX` can't overflow the estimate or corrupt the counter.
+const MAX_RESERVE: i64 = 1_000_000;
 
-/// Cheap admission estimate: ~chars/4 prompt heuristic + requested max_tokens.
+/// Cheap admission estimate: ~chars/4 prompt heuristic + requested max_tokens,
+/// saturating and capped so caller-controlled input can't wrap the counters.
 fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
     let prompt: usize = req.message.iter().map(|m| m.content.len()).sum();
     let max_out = req
@@ -213,8 +217,12 @@ fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
         .and_then(|t| match t {
             gw_models::TypedParams::Chat(c) => c.max_tokens,
             _ => None,
-        });
-    (prompt as i64 / 4).max(1) + max_out.unwrap_or(DEFAULT_COMPLETION_RESERVE)
+        })
+        .unwrap_or(DEFAULT_COMPLETION_RESERVE)
+        .clamp(0, MAX_RESERVE);
+    ((prompt as i64 / 4).max(1))
+        .saturating_add(max_out)
+        .min(MAX_RESERVE)
 }
 
 /// preprocess/quota_check: AK daily-quota admission. Reserves the estimate
@@ -855,4 +863,25 @@ fn model_provider(ctx: &DagContext) -> Option<String> {
         .as_ref()
         .map(|p| p.model_name.clone())?;
     ctx.cfg.find_model(&name).and_then(|m| m.provider.clone())
+}
+
+#[cfg(test)]
+mod nodes_tests {
+    #[test]
+    fn reserve_estimate_saturates_on_hostile_max_tokens() {
+        use gw_models::params::ChatParams;
+        use gw_models::{ChatMsg, GatewayRequest, ModelParamV2, TypedParams};
+        let mut param = ModelParamV2::with_name(gw_consts::Protocol::OpenaiChat, "m");
+        param.typed = Some(TypedParams::Chat(ChatParams {
+            max_tokens: Some(i64::MAX),
+            ..Default::default()
+        }));
+        let req = GatewayRequest {
+            message: vec![ChatMsg::text("user", "hello")],
+            model_param_v2: Some(param),
+            ..Default::default()
+        };
+        let est = super::reserve_estimate(&req);
+        assert!(est > 0 && est <= super::MAX_RESERVE);
+    }
 }

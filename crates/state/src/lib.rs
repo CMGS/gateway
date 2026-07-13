@@ -1109,6 +1109,24 @@ mod tests {
         assert!(c.get(&key).await.is_none(), "TTL expires");
     }
 
+    #[tokio::test]
+    async fn build_selects_sqlite_store_and_seeds_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let yaml = format!(
+            "listen: {{host: h, port: 1}}\nstorage: {{sqlite_path: '{}'}}\naccess_keys: [{{ak: k1, product: p, qps: 1, daily_token_quota: 10}}]",
+            path.to_str().unwrap()
+        );
+        let cfg = GatewayConfig::from_yaml(&yaml).unwrap();
+        let st = GatewayState::build(&cfg).await.unwrap();
+        // config keys seeded into the in-memory table (no postgres)
+        assert!(st.auth.authenticate("k1").await.is_some());
+        // sqlite store selected and durable
+        let f = st.store.file_put("batch", "x".into()).await.unwrap();
+        assert!(st.store.file_get(&f.id).await.unwrap().is_some());
+        assert!(!st.store.distributed_batches());
+    }
+
     #[test]
     fn key_status_lifecycle() {
         let mut info = AkInfo {
