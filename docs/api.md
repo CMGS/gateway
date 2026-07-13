@@ -74,10 +74,16 @@ billing all apply per item).
 
 ## Realtime
 
-`GET /v1/realtime` upgrades to a WebSocket. Auth via header or `?ak=<key>`;
-select the model with `?model=<name>` (must be a realtime-family model). The
-local session mirrors the OpenAI Realtime event shape; bridging to a real
-upstream is not implemented yet.
+`GET /v1/realtime` upgrades to a WebSocket; select the model with
+`?model=<name>` (must be a realtime-family model). Authenticate with an
+`Authorization: Bearer <ak>` header, or — for browser clients that cannot set
+headers — a `gw-api-key.<ak>` entry in the `Sec-WebSocket-Protocol` list.
+
+A realtime model bound to an account with a real `endpoint` bridges the session
+to that vendor's realtime WebSocket: a transparent relay, with the gateway
+still enforcing auth, per-generation rate/quota limits, and billing from the
+vendor's usage. An endpoint-less account serves a local mock session (OpenAI
+Realtime event shape) for offline development.
 
 ## Introspection
 

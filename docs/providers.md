@@ -22,9 +22,9 @@ models:
 
 | kind | base URL | protocols | auth |
 |------|----------|-----------|------|
-| `openai` | `https://api.openai.com` | chat, embeddings, image, tts, stt, responses, completions | `Bearer` |
+| `openai` | `https://api.openai.com` | chat, embeddings, image, tts, stt, responses, completions, realtime | `Bearer` |
 | `anthropic` | `https://api.anthropic.com` | anthropic-messages | `x-api-key` + `anthropic-version` |
-| `gemini` | `https://generativelanguage.googleapis.com` | gemini | API key |
+| `gemini` | `https://generativelanguage.googleapis.com` | gemini | `x-goog-api-key` |
 | `deepseek` | `https://api.deepseek.com` | openai-chat | `Bearer` |
 | `openrouter` | `https://openrouter.ai/api` | openai-chat | `Bearer` |
 
@@ -38,6 +38,34 @@ providers:
     endpoint: "https://my-relay.example.com"
     api_key_env: MYVENDOR_KEY
 ```
+
+## Native (non-OpenAI) wire engines
+
+Some vendors are addressed in their own wire dialect rather than an
+OpenAI-compatible shape, via a raw `accounts:` entry pinned to the vendor's
+`protocol`. All of these stream natively (incremental deltas + billed usage):
+
+| protocol | vendor | endpoint | notes |
+|----------|--------|----------|-------|
+| `gemini` | Google Gemini | `https://generativelanguage.googleapis.com` | `x-goog-api-key`; streams via `streamGenerateContent`; thinking tokens billed as reasoning |
+| `dashscope` | Alibaba Qwen (native) | `https://dashscope-intl.aliyuncs.com` | `Bearer`; streams via `X-DashScope-SSE` + `incremental_output` |
+| `anthropic-messages` | any Anthropic-compatible endpoint (e.g. MiniMax) | vendor's `/anthropic` base | `x-api-key`; some report `input_tokens` only in `message_delta` — handled |
+
+```yaml
+accounts:
+  - name: qwen
+    provider: alibaba
+    endpoint: "https://dashscope-intl.aliyuncs.com"
+    api_key_env: DASHSCOPE_API_KEY
+    protocols: ["dashscope"]
+models:
+  - name: qwen-turbo
+    protocol: dashscope
+```
+
+A vendor's legacy dialect that its platform has since retired (e.g. MiniMax's
+`abab*` v1) is not worth a bespoke engine — use its current OpenAI-compatible
+endpoint via `kind: openai`.
 
 A preset also accepts `endpoint`, `timeout_seconds`, and `connect_retries`,
 inherited by the synthesized account. An explicit `accounts:` entry with the

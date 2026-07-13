@@ -32,11 +32,18 @@ fixed 1s window in Redis); the token/window counters are fixed windows. When
 Redis is configured and unreachable, limits fail open (requests pass) and a
 warning is logged — a persistent outage never silently wedges the gateway.
 
+A streaming response that breaks after delivery has begun (client disconnect or
+upstream failure) is billed for what was delivered: the vendor's usage frame
+never arrives, so the token count is estimated from the request and the
+delivered text. A disconnect *before* any bytes are sent bills nothing.
+
 ## Request cache
 
 A model with `cache_ttl_seconds` set caches non-streaming responses for that
-TTL (bounded, moka-backed). A cache hit short-circuits account selection, the
-engine call, and billing.
+TTL (bounded, moka-backed). A cache hit is **free**: it short-circuits account
+selection, the engine call, and billing/quota — a hit consumes no quota and
+writes no ledger record. Offline batch items bypass the cache entirely (read
+and write) so per-item billing stays accurate.
 
 ```yaml
 models:
