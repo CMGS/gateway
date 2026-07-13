@@ -2649,17 +2649,17 @@ models:
     assert_eq!(done1.unwrap()["response"]["usage"]["total_tokens"], 13);
 
     // turn 2: over quota — the gateway must deny it (error frame), suppress its
-    // output entirely (no delta/done relayed), and not bill it
+    // output entirely (no delta/done relayed before OR after the error), and not
+    // bill it. Read until a brief idle gap so a late leak would be caught too.
     ws.send(append()).await.unwrap();
     let mut saw_error = false;
     let mut leaked_output = false;
-    while let Some(Ok(msg)) = ws.next().await {
+    while let Ok(Some(Ok(msg))) =
+        tokio::time::timeout(std::time::Duration::from_millis(400), ws.next()).await
+    {
         let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
         match v["type"].as_str() {
-            Some("error") => {
-                saw_error = true;
-                break; // the denied turn's own frames are suppressed; error is all we get
-            }
+            Some("error") => saw_error = true,
             Some("response.output_text.delta") | Some("response.done") => leaked_output = true,
             _ => {}
         }
