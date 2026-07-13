@@ -480,6 +480,255 @@ impl Store for SqliteStore {
     }
 }
 
+/// Postgres-backed store for a multi-instance fleet: ledger, files, and
+/// batches are shared, so any instance can serve reads for work submitted on
+/// another. Unlike [`SqliteStore`] there is no orphan sweep on open — a
+/// starting instance must not fail batches another live instance is still
+/// executing (a distributed executor is the M9 follow-up).
+#[derive(Debug)]
+pub struct PostgresStore {
+    pool: sqlx::PgPool,
+    ledger_max_rows: u64,
+}
+
+impl PostgresStore {
+    pub async fn connect(url: &str) -> GResult<Self> {
+        Self::connect_with_cap(url, 0).await
+    }
+
+    /// `ledger_max_rows` > 0 prunes the oldest billing rows past the cap on write.
+    pub async fn connect_with_cap(url: &str, ledger_max_rows: u64) -> GResult<Self> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(10)
+            .connect(url)
+            .await
+            .map_err(|e| store_err("connect postgres store", e))?;
+        for ddl in [
+            "CREATE TABLE IF NOT EXISTS billing (
+                n BIGSERIAL PRIMARY KEY,
+                ak TEXT NOT NULL, product TEXT NOT NULL,
+                tenant TEXT NOT NULL DEFAULT 'default', model TEXT NOT NULL,
+                served_model TEXT NOT NULL DEFAULT '',
+                protocol TEXT NOT NULL, account TEXT NOT NULL,
+                prompt_tokens BIGINT NOT NULL, completion_tokens BIGINT NOT NULL,
+                total_tokens BIGINT NOT NULL, cost_micros BIGINT NOT NULL,
+                ptu_spillover BOOLEAN NOT NULL DEFAULT FALSE)",
+            "CREATE TABLE IF NOT EXISTS files (
+                n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
+                purpose TEXT NOT NULL, bytes BIGINT NOT NULL, content TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS batches (
+                n BIGSERIAL PRIMARY KEY, id TEXT UNIQUE NOT NULL,
+                ak TEXT NOT NULL, model TEXT NOT NULL,
+                status TEXT NOT NULL, total BIGINT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS batch_results (
+                batch_id TEXT NOT NULL, idx BIGINT NOT NULL, ok BOOLEAN NOT NULL,
+                message TEXT NOT NULL, total_tokens BIGINT NOT NULL)",
+        ] {
+            sqlx::query(ddl)
+                .execute(&pool)
+                .await
+                .map_err(|e| store_err("create postgres schema", e))?;
+        }
+        Ok(Self {
+            pool,
+            ledger_max_rows,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Store for PostgresStore {
+    async fn ledger_add(&self, r: BillingRecord) -> GResult<()> {
+        sqlx::query(
+            "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
+             prompt_tokens, completion_tokens, total_tokens, cost_micros, ptu_spillover)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(&r.ak)
+        .bind(&r.product)
+        .bind(&r.tenant)
+        .bind(&r.model)
+        .bind(&r.served_model)
+        .bind(&r.protocol)
+        .bind(&r.account)
+        .bind(r.prompt_tokens)
+        .bind(r.completion_tokens)
+        .bind(r.total_tokens)
+        .bind(r.cost_micros)
+        .bind(r.ptu_spillover)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| store_err("insert billing record", e))?;
+        if self.ledger_max_rows > 0 {
+            sqlx::query("DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - $1")
+                .bind(self.ledger_max_rows as i64)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| store_err("prune billing records", e))?;
+        }
+        Ok(())
+    }
+
+    async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)> {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM billing")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| store_err("count billing records", e))?;
+        let mut rows = sqlx::query(
+            "SELECT ak, product, tenant, model, served_model, protocol, account,
+             prompt_tokens, completion_tokens, total_tokens, cost_micros, ptu_spillover
+             FROM billing ORDER BY n DESC LIMIT $1",
+        )
+        .bind(limit.min(i64::MAX as usize) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| store_err("read billing records", e))?;
+        rows.reverse();
+        Ok((
+            total as usize,
+            rows.iter()
+                .map(|row| BillingRecord {
+                    ak: row.get(0),
+                    product: row.get(1),
+                    tenant: row.get(2),
+                    model: row.get(3),
+                    served_model: row.get(4),
+                    protocol: row.get(5),
+                    account: row.get(6),
+                    prompt_tokens: row.get(7),
+                    completion_tokens: row.get(8),
+                    total_tokens: row.get(9),
+                    cost_micros: row.get(10),
+                    ptu_spillover: row.get(11),
+                })
+                .collect(),
+        ))
+    }
+
+    async fn file_put(&self, purpose: &str, content: String) -> GResult<StoredFile> {
+        let bytes = content.len();
+        // Unlike SQLite's MAX(n)+1 subselect (safe there because SQLite
+        // serializes writers), concurrent Postgres writers race on MAX(n); the
+        // sequence is consumed explicitly so id and n share one atomic value.
+        let id: String = sqlx::query_scalar(
+            "INSERT INTO files (n, id, purpose, bytes, content)
+             SELECT v, 'file-' || v, $1, $2, $3
+             FROM nextval(pg_get_serial_sequence('files', 'n')) AS v
+             RETURNING id",
+        )
+        .bind(purpose)
+        .bind(bytes as i64)
+        .bind(&content)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| store_err("insert file", e))?;
+        Ok(StoredFile {
+            id,
+            bytes,
+            purpose: purpose.to_owned(),
+            content,
+        })
+    }
+
+    async fn file_get(&self, id: &str) -> GResult<Option<StoredFile>> {
+        let row = sqlx::query("SELECT id, purpose, bytes, content FROM files WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| store_err("read file", e))?;
+        Ok(row.map(|row| StoredFile {
+            id: row.get(0),
+            purpose: row.get(1),
+            bytes: row.get::<i64, _>(2) as usize,
+            content: row.get(3),
+        }))
+    }
+
+    async fn batch_create(&self, ak: &str, model: &str, total: usize) -> GResult<BatchJob> {
+        let id: String = sqlx::query_scalar(
+            "INSERT INTO batches (n, id, ak, model, status, total)
+             SELECT v, 'batch-' || v, $1, $2, $3, $4
+             FROM nextval(pg_get_serial_sequence('batches', 'n')) AS v
+             RETURNING id",
+        )
+        .bind(ak)
+        .bind(model)
+        .bind(BatchStatus::Pending.as_str())
+        .bind(total as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| store_err("insert batch", e))?;
+        Ok(BatchJob {
+            id,
+            ak: ak.to_owned(),
+            model: model.to_owned(),
+            status: BatchStatus::Pending,
+            total,
+            results: Vec::new(),
+        })
+    }
+
+    async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>> {
+        let row = sqlx::query("SELECT id, ak, model, status, total FROM batches WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| store_err("read batch", e))?;
+        let Some(row) = row else { return Ok(None) };
+        let results = sqlx::query(
+            "SELECT idx, ok, message, total_tokens FROM batch_results
+             WHERE batch_id = $1 ORDER BY idx",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| store_err("read batch results", e))?;
+        let status_text: String = row.get(3);
+        Ok(Some(BatchJob {
+            id: row.get(0),
+            ak: row.get(1),
+            model: row.get(2),
+            status: BatchStatus::parse(&status_text).unwrap_or(BatchStatus::Failed),
+            total: row.get::<i64, _>(4) as usize,
+            results: results
+                .iter()
+                .map(|r| BatchItemResult {
+                    index: r.get::<i64, _>(0) as usize,
+                    ok: r.get(1),
+                    message: r.get(2),
+                    total_tokens: r.get(3),
+                })
+                .collect(),
+        }))
+    }
+
+    async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()> {
+        sqlx::query("UPDATE batches SET status = $1 WHERE id = $2")
+            .bind(status.as_str())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| store_err("update batch status", e))?;
+        Ok(())
+    }
+
+    async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
+        sqlx::query(
+            "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(result.index as i64)
+        .bind(result.ok)
+        .bind(&result.message)
+        .bind(result.total_tokens)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| store_err("insert batch result", e))?;
+        Ok(())
+    }
+}
+
 fn store_err(what: &str, e: sqlx::Error) -> GatewayError {
     GatewayError::internal(what).with_source(e)
 }
@@ -646,5 +895,60 @@ mod tests {
         assert_eq!(store.ledger_snapshot(usize::MAX).await.unwrap().0, 2);
         let job = store.batch_get("batch-1").await.unwrap().unwrap();
         assert_eq!(job.status, BatchStatus::Completed);
+    }
+
+    /// Set GW_TEST_PG_URL (e.g. postgres://postgres:gwtest@127.0.0.1:15432/gw)
+    /// to run this.
+    #[tokio::test]
+    async fn postgres_store_roundtrip() {
+        let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("pg connect");
+        store.ledger_add(record("gpt-4o")).await.unwrap();
+        let (total, page) = store.ledger_snapshot(5).await.unwrap();
+        assert!(total >= 1);
+        assert_eq!(page.last().unwrap().model, "gpt-4o");
+
+        let f = store.file_put("batch", "hello pg".into()).await.unwrap();
+        assert!(f.id.starts_with("file-"));
+        let got = store.file_get(&f.id).await.unwrap().unwrap();
+        assert_eq!(got.content, "hello pg");
+
+        let b = store.batch_create("ak-t", "gpt-4o", 2).await.unwrap();
+        assert!(b.id.starts_with("batch-"));
+        store
+            .batch_set_status(&b.id, BatchStatus::Running)
+            .await
+            .unwrap();
+        store
+            .batch_push_result(
+                &b.id,
+                BatchItemResult {
+                    index: 0,
+                    ok: true,
+                    message: "ok".into(),
+                    total_tokens: 5,
+                },
+            )
+            .await
+            .unwrap();
+        let got = store.batch_get(&b.id).await.unwrap().unwrap();
+        assert_eq!(got.status, BatchStatus::Running);
+        assert_eq!(got.results.len(), 1);
+
+        // concurrent creates race the id path; every id must be unique
+        let store = std::sync::Arc::new(store);
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = store.clone();
+            handles.push(tokio::spawn(
+                async move { s.file_put("x", "y".into()).await },
+            ));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for h in handles {
+            assert!(ids.insert(h.await.unwrap().unwrap().id));
+        }
     }
 }

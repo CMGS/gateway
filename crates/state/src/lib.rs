@@ -14,9 +14,11 @@ use gw_consts::Protocol;
 use gw_models::Account;
 
 pub mod governance;
+pub mod keystore;
 pub mod store;
 
 pub use governance::{Governance, MemoryGovernance, RedisGovernance};
+pub use keystore::{KeyStore, PostgresKeyStore};
 pub use store::*;
 
 const CACHE_MAX_ENTRIES: u64 = 10_000;
@@ -183,6 +185,46 @@ impl AkAuth {
         for k in keys {
             self.put(AkInfo::from(k), KeySource::Config);
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl KeyStore for AkAuth {
+    async fn authenticate(&self, ak: &str) -> Option<AkInfo> {
+        AkAuth::authenticate(self, ak)
+    }
+    async fn put(&self, info: AkInfo, source: KeySource) -> gw_models::GResult<()> {
+        AkAuth::put(self, info, source);
+        Ok(())
+    }
+    async fn patch(
+        &self,
+        ak: &str,
+        qps: Option<f64>,
+        daily_token_quota: Option<i64>,
+        tokens_per_minute: Option<Option<i64>>,
+        expires_at_epoch_secs: Option<Option<i64>>,
+        banned: Option<bool>,
+    ) -> gw_models::GResult<Option<AkInfo>> {
+        Ok(AkAuth::patch(
+            self,
+            ak,
+            qps,
+            daily_token_quota,
+            tokens_per_minute,
+            expires_at_epoch_secs,
+            banned,
+        ))
+    }
+    async fn revoke(&self, ak: &str) -> gw_models::GResult<bool> {
+        Ok(AkAuth::revoke(self, ak))
+    }
+    async fn list(&self) -> gw_models::GResult<Vec<AkInfo>> {
+        Ok(AkAuth::list(self))
+    }
+    async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> gw_models::GResult<()> {
+        AkAuth::reload_config_keys(self, keys);
+        Ok(())
     }
 }
 
@@ -540,7 +582,8 @@ impl moka::Expiry<String, (gw_models::GatewayResponse, Duration)> for PerEntryTt
 #[derive(Debug)]
 pub struct GatewayState {
     /// Live key table — a preserved seam (admin key edits survive a reload).
-    pub auth: Arc<AkAuth>,
+    /// In-memory by default; Postgres for a fleet-shared key set.
+    pub auth: Arc<dyn KeyStore>,
     pub pool: AccountPool,
     pub governance: Arc<dyn Governance>,
     /// Durable records (ledger/files/batches): memory by default, sqlite when
@@ -583,16 +626,17 @@ impl GatewayState {
     /// response cache — from `prev`. The key table's config-sourced entries are
     /// re-applied from the new config; admin-created keys are kept. In-flight
     /// requests keep running on their own snapshot; new requests see this one.
-    pub fn reload_from(cfg: &GatewayConfig, prev: &GatewayState) -> Self {
-        prev.auth.reload_config_keys(&cfg.access_keys);
-        Self {
+    /// Fails (leaving `prev` live) when a networked key table can't be updated.
+    pub async fn reload_from(cfg: &GatewayConfig, prev: &GatewayState) -> gw_models::GResult<Self> {
+        prev.auth.reload_config_keys(&cfg.access_keys).await?;
+        Ok(Self {
             auth: prev.auth.clone(),
             pool: AccountPool::from_config(cfg),
             governance: prev.governance.clone(),
             store: prev.store.clone(),
             health: prev.health.clone(),
             cache: prev.cache.clone(),
-        }
+        })
     }
 }
 
@@ -625,13 +669,15 @@ impl SharedConfig {
     }
 
     /// Swap in a new config, rebuilding derived state and preserving seams.
-    pub fn reload(&self, cfg: GatewayConfig) {
+    /// On error (networked key table unreachable) the old snapshot stays live.
+    pub async fn reload(&self, cfg: GatewayConfig) -> gw_models::GResult<()> {
         let prev = self.inner.load();
-        let state = GatewayState::reload_from(&cfg, &prev.state);
+        let state = GatewayState::reload_from(&cfg, &prev.state).await?;
         self.inner.store(Arc::new(Snapshot {
             cfg: Arc::new(cfg),
             state: Arc::new(state),
         }));
+        Ok(())
     }
 }
 
@@ -677,20 +723,20 @@ mod tests {
 
         // the boot config has ak-demo-123 but not ak-new
         let snap = shared.load();
-        assert!(snap.state.auth.authenticate("ak-demo-123").is_some());
-        assert!(snap.state.auth.authenticate("ak-new").is_none());
+        assert!(snap.state.auth.authenticate("ak-demo-123").await.is_some());
+        assert!(snap.state.auth.authenticate("ak-new").await.is_none());
 
         // reload with a config carrying a different key set
         let new_cfg = GatewayConfig::from_yaml(
             "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-new, product: p, qps: 5, daily_token_quota: 100}]",
         )
         .unwrap();
-        shared.reload(new_cfg);
+        shared.reload(new_cfg).await.unwrap();
 
         let snap = shared.load();
         // config-derived state rebuilt: new key present, old gone
-        assert!(snap.state.auth.authenticate("ak-new").is_some());
-        assert!(snap.state.auth.authenticate("ak-demo-123").is_none());
+        assert!(snap.state.auth.authenticate("ak-new").await.is_some());
+        assert!(snap.state.auth.authenticate("ak-demo-123").await.is_none());
         // seams preserved: same store/health instances, durable record intact
         assert_eq!(Arc::as_ptr(&snap.state.store), store_ptr);
         assert_eq!(Arc::as_ptr(&snap.state.health), health_ptr);
@@ -854,11 +900,14 @@ mod tests {
         assert_eq!(info.status_at(0), KeyStatus::Banned, "ban wins over expiry");
     }
 
-    #[test]
-    fn auth_lookup() {
+    #[tokio::test]
+    async fn auth_lookup() {
         let s = state();
-        assert_eq!(s.auth.authenticate("ak-demo-123").unwrap().product, "demo");
-        assert!(s.auth.authenticate("nope").is_none());
+        assert_eq!(
+            s.auth.authenticate("ak-demo-123").await.unwrap().product,
+            "demo"
+        );
+        assert!(s.auth.authenticate("nope").await.is_none());
     }
 
     #[tokio::test]

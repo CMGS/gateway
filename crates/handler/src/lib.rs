@@ -124,8 +124,8 @@ mod tests {
         )
     }
 
-    fn ak(h: &OnlineHandler) -> AkInfo {
-        h.state().auth.authenticate("ak-demo-123").unwrap()
+    async fn ak(h: &OnlineHandler) -> AkInfo {
+        h.state().auth.authenticate("ak-demo-123").await.unwrap()
     }
 
     fn chat_req(name: &str, content: &str) -> GatewayRequest {
@@ -140,7 +140,10 @@ mod tests {
     #[tokio::test]
     async fn full_pipeline_openai() {
         let h = handler();
-        let ctx = h.run(chat_req("gpt-4o", "hi there"), ak(&h)).await.unwrap();
+        let ctx = h
+            .run(chat_req("gpt-4o", "hi there"), ak(&h).await)
+            .await
+            .unwrap();
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.message.contains("you said: hi there"));
         assert!(out.response.common_usage.is_some());
@@ -155,7 +158,11 @@ mod tests {
     #[tokio::test]
     async fn unknown_model_404() {
         let h = handler();
-        let err = h.run(chat_req("bogus", "x"), ak(&h)).await.err().unwrap();
+        let err = h
+            .run(chat_req("bogus", "x"), ak(&h).await)
+            .await
+            .err()
+            .unwrap();
         assert_eq!(err.http_status, 404);
     }
 
@@ -163,7 +170,7 @@ mod tests {
     async fn security_block_short_circuits() {
         let h = handler();
         let ctx = h
-            .run(chat_req("gpt-4o", "please say forbiddenword"), ak(&h))
+            .run(chat_req("gpt-4o", "please say forbiddenword"), ak(&h).await)
             .await
             .unwrap();
         let out = ctx.outcome.expect("outcome");
@@ -186,7 +193,7 @@ mod tests {
         let ctx = h
             .run(
                 chat_req("gpt-4o", "mail me at a@b.com and call 13812345678"),
-                ak(&h),
+                ak(&h).await,
             )
             .await
             .unwrap();
@@ -201,7 +208,7 @@ mod tests {
         let h = handler();
         // hunyuan-lite: PTU account name contains "down" -> mock 503 -> fails over to paygo
         let ctx = h
-            .run(chat_req("hunyuan-lite", "failover please"), ak(&h))
+            .run(chat_req("hunyuan-lite", "failover please"), ak(&h).await)
             .await
             .unwrap();
         let out = ctx.outcome.expect("outcome");
@@ -252,7 +259,7 @@ mod tests {
         let mut req = chat_req("gpt-4o", "please stream something long");
         req.stream = true;
         req.stream_tx = Some(tx);
-        let ctx = h.run(req, ak(&h)).await.unwrap();
+        let ctx = h.run(req, ak(&h).await).await.unwrap();
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.aborted, "mid-stream break must mark aborted");
         assert_eq!(out.response.message, "partial answer");
@@ -309,7 +316,7 @@ mod tests {
         let mut req = chat_req("claude-sonnet", "please stream something");
         req.stream = true;
         req.stream_tx = Some(tx);
-        let ctx = h.run(req, ak(&h)).await.unwrap();
+        let ctx = h.run(req, ak(&h).await).await.unwrap();
         let out = ctx.outcome.expect("outcome");
         assert!(out.response.aborted);
         assert_eq!(out.response.message, "delivered words here");
@@ -340,7 +347,7 @@ mod tests {
             },
         ];
         let job = off
-            .submit(ak(&h), "cached-mini".into(), items)
+            .submit(ak(&h).await, "cached-mini".into(), items)
             .await
             .unwrap();
         for _ in 0..100 {
@@ -364,7 +371,7 @@ mod tests {
         let off = OfflineHandler::new(h.clone());
         let job = off
             .submit(
-                ak(&h),
+                ak(&h).await,
                 "gpt-4o-mini".into(),
                 vec![
                     BatchItem {

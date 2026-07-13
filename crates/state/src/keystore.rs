@@ -1,0 +1,392 @@
+//! Dynamic access-key storage behind a trait: the in-memory table serves a
+//! single node; Postgres shares one key set across a fleet, fronted by a
+//! short-TTL cache so the hot auth path stays off the network.
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use sqlx::Row;
+
+use crate::{AkInfo, KeySource};
+use gw_models::{GResult, GatewayError};
+
+/// How long an instance may serve a stale key view: the fleet-wide bound on
+/// create/revoke propagation (a local write invalidates its own cache at once).
+const AUTH_CACHE_TTL: Duration = Duration::from_secs(2);
+/// Bounded so unknown-key probing can't grow the negative cache unboundedly.
+const AUTH_CACHE_MAX: u64 = 100_000;
+
+/// The live key table. Mirrors [`crate::AkAuth`]'s semantics: config keys are
+/// re-applied on reload, admin keys survive it, and config ownership is sticky
+/// against admin overwrites.
+#[async_trait]
+pub trait KeyStore: Send + Sync + std::fmt::Debug {
+    /// Resolve a presented key; `None` = unknown, revoked, or (for a networked
+    /// backend) unreachable — auth fails closed.
+    async fn authenticate(&self, ak: &str) -> Option<AkInfo>;
+    /// Insert or replace a key. Config ownership is sticky: an admin write to
+    /// a config-declared key updates values but keeps it revocable by config.
+    async fn put(&self, info: AkInfo, source: KeySource) -> GResult<()>;
+    /// Update quota/lifecycle fields in place; the `Option<Option<_>>` fields
+    /// are absent = leave, `Some(None)` = clear, `Some(Some(v))` = set.
+    /// `Ok(None)` if the key doesn't exist.
+    async fn patch(
+        &self,
+        ak: &str,
+        qps: Option<f64>,
+        daily_token_quota: Option<i64>,
+        tokens_per_minute: Option<Option<i64>>,
+        expires_at_epoch_secs: Option<Option<i64>>,
+        banned: Option<bool>,
+    ) -> GResult<Option<AkInfo>>;
+    /// Remove a key regardless of source; whether it existed.
+    async fn revoke(&self, ak: &str) -> GResult<bool>;
+    /// Every key, sorted by ak for stable listings.
+    async fn list(&self) -> GResult<Vec<AkInfo>>;
+    /// Re-apply the config file's key set, leaving admin-created keys untouched.
+    async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> GResult<()>;
+}
+
+/// Fleet-shared key table in Postgres. Reads go through a short-TTL cache
+/// (positive and negative entries); writes invalidate the local cache
+/// immediately and reach other instances within [`AUTH_CACHE_TTL`].
+#[derive(Debug)]
+pub struct PostgresKeyStore {
+    pool: sqlx::PgPool,
+    cache: moka::sync::Cache<String, Option<AkInfo>>,
+}
+
+impl PostgresKeyStore {
+    pub async fn connect(url: &str) -> GResult<Self> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(url)
+            .await
+            .map_err(|e| key_err("connect postgres key store", e))?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS access_keys (
+                ak TEXT PRIMARY KEY,
+                product TEXT NOT NULL,
+                tenant TEXT NOT NULL DEFAULT 'default',
+                qps DOUBLE PRECISION NOT NULL,
+                daily_token_quota BIGINT NOT NULL,
+                tokens_per_minute BIGINT,
+                expires_at_epoch_secs BIGINT,
+                banned BOOLEAN NOT NULL DEFAULT FALSE,
+                model_quotas TEXT NOT NULL DEFAULT '{}',
+                source TEXT NOT NULL DEFAULT 'admin')",
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| key_err("create access_keys schema", e))?;
+        Ok(Self {
+            pool,
+            cache: moka::sync::Cache::builder()
+                .max_capacity(AUTH_CACHE_MAX)
+                .time_to_live(AUTH_CACHE_TTL)
+                .build(),
+        })
+    }
+
+    async fn fetch(&self, ak: &str) -> Result<Option<AkInfo>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
+             expires_at_epoch_secs, banned, model_quotas FROM access_keys WHERE ak = $1",
+        )
+        .bind(ak)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(row_to_info))
+    }
+}
+
+#[async_trait]
+impl KeyStore for PostgresKeyStore {
+    async fn authenticate(&self, ak: &str) -> Option<AkInfo> {
+        if let Some(cached) = self.cache.get(ak) {
+            return cached;
+        }
+        match self.fetch(ak).await {
+            Ok(info) => {
+                self.cache.insert(ak.to_owned(), info.clone());
+                info
+            }
+            Err(e) => {
+                // fail closed: a store outage must not admit unknown keys, and
+                // valid keys come back as soon as the store does.
+                tracing::warn!(error = %e, "key store unreachable; auth fails closed");
+                None
+            }
+        }
+    }
+
+    async fn put(&self, info: AkInfo, source: KeySource) -> GResult<()> {
+        let quotas = serde_json::to_string(&info.model_quotas).unwrap_or_else(|_| "{}".into());
+        sqlx::query(
+            "INSERT INTO access_keys (ak, product, tenant, qps, daily_token_quota,
+             tokens_per_minute, expires_at_epoch_secs, banned, model_quotas, source)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (ak) DO UPDATE SET
+               product = EXCLUDED.product, tenant = EXCLUDED.tenant,
+               qps = EXCLUDED.qps, daily_token_quota = EXCLUDED.daily_token_quota,
+               tokens_per_minute = EXCLUDED.tokens_per_minute,
+               expires_at_epoch_secs = EXCLUDED.expires_at_epoch_secs,
+               banned = EXCLUDED.banned, model_quotas = EXCLUDED.model_quotas,
+               source = CASE WHEN access_keys.source = 'config' AND EXCLUDED.source = 'admin'
+                             THEN 'config' ELSE EXCLUDED.source END",
+        )
+        .bind(&info.ak)
+        .bind(&info.product)
+        .bind(&info.tenant)
+        .bind(info.qps)
+        .bind(info.daily_token_quota)
+        .bind(info.tokens_per_minute)
+        .bind(info.expires_at_epoch_secs)
+        .bind(info.banned)
+        .bind(&quotas)
+        .bind(source_str(source))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| key_err("upsert access key", e))?;
+        self.cache.invalidate(&info.ak);
+        Ok(())
+    }
+
+    async fn patch(
+        &self,
+        ak: &str,
+        qps: Option<f64>,
+        daily_token_quota: Option<i64>,
+        tokens_per_minute: Option<Option<i64>>,
+        expires_at_epoch_secs: Option<Option<i64>>,
+        banned: Option<bool>,
+    ) -> GResult<Option<AkInfo>> {
+        // read-modify-write under FOR UPDATE: concurrent patches serialize
+        // instead of clobbering each other's untouched fields.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| key_err("begin patch", e))?;
+        let row = sqlx::query(
+            "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
+             expires_at_epoch_secs, banned, model_quotas FROM access_keys
+             WHERE ak = $1 FOR UPDATE",
+        )
+        .bind(ak)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| key_err("read key for patch", e))?;
+        let Some(row) = row else { return Ok(None) };
+        let mut info = row_to_info(&row);
+        if let Some(v) = qps {
+            info.qps = v;
+        }
+        if let Some(v) = daily_token_quota {
+            info.daily_token_quota = v;
+        }
+        if let Some(v) = tokens_per_minute {
+            info.tokens_per_minute = v;
+        }
+        if let Some(v) = expires_at_epoch_secs {
+            info.expires_at_epoch_secs = v;
+        }
+        if let Some(v) = banned {
+            info.banned = v;
+        }
+        sqlx::query(
+            "UPDATE access_keys SET qps = $2, daily_token_quota = $3,
+             tokens_per_minute = $4, expires_at_epoch_secs = $5, banned = $6
+             WHERE ak = $1",
+        )
+        .bind(ak)
+        .bind(info.qps)
+        .bind(info.daily_token_quota)
+        .bind(info.tokens_per_minute)
+        .bind(info.expires_at_epoch_secs)
+        .bind(info.banned)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| key_err("apply patch", e))?;
+        tx.commit().await.map_err(|e| key_err("commit patch", e))?;
+        self.cache.invalidate(ak);
+        Ok(Some(info))
+    }
+
+    async fn revoke(&self, ak: &str) -> GResult<bool> {
+        let n = sqlx::query("DELETE FROM access_keys WHERE ak = $1")
+            .bind(ak)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| key_err("revoke key", e))?
+            .rows_affected();
+        self.cache.invalidate(ak);
+        Ok(n > 0)
+    }
+
+    async fn list(&self) -> GResult<Vec<AkInfo>> {
+        let rows = sqlx::query(
+            "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
+             expires_at_epoch_secs, banned, model_quotas FROM access_keys ORDER BY ak",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| key_err("list keys", e))?;
+        Ok(rows.iter().map(row_to_info).collect())
+    }
+
+    async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> GResult<()> {
+        let wanted: Vec<String> = keys.iter().map(|k| k.ak.clone()).collect();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| key_err("begin reload", e))?;
+        sqlx::query("DELETE FROM access_keys WHERE source = 'config' AND NOT (ak = ANY($1))")
+            .bind(&wanted)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| key_err("drop stale config keys", e))?;
+        for k in keys {
+            let info = AkInfo::from(k);
+            let quotas = serde_json::to_string(&info.model_quotas).unwrap_or_else(|_| "{}".into());
+            sqlx::query(
+                "INSERT INTO access_keys (ak, product, tenant, qps, daily_token_quota,
+                 tokens_per_minute, expires_at_epoch_secs, banned, model_quotas, source)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'config')
+                 ON CONFLICT (ak) DO UPDATE SET
+                   product = EXCLUDED.product, tenant = EXCLUDED.tenant,
+                   qps = EXCLUDED.qps, daily_token_quota = EXCLUDED.daily_token_quota,
+                   tokens_per_minute = EXCLUDED.tokens_per_minute,
+                   expires_at_epoch_secs = EXCLUDED.expires_at_epoch_secs,
+                   banned = EXCLUDED.banned, model_quotas = EXCLUDED.model_quotas,
+                   source = 'config'",
+            )
+            .bind(&info.ak)
+            .bind(&info.product)
+            .bind(&info.tenant)
+            .bind(info.qps)
+            .bind(info.daily_token_quota)
+            .bind(info.tokens_per_minute)
+            .bind(info.expires_at_epoch_secs)
+            .bind(info.banned)
+            .bind(&quotas)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| key_err("re-apply config key", e))?;
+        }
+        tx.commit().await.map_err(|e| key_err("commit reload", e))?;
+        self.cache.invalidate_all();
+        Ok(())
+    }
+}
+
+fn row_to_info(row: &sqlx::postgres::PgRow) -> AkInfo {
+    AkInfo {
+        ak: row.get(0),
+        product: row.get(1),
+        tenant: row.get(2),
+        qps: row.get(3),
+        daily_token_quota: row.get(4),
+        tokens_per_minute: row.get(5),
+        expires_at_epoch_secs: row.get(6),
+        banned: row.get(7),
+        model_quotas: serde_json::from_str(row.get::<&str, _>(8)).unwrap_or_default(),
+    }
+}
+
+fn source_str(s: KeySource) -> &'static str {
+    match s {
+        KeySource::Config => "config",
+        KeySource::Admin => "admin",
+    }
+}
+
+fn key_err(what: &str, e: sqlx::Error) -> GatewayError {
+    GatewayError::internal(what).with_source(e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(ak: &str, qps: f64) -> AkInfo {
+        AkInfo {
+            ak: ak.into(),
+            product: "p".into(),
+            tenant: "default".into(),
+            qps,
+            daily_token_quota: 10,
+            tokens_per_minute: None,
+            expires_at_epoch_secs: None,
+            banned: false,
+            model_quotas: Default::default(),
+        }
+    }
+
+    /// Set GW_TEST_PG_URL (e.g. postgres://postgres:gwtest@127.0.0.1:15432/gw)
+    /// to run this.
+    #[tokio::test]
+    async fn postgres_keystore_semantics_mirror_memory() {
+        let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
+            return;
+        };
+        let ks = PostgresKeyStore::connect(&url).await.expect("pg connect");
+        // isolate from previous runs
+        sqlx::query("TRUNCATE access_keys")
+            .execute(&ks.pool)
+            .await
+            .unwrap();
+        ks.cache.invalidate_all();
+
+        // create-and-use, negative caching, revoke
+        ks.put(info("pk-a", 1.0), KeySource::Admin).await.unwrap();
+        assert_eq!(ks.authenticate("pk-a").await.unwrap().qps, 1.0);
+        assert!(ks.authenticate("pk-nope").await.is_none());
+        assert!(ks.revoke("pk-a").await.unwrap());
+        assert!(
+            ks.authenticate("pk-a").await.is_none(),
+            "local write invalidates the cache immediately"
+        );
+        assert!(!ks.revoke("pk-a").await.unwrap());
+
+        // patch tri-state
+        ks.put(info("pk-b", 2.0), KeySource::Admin).await.unwrap();
+        let p = ks
+            .patch("pk-b", Some(9.0), None, Some(Some(5)), None, Some(true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((p.qps, p.tokens_per_minute, p.banned), (9.0, Some(5), true));
+        let p = ks
+            .patch("pk-b", None, None, Some(None), None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.tokens_per_minute, None);
+        assert!(p.banned, "untouched fields survive a partial patch");
+
+        // config reload semantics: sticky source + admin keys survive
+        let cfg = gw_config::GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\naccess_keys: [{ak: pk-cfg, product: p, qps: 1, daily_token_quota: 5}]",
+        )
+        .unwrap();
+        ks.reload_config_keys(&cfg.access_keys).await.unwrap();
+        assert!(ks.authenticate("pk-cfg").await.is_some());
+        assert!(
+            ks.authenticate("pk-b").await.is_some(),
+            "admin key survives reload"
+        );
+        // admin overwrite must not defeat config revocation
+        ks.put(info("pk-cfg", 3.0), KeySource::Admin).await.unwrap();
+        let empty =
+            gw_config::GatewayConfig::from_yaml("listen: {host: h, port: 1}\naccess_keys: []")
+                .unwrap();
+        ks.reload_config_keys(&empty.access_keys).await.unwrap();
+        assert!(
+            ks.authenticate("pk-cfg").await.is_none(),
+            "config ownership is sticky against admin overwrite"
+        );
+        assert!(ks.authenticate("pk-b").await.is_some());
+    }
+}

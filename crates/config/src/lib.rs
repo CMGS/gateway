@@ -210,6 +210,10 @@ impl Default for StabilityConf {
 /// Durable-record backend selection.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct StorageConf {
+    /// Postgres URL for the fleet-shared ledger/files/batches store; takes
+    /// precedence over `sqlite_path`. Empty = unused.
+    #[serde(default)]
+    pub postgres_url: String,
     /// SQLite database path for the ledger/files/batches store; empty = in-memory.
     #[serde(default)]
     pub sqlite_path: String,

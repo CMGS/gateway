@@ -94,11 +94,14 @@ impl AppState {
     /// Reload config from source and atomically swap it in (derived state
     /// rebuilt, runtime seams preserved). Storage-backend changes (redis/sqlite
     /// URLs) need a restart and are ignored here.
-    pub fn reload(&self) -> Result<(), String> {
+    pub async fn reload(&self) -> Result<(), String> {
         let loader = self.loader.as_ref().ok_or("reload not configured")?;
         let cfg = loader()?;
-        self.handler.config.reload(cfg);
-        Ok(())
+        self.handler
+            .config
+            .reload(cfg)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -184,10 +187,14 @@ async fn realtime_ws(
     // one consistent snapshot for the whole accept decision (cfg + state)
     let snap = s.handler.config.load();
     // Auth: header, or the gw-api-key.<ak> subprotocol for browser clients
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => {
-            match ws_subprotocol_ak(&headers).and_then(|k| snap.state.auth.authenticate(&k)) {
+            let sub = match ws_subprotocol_ak(&headers) {
+                Some(k) => snap.state.auth.authenticate(&k).await,
+                None => None,
+            };
+            match sub {
                 Some(ak) => match check_key_status(&ak) {
                     Ok(()) => ak,
                     Err((st, msg)) => return error_response(st, msg),
@@ -565,7 +572,7 @@ async fn health() -> Json<Value> {
 
 /// Configured public models, filtered to the caller's tenant entitlement.
 async fn list_models(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
@@ -625,7 +632,7 @@ async fn accounts(State(s): State<AppState>) -> Json<Value> {
 
 /// AK auth: `Authorization: Bearer <ak>` or `x-api-key: <ak>`. The error is
 /// `(status, message)` so each surface can shape it to its own wire dialect.
-fn authenticate(s: &AppState, headers: &HeaderMap) -> Result<AkInfo, (u16, &'static str)> {
+async fn authenticate(s: &AppState, headers: &HeaderMap) -> Result<AkInfo, (u16, &'static str)> {
     let ak = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -642,6 +649,7 @@ fn authenticate(s: &AppState, headers: &HeaderMap) -> Result<AkInfo, (u16, &'sta
         .state()
         .auth
         .authenticate(ak)
+        .await
         .ok_or((401, "invalid api key"))?;
     check_key_status(&info)?;
     Ok(info)
@@ -734,7 +742,7 @@ async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response
         }
         Err((st, msg)) => return error_response(st, msg),
     }
-    match s.reload() {
+    match s.reload().await {
         Ok(()) => {
             let cfg = s.handler.cfg();
             tracing::info!(
@@ -786,7 +794,7 @@ async fn admin_key_create(
     if !scope.covers(tenant) {
         return error_response(403, "tenant admin may only create keys in its own tenant");
     }
-    if let Some(existing) = s.handler.state().auth.authenticate(ak)
+    if let Some(existing) = s.handler.state().auth.authenticate(ak).await
         && !scope.covers(&existing.tenant)
     {
         return error_response(403, "key exists under another tenant");
@@ -809,7 +817,15 @@ async fn admin_key_create(
             })
             .unwrap_or_default(),
     };
-    s.handler.state().auth.put(info, gw_state::KeySource::Admin);
+    if let Err(e) = s
+        .handler
+        .state()
+        .auth
+        .put(info, gw_state::KeySource::Admin)
+        .await
+    {
+        return gateway_error(e);
+    }
     (
         StatusCode::CREATED,
         Json(json!({ "ak": ak, "status": "created" })),
@@ -832,7 +848,7 @@ async fn admin_key_patch(
     };
     // Another tenant's key answers 404 (not 403) so a tenant admin can't
     // probe which keys exist outside its scope.
-    match s.handler.state().auth.authenticate(&ak) {
+    match s.handler.state().auth.authenticate(&ak).await {
         Some(existing) if !scope.covers(&existing.tenant) => {
             return error_response(404, format!("key {ak} not found"));
         }
@@ -847,15 +863,22 @@ async fn admin_key_patch(
         Some(v) if v.is_i64() || v.is_u64() => Some(v.as_i64()),
         _ => None,
     };
-    match s.handler.state().auth.patch(
-        &ak,
-        body["qps"].as_f64(),
-        body["daily_token_quota"].as_i64(),
-        tri("tokens_per_minute"),
-        tri("expires_at_epoch_secs"),
-        body["banned"].as_bool(),
-    ) {
-        Some(info) => (
+    let patched = s
+        .handler
+        .state()
+        .auth
+        .patch(
+            &ak,
+            body["qps"].as_f64(),
+            body["daily_token_quota"].as_i64(),
+            tri("tokens_per_minute"),
+            tri("expires_at_epoch_secs"),
+            body["banned"].as_bool(),
+        )
+        .await;
+    match patched {
+        Err(e) => gateway_error(e),
+        Ok(Some(info)) => (
             StatusCode::OK,
             Json(json!({
                 "ak": info.ak, "product": info.product, "tenant": info.tenant,
@@ -867,7 +890,7 @@ async fn admin_key_patch(
             })),
         )
             .into_response(),
-        None => error_response(404, format!("key {ak} not found")),
+        Ok(None) => error_response(404, format!("key {ak} not found")),
     }
 }
 
@@ -882,20 +905,20 @@ async fn admin_key_delete(
         Ok(scope) => scope,
         Err((st, msg)) => return error_response(st, msg),
     };
-    match s.handler.state().auth.authenticate(&ak) {
+    match s.handler.state().auth.authenticate(&ak).await {
         Some(existing) if !scope.covers(&existing.tenant) => {
             return error_response(404, format!("key {ak} not found"));
         }
         _ => {}
     }
-    if s.handler.state().auth.revoke(&ak) {
-        (
+    match s.handler.state().auth.revoke(&ak).await {
+        Err(e) => gateway_error(e),
+        Ok(true) => (
             StatusCode::OK,
             Json(json!({ "ak": ak, "status": "revoked" })),
         )
-            .into_response()
-    } else {
-        error_response(404, format!("key {ak} not found"))
+            .into_response(),
+        Ok(false) => error_response(404, format!("key {ak} not found")),
     }
 }
 
@@ -906,11 +929,11 @@ async fn admin_key_list(State(s): State<AppState>, headers: HeaderMap) -> Respon
         Ok(scope) => scope,
         Err((st, msg)) => return error_response(st, msg),
     };
-    let keys: Vec<Value> = s
-        .handler
-        .state()
-        .auth
-        .list()
+    let listed = match s.handler.state().auth.list().await {
+        Ok(v) => v,
+        Err(e) => return gateway_error(e),
+    };
+    let keys: Vec<Value> = listed
         .into_iter()
         .filter(|k| scope.covers(&k.tenant))
         .map(|k| {
@@ -1064,7 +1087,7 @@ async fn chat_completions(
     Json(body): Json<ChatCompletionRequest>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
@@ -1352,7 +1375,7 @@ async fn messages(
     Json(body): Json<MessagesRequest>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => return anthropic_error(st, msg),
     };
@@ -1696,7 +1719,7 @@ async fn completions(
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
@@ -1766,7 +1789,7 @@ async fn responses(
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
@@ -1868,7 +1891,7 @@ async fn embeddings(
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
@@ -1910,7 +1933,7 @@ async fn images_generations(
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
@@ -1945,7 +1968,7 @@ async fn images_edits(
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
@@ -1980,7 +2003,7 @@ async fn audio_speech(
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
@@ -2029,7 +2052,7 @@ async fn audio_transcriptions(
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
@@ -2076,7 +2099,7 @@ async fn batches_submit(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let ak = match authenticate(&s, &headers) {
+    let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
@@ -2141,7 +2164,7 @@ async fn files_upload(
     Json(body): Json<Value>,
 ) -> Response {
     // gate on a valid AK (the file store isn't AK-scoped in this local subset).
-    if let Err((st, msg)) = authenticate(&s, &headers) {
+    if let Err((st, msg)) = authenticate(&s, &headers).await {
         return error_response(st, msg);
     }
     let purpose = body["purpose"].as_str().unwrap_or("batch").to_owned();
@@ -2178,7 +2201,7 @@ async fn files_get(
     Path(id): Path<String>,
 ) -> Response {
     // ids are sequential — without auth any client could enumerate all files.
-    if let Err((st, msg)) = authenticate(&s, &headers) {
+    if let Err((st, msg)) = authenticate(&s, &headers).await {
         return error_response(st, msg);
     }
     match s.handler.state().store.file_get(&id).await {
@@ -2198,7 +2221,7 @@ async fn files_content(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err((st, msg)) = authenticate(&s, &headers) {
+    if let Err((st, msg)) = authenticate(&s, &headers).await {
         return error_response(st, msg);
     }
     match s.handler.state().store.file_get(&id).await {
@@ -2214,7 +2237,7 @@ async fn batches_get(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err((st, msg)) = authenticate(&s, &headers) {
+    if let Err((st, msg)) = authenticate(&s, &headers).await {
         return error_response(st, msg);
     }
     match s.handler.state().store.batch_get(&id).await {
