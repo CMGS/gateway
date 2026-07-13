@@ -900,12 +900,9 @@ fn chat_stream_response(
                 }
                 Some(c) => {
                     if !c.delta.is_empty() {
-                        let chunk = ChatCompletionChunk::content(
-                            &st.id,
-                            st.created,
-                            &st.model,
-                            c.delta.clone(),
-                        );
+                        // move the delta text (owned chunk, field not read again)
+                        let chunk =
+                            ChatCompletionChunk::content(&st.id, st.created, &st.model, c.delta);
                         if let Ok(payload) = serde_json::to_string(&chunk) {
                             st.queue.push_back(Event::default().data(payload));
                         }
