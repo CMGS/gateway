@@ -11,10 +11,12 @@ key-based auth, quotas, rate limits, failover, and a billing ledger.
 - **OpenAI + Anthropic compatible surface** — `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/embeddings`, `/v1/images/{generations,edits}`, `/v1/audio/{speech,transcriptions}`, `/v1/batches` + `/v1/files`, `/v1/models`, `/v1/realtime` (WebSocket) — streaming and non-streaming
 - **Cross-protocol conversion** — serve Anthropic-style `/v1/messages` on OpenAI-protocol models and vice versa, including streaming event mapping
 - **Staged request pipeline** — a 4-layer DAG per request: model resolve / quota / cache lookup → account selection (priority, PTU-first, failover) → rate limits + engine call (retry on upstream 5xx) → usage extraction, billing, cache store
-- **Governance built in** — access-key auth, daily token quotas, QPS / QPM / TPM limits at key, product, and model level, request-level TTL cache, account cooldown and recovery, DLP redaction and blocklist plugins
+- **Governance built in** — access-key auth, daily token quotas, QPS / QPM / TPM limits at key, product, and model level, request-level TTL cache, account cooldown and recovery, DLP redaction and blocklist plugins. Admission reserves then settles, so concurrent requests can't overshoot a quota
+- **Multi-tenant** — keys carry a tenant; tenants get a pooled QPS bucket, a model entitlement allowlist, per-(key, model) quota defaults with an optional fallback-model degrade, key lifecycle (expiry/ban), and tenant-scoped admin tokens. Billing records charged cost and (optionally) vendor cost per row, so margin is queryable per tenant × model
+- **Fleet-ready** — run N instances behind a load balancer: Postgres shares config (versioned + a change feed), the access-key table, the ledger/files/batches store, and a distributed batch queue any instance drains; Redis shares rate/quota/TPM counters, account health, and optionally the response cache. Single-node stays zero-dependency
 - **Providers behind traits** — engines talk to upstreams through a `Transport` seam; accounts with a real endpoint go over HTTP (reqwest + rustls), accounts without one are served by a deterministic in-process mock; AWS SigV4 signing included
 - **Observability built in** — Prometheus `/metrics` (per-route request/status counters, per-pipeline-stage latency, token counters), structured access logs
-- **One binary, one YAML** — no external services required; in-process state, optional SQLite persistence, graceful shutdown
+- **One binary, one YAML** — no external services required to start; in-process state by default, SQLite for one-node durability, Postgres + Redis for a shared fleet; graceful shutdown
 
 ## Quick Start
 
