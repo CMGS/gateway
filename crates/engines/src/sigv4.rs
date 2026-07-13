@@ -85,8 +85,6 @@ pub fn sign(p: &SigV4Params) -> (String, String) {
 mod tests {
     use super::*;
 
-    // AWS's published example: GET ListUsers against IAM, us-east-1, 20150830.
-    // https://docs.aws.amazon.com/general/latest/gr/sigv4-signed-request-examples.html
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
 
     #[test]

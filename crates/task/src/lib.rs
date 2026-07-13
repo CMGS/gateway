@@ -39,7 +39,6 @@ mod tests {
         state.governance.quota_consume("ak-x", 42).await;
         assert_eq!(state.governance.quota_used("ak-x").await, 42);
         let handle = spawn_quota_reset(state.clone(), Duration::from_millis(20));
-        // wait for at least one reset tick
         for _ in 0..50 {
             if state.governance.quota_used("ak-x").await == 0 {
                 break;

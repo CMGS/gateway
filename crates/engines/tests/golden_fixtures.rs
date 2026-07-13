@@ -59,14 +59,12 @@ async fn openai_chat_matches_go_recorded_response() {
         .run()
         .await
         .unwrap();
-    // exactly what this fixture is expected to produce
     assert_eq!(out.response.message, "Hello!");
     assert_eq!(out.response.model, "test-model");
     assert_eq!(out.response.finish_reason, "stop");
     assert_eq!(out.response.prompt_tokens, 5);
     assert_eq!(out.response.completion_tokens, 3);
     assert_eq!(out.response.total_tokens, 8);
-    // raw usage subtree is preserved byte-for-byte for the CommonUsage node
     assert_eq!(
         String::from_utf8(out.response.raw_usage_json).unwrap(),
         r#"{"completion_tokens":3,"prompt_tokens":5,"total_tokens":8}"#
@@ -196,7 +194,6 @@ async fn family_and_bespoke_engines_surface_errors() {
         engine.run().await.expect_err("error surfaced").http_status
     }
 
-    // vertex (family)
     let v = VertexEngine::new(
         GatewayRequest {
             message: vec![ChatMsg::text("user", "x")],
@@ -211,7 +208,6 @@ async fn family_and_bespoke_engines_surface_errors() {
     );
     assert_eq!(expect_err(v).await, 429);
 
-    // ernie (bespoke)
     let e = ErnieEngine::new(
         GatewayRequest {
             message: vec![ChatMsg::text("user", "x")],
@@ -226,7 +222,6 @@ async fn family_and_bespoke_engines_surface_errors() {
     );
     assert_eq!(expect_err(e).await, 429);
 
-    // embeddings (family) — also needs typed input to build a request
     let mut p = ModelParamV2::with_name(Protocol::Embeddings, "emb");
     p.typed = Some(gw_models::TypedParams::Embeddings(
         gw_models::EmbeddingParams {
@@ -301,7 +296,6 @@ fn openai_req_stream() -> GatewayRequest {
 /// Fixtures are real recorded vendor error bodies.
 #[tokio::test]
 async fn openai_error_envelope_surfaces() {
-    // a recorded rate-limit error envelope
     let fixture = r#"{"error":{"type":"rate_limit","code":"429","message":"too many requests"}}"#;
     let transport = Arc::new(FixtureTransport {
         status: 200, // vendor 200 body but error envelope → status from error.code
@@ -319,7 +313,6 @@ async fn openai_error_envelope_surfaces() {
 
 #[tokio::test]
 async fn anthropic_error_envelope_surfaces() {
-    // a recorded content-policy error envelope
     let fixture = r#"{"error":{"message":"The request is prohibited due to a violation of provider Terms Of Service","code":403}}"#;
     let err = ClaudeEngine::new(
         claude_req(),
@@ -339,7 +332,6 @@ async fn anthropic_error_envelope_surfaces() {
 
 #[tokio::test]
 async fn minimax_error_envelope_surfaces() {
-    // a recorded minimax-style error envelope with http_code as a string
     let fixture = r#"{"type":"error","error":{"http_code":"529","message":"cluster overloaded"},"request_id":"t"}"#;
     let err = OpenAiEngine::new(
         openai_req(),

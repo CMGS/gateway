@@ -199,8 +199,6 @@ macro_rules! bespoke_engine {
     };
 }
 
-// ------------------------------------------------- Baidu Ernie (Wenxin)
-
 bespoke_engine!(ErnieEngine);
 
 #[async_trait::async_trait]
@@ -266,8 +264,6 @@ impl ModelEngine for ErnieEngine {
     }
 }
 
-// ------------------------------------------------- MiniMax v1 (abab chatcompletion)
-
 bespoke_engine!(MinimaxV1Engine);
 
 #[async_trait::async_trait]
@@ -327,8 +323,6 @@ impl ModelEngine for MinimaxV1Engine {
         &self.base.recorder
     }
 }
-
-// ------------------------------------------------- AWS Bedrock: Cohere Command
 
 bespoke_engine!(CohereEngine);
 
@@ -413,8 +407,6 @@ impl ModelEngine for CohereEngine {
     }
 }
 
-// ------------------------------------------------- AWS Bedrock: Llama
-
 bespoke_engine!(LlamaEngine);
 
 #[async_trait::async_trait]
@@ -491,8 +483,6 @@ impl ModelEngine for LlamaEngine {
         &self.base.recorder
     }
 }
-
-// ------------------------------------------------- Ali DashScope (Qwen native)
 
 bespoke_engine!(DashScopeEngine);
 

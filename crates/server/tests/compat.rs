@@ -6,7 +6,6 @@
 //! field compatibility on the way in, and (b) our gateway's live responses are
 //! diffed against the canonical key sets on the way out. Runs fully offline.
 
-// test scaffolding — unwrap/expect allowed as in #[test] fns (clippy.toml can't reach helpers here)
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeSet;
@@ -168,7 +167,6 @@ async fn live_embeddings_response_matches_openai_shape() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let ours = body_json(resp).await;
-    // OpenAI embeddings canonical keys: object/data/model/usage; item: object/index/embedding
     assert_eq!(
         keys(&ours),
         ["data", "model", "object", "usage"]

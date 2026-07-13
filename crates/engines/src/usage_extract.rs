@@ -87,9 +87,6 @@ mod tests {
 
     #[test]
     fn malformed_usage_never_bills_negative_or_inflated() {
-        // vendor contract violation: more cached than prompt, more reasoning than
-        // completion. Parts must clamp so nothing goes negative AND the parts
-        // sum to the vendor totals — billing recomputes the total from them.
         let raw = br#"{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,
             "prompt_tokens_details":{"cached_tokens":9},
             "completion_tokens_details":{"reasoning_tokens":9}}"#;

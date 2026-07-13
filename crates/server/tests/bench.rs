@@ -9,7 +9,6 @@
 //! hard-require networked state/config backends and RPC to the internal network
 //! at startup, so numbers here reflect this implementation only, in-process.
 
-// test scaffolding — unwrap/expect allowed as in #[test] fns (clippy.toml can't reach helpers here)
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
@@ -97,13 +96,11 @@ async fn bench_big_payload() {
 async fn bench_chat_completions() {
     let app = app();
 
-    // warmup
     for _ in 0..50 {
         let resp = app.clone().oneshot(chat_req()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // serial latency distribution
     const N: usize = 2000;
     let mut lat_us = Vec::with_capacity(N);
     let t0 = Instant::now();
@@ -125,7 +122,6 @@ async fn bench_chat_completions() {
         lat_us[lat_us.len() - 1],
     );
 
-    // concurrent throughput: 64 workers × 50 requests
     const WORKERS: usize = 64;
     const PER: usize = 50;
     let t0 = Instant::now();

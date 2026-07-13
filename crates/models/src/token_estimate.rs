@@ -234,24 +234,17 @@ mod tests {
     #[test]
     fn heuristic_classifies_runs() {
         let e = HeuristicEncoder;
-        // "hello" = 5 letters → ceil(5/4) = 2
         assert_eq!(e.encode_len("hello"), 2);
-        // pure whitespace → 0 standalone tokens
         assert_eq!(e.encode_len("   "), 0);
-        // digits group by 3: "12345" → ceil(5/3) = 2
         assert_eq!(e.encode_len("12345"), 2);
-        // punctuation each ~1 token
         assert_eq!(e.encode_len("!?."), 3);
-        // CJK ~1 token per char
         assert_eq!(e.encode_len("你好"), 2);
-        // empty
         assert_eq!(e.encode_len(""), 0);
     }
 
     #[test]
     fn heuristic_mixed_text() {
         let e = HeuristicEncoder;
-        // "hi there" → "hi"(1) + "there"(ceil(5/4)=2) = 3; space folds in
         assert_eq!(e.encode_len("hi there"), 3);
     }
 
@@ -259,8 +252,6 @@ mod tests {
     fn tiktoken_matches_known_cl100k_counts() {
         let e = TiktokenEncoder::new().unwrap();
         assert_eq!(e.encode_len(""), 0);
-        // canonical cl100k examples (OpenAI cookbook):
-        // "tiktoken is great!" → ["t","ik","token"," is"," great","!"]
         assert_eq!(e.encode_len("tiktoken is great!"), 6);
         assert_eq!(e.encode_len("hello world"), 2);
     }
@@ -278,9 +269,6 @@ mod tests {
             ChatMsg::text("user", "hello"),
         ];
         let n = estimate_prompt_tokens(&msgs, None, "gpt-4o", &e);
-        // 2 messages × 3 overhead + content/role encodings + 3 priming.
-        // must be strictly greater than a raw content-only count (proves the
-        // per-message + role + priming structure is applied).
         let content_only = e.encode_len("be brief") + e.encode_len("hello");
         assert!(
             n > (content_only as i64) + 6,
@@ -294,7 +282,6 @@ mod tests {
         let msgs = vec![ChatMsg::text("user", "x")];
         let modern = estimate_prompt_tokens(&msgs, None, "gpt-4o", &e);
         let gpt35 = estimate_prompt_tokens(&msgs, None, "gpt-3.5-turbo", &e);
-        // same messages, gpt-3.5 counts 4/message vs 3 → exactly +1 per message.
         assert_eq!(gpt35 - modern, 1, "gpt-3.5 adds 1 token/message");
     }
 
@@ -303,12 +290,10 @@ mod tests {
         let e = HeuristicEncoder;
         let plain = vec![ChatMsg::text("user", "hi")];
         let base = estimate_prompt_tokens(&plain, None, "gpt-4o", &e);
-        // adding tool definitions must raise the estimate.
         let tools = json!([{"type":"function","function":{"name":"get_weather","parameters":{}}}]);
         let with_tools = estimate_prompt_tokens(&plain, Some(&tools), "gpt-4o", &e);
         assert!(with_tools > base, "tool defs must add tokens");
 
-        // an assistant message carrying a tool_call adds 3 + name + args.
         let mut asst = ChatMsg::text("assistant", "");
         asst.tool_calls = Some(json!([
             {"function":{"name":"get_weather","arguments":"{\"city\":\"NYC\"}"}}
@@ -328,8 +313,6 @@ mod tests {
             {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
         ]));
         let n = estimate_prompt_tokens(&[msg], None, "gpt-4o", &e);
-        // "describe" (ceil(8/4)=2) + role "user"(1) + 3 msg + 3 priming = 9;
-        // the base64 image URL must NOT be counted as text.
         assert_eq!(n, 9, "only text parts counted, image excluded");
     }
 }

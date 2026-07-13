@@ -195,8 +195,6 @@ mod tests {
 
     #[test]
     fn dlp_redacts_multimodal_parts_not_just_content() {
-        // A multimodal message: the engine forwards `parts`, so PII in a text
-        // part must be scrubbed there — redacting `content` alone would leak it.
         let mut msg = ChatMsg::text("user", "see image");
         msg.parts = Some(serde_json::json!([
             {"type":"text","text":"my email is jane@corp.com"},
@@ -218,7 +216,6 @@ mod tests {
             !parts.to_string().contains("jane@corp.com"),
             "original email must not survive anywhere in parts"
         );
-        // the image part is untouched
         assert_eq!(parts[1]["type"], "image_url");
     }
 }

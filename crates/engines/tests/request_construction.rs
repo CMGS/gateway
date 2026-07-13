@@ -2,7 +2,6 @@
 //! bodies (the other half of the round-trip; response parsing is covered by
 //! golden_fixtures.rs). Fully offline.
 
-// test scaffolding — unwrap/expect allowed as in #[test] fns (clippy.toml can't reach helpers here)
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::{Arc, Mutex};
@@ -92,14 +91,12 @@ async fn openai_request_shape() {
     let _ = OpenAiEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
     assert_eq!(b["model"], "gpt-4o");
-    // system + user messages preserved, in order
     assert_eq!(b["messages"][0]["role"], "system");
     assert_eq!(b["messages"][1]["role"], "user");
     assert_eq!(b["messages"][1]["content"], "hello");
     assert_eq!(b["stream"], false);
     assert_eq!(b["temperature"], 0.5);
     assert_eq!(b["max_tokens"], 256);
-    // correct endpoint path + auth header
     assert!(
         t.url().ends_with("/v1/chat/completions"),
         "url: {}",
@@ -114,9 +111,6 @@ async fn openai_request_shape() {
 
 #[tokio::test]
 async fn openai_streaming_requests_usage() {
-    // streaming must ask for usage, else OpenAI omits it and billing sees 0 tokens.
-    // (this test inspects the REQUEST only; response handling is covered elsewhere,
-    // so a plain JSON reply is fine for the RecordingTransport.)
     let t = RecordingTransport::new(
         r#"{"model":"gpt","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
     );
@@ -144,11 +138,9 @@ async fn anthropic_request_shape() {
     let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
     assert_eq!(b["model"], "claude-sonnet");
-    // stop → Anthropic's stop_sequences (not dropped, not sent as `stop`)
     assert_eq!(b["stop_sequences"][0], "STOP");
     assert_eq!(b["stop_sequences"][1], "END");
     assert!(b.get("stop").is_none());
-    // system turn is lifted to a top-level `system` field (anthropic wire), not a message
     assert_eq!(b["system"], "be brief");
     assert_eq!(b["messages"].as_array().unwrap().len(), 1); // only the user turn remains
     assert_eq!(b["messages"][0]["role"], "user");
@@ -159,14 +151,11 @@ async fn anthropic_request_shape() {
         t.header("content-type").as_deref(),
         Some("application/json")
     );
-    // Anthropic mandates the version header
     assert_eq!(t.header("anthropic-version").as_deref(), Some("2023-06-01"));
 }
 
 #[tokio::test]
 async fn anthropic_multimodal_content_preserved() {
-    // multimodal input (text + image block) must reach the vendor as content
-    // blocks, not be flattened to text.
     let t = RecordingTransport::new(
         r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
     );
@@ -185,7 +174,6 @@ async fn anthropic_multimodal_content_preserved() {
     req.message = vec![msg];
     let _ = ClaudeEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
-    // content is the block array, not a flattened string
     let content = &b["messages"][0]["content"];
     assert!(content.is_array(), "content should be blocks: {content}");
     assert_eq!(content[0]["type"], "text");
@@ -208,7 +196,6 @@ async fn vertex_request_shape() {
     }
     let _ = VertexEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
-    // gemini uses contents[].parts[].text with role "user"/"model"
     let contents = b["contents"].as_array().unwrap();
     assert_eq!(contents.last().unwrap()["parts"][0]["text"], "hello");
     assert!(
@@ -217,23 +204,16 @@ async fn vertex_request_shape() {
         "url: {}",
         t.url()
     );
-    // Gemini API auth: an x-goog-api-key header, never a Bearer token
     assert!(t.header("x-goog-api-key").is_some());
     assert!(t.header("authorization").is_none());
-    // sampling params reach Gemini via generationConfig (not silently dropped)
     assert_eq!(b["generationConfig"]["temperature"], 0.4);
     assert_eq!(b["generationConfig"]["maxOutputTokens"], 128);
 }
 
 #[tokio::test]
 async fn go_live_seam_routes_to_configured_endpoint() {
-    // go-live readiness: when the account has a real endpoint + key env,
-    // engines must build the REAL URL + auth, not the mock sentinel. This is the
-    // switch that flips every engine live — verify it for both a chat-messages
-    // engine (Claude, x-api-key) and a family engine (Vertex, Bearer).
     use gw_models::Account;
 
-    // Claude → x-api-key + real /v1/messages endpoint.
     let t = RecordingTransport::new(
         r#"{"model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
     );
@@ -249,10 +229,8 @@ async fn go_live_seam_routes_to_configured_endpoint() {
         !t.url().starts_with("mock://"),
         "must not be the mock sentinel"
     );
-    // key comes from the account's env var (unset here → inert "mock", never a panic)
     assert!(t.header("x-api-key").is_some());
 
-    // Vertex (family engine) → real generateContent endpoint, x-goog-api-key auth.
     let t2 = RecordingTransport::new(
         r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#,
     );
@@ -275,9 +253,6 @@ async fn go_live_seam_routes_to_configured_endpoint() {
 
 #[tokio::test]
 async fn go_live_seam_aws_sigv4_uses_real_credentials() {
-    // At go-live the AWS engines must sign with the account's real key pair (from
-    // its two env vars), not the mock creds. SigV4 embeds the access key id in the
-    // Authorization header's `Credential=<access_key>/...` component.
     use gw_models::Account;
     // SAFETY: unique test-local var names; no concurrent reader.
     unsafe {
@@ -297,7 +272,6 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
         ..Default::default()
     });
     let _ = CohereEngine::new(req, t.clone()).run().await.unwrap();
-    // real endpoint host, and the signature credential uses the real access key
     assert!(
         t.url()
             .starts_with("https://bedrock-runtime.eu-west-1.amazonaws.com/model/"),
@@ -324,8 +298,6 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
 
 #[tokio::test]
 async fn go_live_seam_bespoke_dashscope() {
-    // bespoke engines are now go-live-ready too: configured endpoint → real URL,
-    // Bearer key from the account (unset env → inert "mock", never a panic).
     use gw_models::Account;
     let t = RecordingTransport::new(
         r#"{"output":{"text":"ok","finish_reason":"stop"},"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#,
@@ -349,13 +321,10 @@ async fn go_live_seam_bespoke_dashscope() {
 
 #[tokio::test]
 async fn legacy_completions_sends_prompt_not_messages() {
-    // Legacy completions uses {prompt} at /v1/completions — NOT the chat
-    // {messages} shape at /v1/chat/completions.
     let t = RecordingTransport::new(
         r#"{"id":"cmpl-1","object":"text_completion","model":"instruct","choices":[{"text":"ok","index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}"#,
     );
     let mut req = chat_req(Protocol::Completions, "gpt-3.5-turbo-instruct");
-    // the view carries the prompt as a single message; engine joins message text.
     req.message = vec![ChatMsg::text("user", "once upon a time")];
     if let Some(p) = req.model_param_v2.as_mut() {
         p.typed = Some(TypedParams::Chat(ChatParams {
@@ -380,8 +349,6 @@ async fn legacy_completions_sends_prompt_not_messages() {
 
 #[tokio::test]
 async fn responses_api_forwards_native_body() {
-    // The Responses engine forwards the client's native Responses-shaped body
-    // (carried in `raw`) to the /responses endpoint, ensuring `model` is set.
     let t = RecordingTransport::new(
         r#"{"id":"resp_1","object":"response","model":"gpt-5","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}"#,
     );
@@ -396,21 +363,16 @@ async fn responses_api_forwards_native_body() {
     });
     let _ = ResponsesEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
-    // native fields preserved verbatim (passthrough), model ensured
     assert_eq!(b["instructions"], "be brief");
     assert_eq!(b["max_output_tokens"], 256);
     assert_eq!(b["input"][0]["role"], "user");
     assert_eq!(b["model"], "gpt-5");
-    // hits the Responses endpoint, not chat/completions
     assert!(t.url().contains("/responses"), "url: {}", t.url());
-    // NOT the chat shape
     assert!(b.get("messages").is_none(), "must not be chat-shaped");
 }
 
 #[tokio::test]
 async fn vertex_multimodal_image_becomes_inline_data() {
-    // A multimodal message must reach Gemini as inlineData, not be dropped to
-    // text-only (Gemini previously silently dropped every image).
     let t = RecordingTransport::new(
         r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#,
     );
@@ -427,18 +389,14 @@ async fn vertex_multimodal_image_becomes_inline_data() {
     let _ = VertexEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
     let parts = b["contents"][0]["parts"].as_array().unwrap();
-    // text part preserved
     assert_eq!(parts[0]["text"], "what is this?");
-    // image translated to Gemini inlineData (mime + base64 payload), not dropped
     assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
     assert_eq!(parts[1]["inlineData"]["data"], "iVBORw0KGgo=");
-    // the OpenAI image_url shape must NOT leak through
     assert!(!b.to_string().contains("image_url"), "openai shape leaked");
 }
 
 #[tokio::test]
 async fn ernie_request_shape() {
-    // baidu wenxinworkshop: {messages:[{role,content}]}, system as top-level field
     let t = RecordingTransport::new(
         r#"{"result":"ok","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
     );
@@ -447,7 +405,6 @@ async fn ernie_request_shape() {
         .await
         .unwrap();
     let b = t.body_json();
-    // system turn excluded from messages; user turn present
     assert_eq!(b["messages"][0]["role"], "user");
     assert_eq!(b["messages"][0]["content"], "hello");
     assert!(t.url().contains("wenxinworkshop"), "url: {}", t.url());
@@ -459,10 +416,6 @@ async fn ernie_request_shape() {
 
 #[tokio::test]
 async fn bespoke_forwards_raw_passthrough_params() {
-    // Bespoke engines serialize the whole param object, so every caller-set
-    // field reaches the vendor. We cherry-pick a couple of typed
-    // fields and let `raw` carry the rest — assert it actually flows through and
-    // that a typed field stays authoritative over the same key in `raw`.
     let t = RecordingTransport::new(
         r#"{"result":"ok","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
     );
@@ -472,15 +425,12 @@ async fn bespoke_forwards_raw_passthrough_params() {
             temperature: Some(0.3),
             ..Default::default()
         }));
-        // penalty_score/top_p aren't in our per-vendor extraction; temperature IS,
-        // and collides with a raw value to prove typed wins.
         p.raw = serde_json::json!({"penalty_score": 1.5, "top_p": 0.8, "temperature": 0.99});
     }
     let _ = ErnieEngine::new(req, t.clone()).run().await.unwrap();
     let b = t.body_json();
     assert_eq!(b["penalty_score"], 1.5, "raw param must reach vendor");
     assert_eq!(b["top_p"], 0.8, "raw param must reach vendor");
-    // typed temperature (0.3) wins over the raw one (0.99): or_insert semantics.
     assert_eq!(
         b["temperature"], 0.3,
         "typed field stays authoritative over raw"
@@ -489,7 +439,6 @@ async fn bespoke_forwards_raw_passthrough_params() {
 
 #[tokio::test]
 async fn minimax_v1_request_shape() {
-    // minimax v1: sender_type USER/BOT + text
     let t = RecordingTransport::new(
         r#"{"reply":"ok","usage":{"total_tokens":2},"base_resp":{"status_code":0,"status_msg":""}}"#,
     );
@@ -506,7 +455,6 @@ async fn minimax_v1_request_shape() {
 
 #[tokio::test]
 async fn cohere_request_shape_with_sigv4() {
-    // aws cohere: {message, chat_history}, SigV4 Authorization header
     let t = RecordingTransport::new(
         r#"{"text":"ok","finish_reason":"COMPLETE","meta":{"tokens":{"input_tokens":1,"output_tokens":1}}}"#,
     );
@@ -517,7 +465,6 @@ async fn cohere_request_shape_with_sigv4() {
     let b = t.body_json();
     assert_eq!(b["message"], "hello"); // last user turn becomes `message`
     assert!(b["chat_history"].is_array());
-    // real SigV4 authorization header present
     let auth = t.header("authorization").expect("SigV4 auth header");
     assert!(
         auth.starts_with("AWS4-HMAC-SHA256 Credential="),
@@ -529,7 +476,6 @@ async fn cohere_request_shape_with_sigv4() {
 
 #[tokio::test]
 async fn llama_request_shape_with_sigv4() {
-    // aws llama: {prompt}, SigV4 header
     let t = RecordingTransport::new(
         r#"{"generation":"ok","prompt_token_count":1,"generation_token_count":1,"stop_reason":"stop"}"#,
     );
@@ -538,7 +484,6 @@ async fn llama_request_shape_with_sigv4() {
         .await
         .unwrap();
     let b = t.body_json();
-    // conversation folded into a prompt string containing the user turn
     assert!(
         b["prompt"].as_str().unwrap().contains("hello"),
         "prompt: {}",
@@ -561,15 +506,12 @@ async fn dashscope_request_shape() {
         .await
         .unwrap();
     let b = t.body_json();
-    // DashScope native: input.messages + parameters.result_format
     assert_eq!(b["model"], "qwen-max");
     assert_eq!(b["input"]["messages"][0]["role"], "system");
     assert_eq!(b["input"]["messages"][1]["content"], "hello");
     assert_eq!(b["parameters"]["result_format"], "message");
     assert!(t.url().contains("dashscope"), "url: {}", t.url());
 }
-
-// --- non-chat families: request-side alignment across all engine families ---
 
 fn typed_req(mt: Protocol, name: &str, typed: TypedParams) -> GatewayRequest {
     let mut p = ModelParamV2::with_name(mt, name);
@@ -625,14 +567,11 @@ async fn image_request_shape() {
     assert_eq!(b["prompt"], "a cat");
     assert_eq!(b["n"], 2);
     assert!(t.url().ends_with("/images/generations"), "url: {}", t.url());
-    // no source image → generation, not edit
     assert!(b.get("image").is_none());
 }
 
 #[tokio::test]
 async fn image_edit_routes_to_edits_endpoint() {
-    // ImageParams.image present → the engine posts to /images/edits with the
-    // source image (+ optional mask), not /images/generations.
     let t = RecordingTransport::new(r#"{"created":1,"data":[{"b64_json":"AAAA"}]}"#);
     let req = typed_req(
         Protocol::Image,

@@ -8,7 +8,6 @@
 //! live transport machinery; byte-level alignment with real vendors
 //! still needs real endpoints + credentials.
 
-// test scaffolding — unwrap/expect allowed as in #[test] fns (clippy.toml can't reach helpers here)
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
@@ -108,7 +107,6 @@ async fn http_transport_sse_over_real_socket() {
     };
     let resp = transport.send(req).await.expect("real http round trip");
     assert_eq!(resp.status, 200);
-    // live SSE arrives as a stream now; buffering it exercises the drain path
     assert!(matches!(resp.body, UpstreamBody::SseStream(_)));
     let resp = resp.buffered().await.expect("drain live sse");
     let UpstreamBody::Sse(b) = resp.body else {
@@ -165,11 +163,6 @@ async fn dispatch_routes_mock_scheme_in_process_and_real_urls_over_http() {
 
 #[tokio::test]
 async fn engine_through_real_http_transport_end_to_end() {
-    // GENUINE full path: OpenAiEngine builds the request → routes to the account's
-    // configured endpoint (the local server) → HttpTransport sends over a real
-    // socket → engine parses the reply. This is exactly the go-live path; the only
-    // thing separating it from a real vendor is the endpoint URL + credentials in
-    // account config.
     let base = spawn_vendor().await;
     let transport: gw_engines::SharedTransport =
         Arc::new(HttpTransport::new(Duration::from_secs(5)).unwrap());
@@ -212,8 +205,6 @@ async fn per_account_policy_and_connect_retry() {
     assert_eq!(transport.policy_for("tight").connect_retries, 2);
     assert_eq!(transport.policy_for("other").connect_retries, 1);
 
-    // grab a port and close it: connect must fail, retry twice (100+200ms
-    // backoff), then surface a 502 — an in-flight request is never replayed.
     let closed = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap()
@@ -266,7 +257,6 @@ async fn client_disconnect_midstream_is_499_not_500() {
         }
     }
 
-    // a stream_tx whose receiver is dropped immediately = a gone client
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     drop(rx);
     let mut request = GatewayRequest {
@@ -309,7 +299,6 @@ async fn midstream_upstream_error_after_send_aborts_without_failover() {
         }
     }
 
-    // a live receiver that stays open (client still connected)
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let mut request = GatewayRequest {
@@ -320,8 +309,6 @@ async fn midstream_upstream_error_after_send_aborts_without_failover() {
     };
     request.stream_tx = Some(tx);
 
-    // committed response: no error, no failover — the delivered part is kept
-    // (and billed from) as an aborted outcome
     let out = OpenAiEngine::new(request, Arc::new(FlakyStream))
         .run()
         .await
@@ -348,7 +335,6 @@ async fn vendor_error_frame_after_send_aborts_without_failover() {
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
                 )),
-                // a vendor overload error delivered as a normal SSE frame
                 Ok(bytes::Bytes::from(
                     "data: {\"error\":{\"message\":\"overloaded\"}}\n\n",
                 )),

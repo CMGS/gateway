@@ -10,7 +10,6 @@
 //! everything EXCEPT the vendor's identity is the real go-live path — swap the
 //! account endpoint/api_key_env for a real vendor and it is live, no code change.
 
-// test scaffolding — unwrap/expect allowed as in #[test] fns (clippy.toml can't reach helpers here)
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
@@ -65,12 +64,9 @@ async fn spawn_vendor() -> String {
                 }
             }),
         )
-        // Anthropic-shaped endpoint: proves a NON-OpenAI engine (ClaudeEngine,
-        // x-api-key auth, /v1/messages) also completes over the real transport.
         .route(
             "/v1/messages",
             post(|headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
-                // the go-live seam must send the account key as x-api-key (not Bearer)
                 let has_key = headers.contains_key("x-api-key");
                 let user = body["messages"]
                     .as_array()
@@ -145,7 +141,6 @@ async fn full_pipeline_over_real_http() {
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
 
-    // response came from the loopback vendor, through the whole pipeline over real HTTP
     assert_eq!(j["object"], "chat.completion");
     assert_eq!(j["model"], "gpt-live");
     assert!(
@@ -156,7 +151,6 @@ async fn full_pipeline_over_real_http() {
     );
     assert_eq!(j["usage"]["total_tokens"], 11);
 
-    // billing recorded through the real path
     let resp = app
         .oneshot(
             Request::builder()
@@ -175,8 +169,6 @@ async fn full_pipeline_over_real_http() {
 
 #[tokio::test]
 async fn streaming_pipeline_over_real_http() {
-    // distinct path: vendor SSE → HttpTransport content-type detection → engine
-    // parse_sse → views SSE re-emission, all over a real socket.
     let vendor = spawn_vendor().await;
     let app = gateway(&vendor);
     let req = Request::builder()
@@ -209,7 +201,6 @@ async fn streaming_pipeline_over_real_http() {
         .collect();
     assert!(frames.len() >= 2, "sse frames: {frames:?}");
     assert_eq!(*frames.last().unwrap(), "[DONE]");
-    // reassemble deltas: the vendor's streamed content came through the whole pipeline
     let mut assembled = String::new();
     for f in &frames[..frames.len() - 1] {
         let v: Value = serde_json::from_str(f).unwrap();
@@ -225,10 +216,6 @@ async fn streaming_pipeline_over_real_http() {
 
 #[tokio::test]
 async fn claude_messages_over_real_http() {
-    // Proves the go-live seam works for a NON-OpenAI engine: an Anthropic-protocol
-    // request drives ClaudeEngine → HttpTransport → real socket → /v1/messages on
-    // the loopback vendor, with the account key sent as x-api-key. This is the
-    // integration capstone for the "all engines go-live-ready" work.
     let vendor = spawn_vendor().await;
     let app = gateway(&vendor);
     let req = Request::builder()
@@ -243,8 +230,6 @@ async fn claude_messages_over_real_http() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
-    // response came back from the loopback vendor's /v1/messages over real HTTP,
-    // reshaped to the Anthropic wire response by the views layer.
     assert_eq!(j["type"], "message");
     assert!(
         j["content"][0]["text"]
@@ -252,7 +237,6 @@ async fn claude_messages_over_real_http() {
             .unwrap()
             .contains("anthropic echo (keyed=true)")
     );
-    // billed through the real path, attributed to the anthropic account
     let resp = app
         .oneshot(
             Request::builder()
@@ -271,7 +255,6 @@ async fn claude_messages_over_real_http() {
 async fn auth_and_limits_still_apply_over_real_http() {
     let vendor = spawn_vendor().await;
     let app = gateway(&vendor);
-    // wrong key is rejected before any upstream call
     let req = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")

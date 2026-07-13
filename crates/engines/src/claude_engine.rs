@@ -405,7 +405,6 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}\n\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"sf\\\"}\"}}\n\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            // input_tokens here, not in message_start — the MiniMax placement
             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":9,\"output_tokens\":5}}\n\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
@@ -418,7 +417,6 @@ mod tests {
         assert_eq!(tc[0]["name"], "get_weather");
         assert_eq!(tc[0]["input"]["city"], "sf");
         assert!(out.chunks.iter().any(|c| c.tool_calls.is_some()));
-        // message_delta's input_tokens wins over message_start's
         assert_eq!(out.response.prompt_tokens, 9);
         assert_eq!(out.response.completion_tokens, 5);
     }
@@ -435,7 +433,6 @@ mod tests {
         }
         let e = ClaudeEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();
-        // mock answers tool requests with a tool_use block
         assert_eq!(out.response.finish_reason, "tool_use");
         let tc = out.response.tool_calls.expect("tool_use blocks");
         assert_eq!(tc[0]["type"], "tool_use");

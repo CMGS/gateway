@@ -311,19 +311,16 @@ mod tests {
 
     #[test]
     fn account_endpoint_and_key_seam() {
-        // default account: mock sentinel, no key → callers use "mock"
         let a = Account::default();
         assert_eq!(a.base_url("mock://x"), "mock://x");
         assert!(a.api_key().is_none());
 
-        // configured endpoint wins; trailing slash trimmed
         let a = Account {
             endpoint: "https://api.vendor.com/".into(),
             ..Default::default()
         };
         assert_eq!(a.base_url("mock://x"), "https://api.vendor.com");
 
-        // key read from the named env var at call time (secret never on the struct)
         let var = "GW_TEST_ACCOUNT_KEY_SEAM";
         // SAFETY: the var name is unique to this test and nothing reads it concurrently.
         unsafe { std::env::set_var(var, "sk-secret-123") };

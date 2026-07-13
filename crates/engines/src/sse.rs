@@ -96,7 +96,6 @@ mod tests {
     fn multibyte_utf8_split_across_feeds_survives() {
         let mut d = SseDecoder::default();
         let payload = "data: {\"t\":\"你好😀\"}\n\n".as_bytes();
-        // split inside the first multi-byte character
         let (a, b) = payload.split_at(13);
         assert!(std::str::from_utf8(a).is_err(), "split must land mid-char");
         assert!(d.feed(a).is_empty());
@@ -105,11 +104,9 @@ mod tests {
 
     #[test]
     fn crlf_framed_events_split() {
-        // Google frames SSE with \r\n\r\n — must split just like \n\n.
         let mut d = SseDecoder::default();
         let got = d.feed(b"data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\r\n\r\n");
         assert_eq!(got, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
-        // boundary split across network chunks mid-CRLF
         let mut d = SseDecoder::default();
         assert!(d.feed(b"data: x\r\n\r").is_empty());
         assert_eq!(d.feed(b"\n"), vec!["x"]);
@@ -118,7 +115,6 @@ mod tests {
     #[test]
     fn crlf_tolerated() {
         let (events, done) = SseDecoder::decode_all(b"data: x\r\n\n\ndata: [DONE]\r\n\n\n");
-        // CRLF payload lines keep working; exact blank-line style varies by vendor
         assert_eq!(events, vec!["x"]);
         assert!(done);
     }

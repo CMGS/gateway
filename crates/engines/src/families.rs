@@ -162,8 +162,6 @@ macro_rules! family_engine {
     };
 }
 
-// ---------------------------------------------------------------- Vertex chat
-
 /// Build Gemini `parts` from a unified message. Text → `{"text":…}`; data-URI
 /// images → `{"inlineData":{"mimeType","data"}}` (Gemini's inline-image shape).
 /// camelCase keys match this engine's existing `generationConfig`/`topP`
@@ -432,8 +430,6 @@ fn vertex_raw_usage(resp: &GatewayResponse) -> Vec<u8> {
     .into_bytes()
 }
 
-// ---------------------------------------------------------------- Embeddings
-
 family_engine!(EmbeddingsEngine);
 
 #[async_trait::async_trait]
@@ -506,8 +502,6 @@ impl ModelEngine for EmbeddingsEngine {
     }
 }
 
-// ---------------------------------------------------------------- Image
-
 family_engine!(ImageEngine);
 
 #[async_trait::async_trait]
@@ -573,8 +567,6 @@ impl ModelEngine for ImageEngine {
         &self.base.recorder
     }
 }
-
-// ---------------------------------------------------------------- Audio
 
 /// Which audio surface this engine serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -677,8 +669,6 @@ impl ModelEngine for AudioEngine {
     }
 }
 
-// ---------------------------------------------------------------- Video
-
 family_engine!(VideoEngine);
 
 #[async_trait::async_trait]
@@ -742,8 +732,6 @@ impl ModelEngine for VideoEngine {
     }
 }
 
-// ---------------------------------------------------------------- Search
-
 family_engine!(SearchEngine);
 
 #[async_trait::async_trait]
@@ -802,8 +790,6 @@ impl ModelEngine for SearchEngine {
     }
 }
 
-// ---------------------------------------------------------------- Passthrough
-
 family_engine!(PassthroughEngine);
 
 #[async_trait::async_trait]
@@ -846,8 +832,6 @@ impl ModelEngine for PassthroughEngine {
         &self.base.recorder
     }
 }
-
-// ---------------------------------------------------------------- Legacy completions
 
 family_engine!(CompletionsEngine);
 
@@ -925,8 +909,6 @@ impl ModelEngine for CompletionsEngine {
         &self.base.recorder
     }
 }
-
-// ---------------------------------------------------------------- Responses API
 
 family_engine!(ResponsesEngine);
 
@@ -1324,51 +1306,40 @@ mod tests {
 
     #[tokio::test]
     async fn responses_api_round_trip() {
-        // Responses request: native body lives in `raw` (the client's Responses
-        // shape). Engine forwards it, parses output-item text and input/output
-        // token usage.
         let mut r = req(Protocol::Responses, "gpt-5-responses", None);
         r.model_param_v2.as_mut().unwrap().raw = serde_json::json!({
             "input": "summarize this",
             "instructions": "be terse",
         });
         let out = ResponsesEngine::new(r, t()).run().await.unwrap();
-        // assistant text extracted from output[].content[].output_text
         assert!(
             out.response.message.contains("you said: summarize this"),
             "message: {}",
             out.response.message
         );
         assert_eq!(out.response.finish_reason, "completed");
-        // Responses input_tokens/output_tokens surfaced as prompt/completion tokens
         assert!(out.response.prompt_tokens > 0 && out.response.completion_tokens > 0);
         assert_eq!(
             out.response.total_tokens,
             out.response.prompt_tokens + out.response.completion_tokens
         );
-        // usage normalized to openai shape so downstream billing reads it
         let u = String::from_utf8(out.response.raw_usage_json).unwrap();
         assert!(u.contains("prompt_tokens") && u.contains("completion_tokens"));
     }
 
     #[tokio::test]
     async fn responses_api_streaming() {
-        // stream=true → engine decodes response.output_text.delta frames into
-        // chunks and reads final usage from the response.completed frame.
         let mut r = req(Protocol::Responses, "gpt-5-responses", None);
         r.stream = true;
         r.model_param_v2.as_mut().unwrap().raw = serde_json::json!({"input": "stream this"});
         let out = ResponsesEngine::new(r, t()).run().await.unwrap();
-        // at least the two text deltas + the completed marker
         assert!(out.chunks.len() >= 2, "chunks: {:?}", out.chunks);
         assert!(out.chunks.iter().any(|c| c.finish_reason.is_some()));
-        // reassembled message matches what the deltas spelled out
         assert!(
             out.response.message.contains("you said: stream this"),
             "message: {}",
             out.response.message
         );
-        // usage recovered from the completed frame
         assert!(out.response.prompt_tokens > 0 && out.response.completion_tokens > 0);
     }
 }

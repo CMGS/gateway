@@ -450,7 +450,6 @@ mod tests {
         }];
         let e = OpenAiEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();
-        // mock acknowledges image parts it saw
         assert!(
             out.response.message.contains("[saw 1 image(s)]"),
             "{}",
@@ -469,7 +468,6 @@ mod tests {
             }));
             p.raw = json!({"seed": 42});
         }
-        // MockTransport echoes params presence via a marker when seed is set
         let e = OpenAiEngine::new(r, Arc::new(MockTransport));
         let out = e.run().await.unwrap();
         assert!(out.response.message.contains("you said:"));

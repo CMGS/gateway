@@ -285,7 +285,6 @@ mod tests {
         assert_eq!(out["role"], "assistant");
         assert_eq!(out["model"], "gpt-4o");
         assert_eq!(out["stop_reason"], "end_turn");
-        // collect: message content wrapped into a text block
         assert_eq!(out["content"][0]["type"], "text");
         assert_eq!(out["content"][0]["text"], "Hello!");
         assert_eq!(out["usage"]["input_tokens"], 10); // renamed from prompt_tokens
@@ -294,7 +293,6 @@ mod tests {
 
     #[test]
     fn collect_wraps_tool_calls_into_tool_use_blocks() {
-        // OpenAI assistant tool call → Anthropic tool_use block (arguments parsed to object)
         let input = json!({"choices":[{"message":{"tool_calls":[
             {"id":"call_1","function":{"name":"get_weather","arguments":"{\"city\":\"sf\"}"}}
         ]}}]});
@@ -308,7 +306,6 @@ mod tests {
         assert_eq!(out["content"][0]["type"], "tool_use");
         assert_eq!(out["content"][0]["id"], "call_1");
         assert_eq!(out["content"][0]["name"], "get_weather");
-        // arguments string was parse_json'd into an object
         assert_eq!(out["content"][0]["input"]["city"], "sf");
     }
 
@@ -323,7 +320,6 @@ mod tests {
         )
         .unwrap();
         let anthropic = transform(&openai, &openai_to_anthropic());
-        // resulting shape is a valid Anthropic message
         assert_eq!(anthropic["id"], "chatcmpl-test");
         assert_eq!(anthropic["type"], "message");
         assert_eq!(anthropic["role"], "assistant");
@@ -333,7 +329,6 @@ mod tests {
         assert_eq!(anthropic["content"][0]["text"], "Hello!");
         assert_eq!(anthropic["usage"]["input_tokens"], 5);
         assert_eq!(anthropic["usage"]["output_tokens"], 3);
-        // and it round-trips into our typed Anthropic response struct
         let typed: crate::anthropic::MessagesResponse =
             serde_json::from_value(anthropic).expect("valid anthropic message");
         assert_eq!(typed.stop_reason, "end_turn");

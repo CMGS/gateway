@@ -27,7 +27,6 @@ mod tests {
     fn timestamp_shape() {
         let (unix, s) = now_unix_and_formatted();
         assert!(unix > 0);
-        // "YYYY-MM-DD HH:MM:SS" == 19 chars
         assert_eq!(s.len(), 19);
         assert_eq!(s.as_bytes()[4], b'-');
         assert_eq!(s.as_bytes()[13], b':');

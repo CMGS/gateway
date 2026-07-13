@@ -84,7 +84,6 @@ mod tests {
 
     #[test]
     fn default_rate_is_plain_sum() {
-        // 1:1 weights, prompt excludes cache → 10 + 2 + 1 + 5 + 2 = 20
         assert_eq!(platform_total(&sample(), &TokenRate::default()), 20);
         assert_eq!(platform_input(&sample(), &TokenRate::default()), 10);
     }
@@ -95,20 +94,17 @@ mod tests {
             prompt_includes_cache: true,
             ..Default::default()
         };
-        // normalize prompt: 10 - (2+1) = 7 → 7 + 2 + 1 + 5 + 2 = 17
         assert_eq!(platform_total(&sample(), &rate), 17);
         assert_eq!(platform_input(&sample(), &rate), 7);
     }
 
     #[test]
     fn weights_and_rounding() {
-        // prompt*1.5 = 15; completion*0.5 = 2.5; others 1.0
         let rate = TokenRate {
             prompt_weight: 1.5,
             completion_weight: 0.5,
             ..Default::default()
         };
-        // 10*1.5 + 2 + 1 + 5*0.5 + 2 = 15 + 2 + 1 + 2.5 + 2 = 22.5 → round → 23
         assert_eq!(platform_total(&sample(), &rate), 23);
     }
 
@@ -124,7 +120,6 @@ mod tests {
             write_cache: 5,
             ..Default::default()
         };
-        // normalize prompt: 1 - 10 = -9 → clamp 0; total = 0 + 5 + 5 = 10
         assert_eq!(platform_input(&input, &rate), 0);
         assert_eq!(platform_total(&input, &rate), 10);
     }

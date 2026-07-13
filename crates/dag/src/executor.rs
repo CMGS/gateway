@@ -168,7 +168,6 @@ mod tests {
             name: "t",
             nodes: vec![Box::new(Rec("a", &["b"])), Box::new(Rec("b", &["a"]))],
         };
-        // a cycle fails at plan-build time, not per request
         assert!(Plan::build(vec![layer]).is_err());
     }
 }

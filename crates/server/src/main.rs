@@ -27,11 +27,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // The config source (file path or the embedded default) is captured so a
-    // runtime reload — SIGHUP or POST /admin/reload — re-reads the same source.
-    // When storage.postgres_url is set, the Postgres config store becomes the
-    // source of truth instead: the file only seeds an empty store, and reloads
-    // read the latest published version.
+    // Reloads re-read the captured source; with storage.postgres_url the
+    // config store is the source of truth and the file only seeds it.
     let config_source = env::var("GW_CONFIG").ok();
     let read_source_text = {
         let src = config_source.clone();
@@ -137,8 +134,7 @@ async fn main() -> anyhow::Result<()> {
         "gateway state built"
     );
 
-    // Local background task: AK daily quota reset (governance is a preserved
-    // seam, so this keeps resetting the live counters across reloads).
+    // daily quota reset; governance is a preserved seam, so this survives reloads
     let quota_task = gw_task::spawn_quota_reset(state.clone(), gw_task::DAILY);
 
     let transport = select_transport(&cfg)?;
@@ -170,8 +166,7 @@ async fn main() -> anyhow::Result<()> {
         app_state = app_state.with_config_store(store.clone());
     }
 
-    // Config change feed: every instance reloads when a new version is
-    // published (PUT /admin/config anywhere in the fleet). Reconnects forever.
+    // change feed: reload on every published config version; reconnects forever
     if config_store.is_some() {
         let app = app_state.clone();
         tokio::spawn(async move {
@@ -179,8 +174,7 @@ async fn main() -> anyhow::Result<()> {
                 match gw_state::configstore::subscribe(&postgres_url).await {
                     Ok(mut versions) => {
                         tracing::info!("config change feed connected");
-                        // catch up: a publish during a reconnect gap fired its
-                        // NOTIFY to no one, so re-read latest on every connect
+                        // a publish during a reconnect gap notified no one — catch up
                         if let Err(e) = app.reload().await {
                             tracing::error!(error = %e, "config feed: catch-up reload failed");
                         }
@@ -201,8 +195,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // SIGHUP → live reload (rebuild AK table / models / providers / accounts;
-    // keep governance / store / health / cache; storage-backend changes need a restart).
+    // SIGHUP → live reload (storage-backend changes still need a restart)
     #[cfg(unix)]
     {
         let app = app_state.clone();
@@ -233,7 +226,6 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("gw listening on http://{addr}");
 
-    // graceful shutdown (drain on SIGINT/SIGTERM)
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
