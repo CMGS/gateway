@@ -32,15 +32,78 @@ pub struct AkInfo {
     pub tokens_per_minute: Option<i64>,
 }
 
-/// AK auth: local key table.
+impl From<&gw_config::AkConf> for AkInfo {
+    fn from(k: &gw_config::AkConf) -> Self {
+        Self {
+            ak: k.ak.clone(),
+            product: k.product.clone(),
+            qps: k.qps,
+            daily_token_quota: k.daily_token_quota,
+            tokens_per_minute: k.tokens_per_minute,
+        }
+    }
+}
+
+/// Where a key came from: the config file (re-applied on reload) or the admin
+/// API at runtime (kept across a config reload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Config,
+    Admin,
+}
+
+/// AK auth: the live key table. Config keys seed it at boot and are re-applied
+/// on reload; admin keys are created/updated/revoked at runtime and survive a
+/// reload. A preserved seam, so those runtime edits outlive a config swap.
 #[derive(Debug, Default)]
 pub struct AkAuth {
-    keys: DashMap<String, AkInfo>,
+    keys: DashMap<String, (AkInfo, KeySource)>,
 }
 
 impl AkAuth {
     pub fn authenticate(&self, ak: &str) -> Option<AkInfo> {
-        self.keys.get(ak).map(|e| e.value().clone())
+        self.keys.get(ak).map(|e| e.value().0.clone())
+    }
+
+    /// Insert or replace a key with the given provenance.
+    pub fn put(&self, info: AkInfo, source: KeySource) {
+        self.keys.insert(info.ak.clone(), (info, source));
+    }
+
+    /// Update quota fields of an existing key in place; returns the new view.
+    /// `None` if the key doesn't exist.
+    pub fn patch(
+        &self,
+        ak: &str,
+        qps: Option<f64>,
+        daily_token_quota: Option<i64>,
+        tokens_per_minute: Option<Option<i64>>,
+    ) -> Option<AkInfo> {
+        let mut e = self.keys.get_mut(ak)?;
+        if let Some(v) = qps {
+            e.0.qps = v;
+        }
+        if let Some(v) = daily_token_quota {
+            e.0.daily_token_quota = v;
+        }
+        if let Some(v) = tokens_per_minute {
+            e.0.tokens_per_minute = v;
+        }
+        Some(e.0.clone())
+    }
+
+    /// Remove a key regardless of source; returns whether it existed.
+    pub fn revoke(&self, ak: &str) -> bool {
+        self.keys.remove(ak).is_some()
+    }
+
+    /// Re-apply the config file's key set: drop every config-sourced key and
+    /// re-add from `keys`, leaving admin-created keys untouched.
+    pub fn reload_config_keys(&self, keys: &[gw_config::AkConf]) {
+        self.keys.retain(|_, (_, src)| *src == KeySource::Admin);
+        for k in keys {
+            self.put(AkInfo::from(k), KeySource::Config);
+        }
     }
 }
 
@@ -121,6 +184,33 @@ pub struct AccountPool {
 }
 
 impl AccountPool {
+    /// Build the pool from config accounts (protocols validated at config load,
+    /// so the unwrap-free filter drops nothing).
+    pub fn from_config(cfg: &GatewayConfig) -> Self {
+        let accounts = cfg
+            .accounts
+            .iter()
+            .map(|a| Account {
+                name: a.name.clone(),
+                provider: a.provider.clone(),
+                priority: a.priority,
+                tier: a.tier.clone(),
+                endpoint: a.endpoint.clone(),
+                api_key_env: a.api_key_env.clone(),
+                secret_key_env: a.secret_key_env.clone(),
+                protocols: a
+                    .protocols
+                    .iter()
+                    .filter_map(|w| Protocol::from_wire(w))
+                    .collect(),
+            })
+            .collect();
+        Self {
+            accounts,
+            rr: AtomicUsize::new(0),
+        }
+    }
+
     pub fn select(&self, p: Protocol, provider: Option<&str>) -> Option<Account> {
         self.select_excluding(p, provider, &[])
     }
@@ -370,7 +460,8 @@ impl moka::Expiry<String, (gw_models::GatewayResponse, Duration)> for PerEntryTt
 /// live reload; the other four are runtime seams preserved across reloads.
 #[derive(Debug)]
 pub struct GatewayState {
-    pub auth: AkAuth,
+    /// Live key table — a preserved seam (admin key edits survive a reload).
+    pub auth: Arc<AkAuth>,
     pub pool: AccountPool,
     pub governance: Arc<dyn Governance>,
     /// Durable records (ledger/files/batches): memory by default, sqlite when
@@ -385,7 +476,7 @@ pub struct GatewayState {
 impl Default for GatewayState {
     fn default() -> Self {
         Self {
-            auth: AkAuth::default(),
+            auth: Arc::new(AkAuth::default()),
             pool: AccountPool::default(),
             governance: Arc::new(MemoryGovernance::default()),
             store: Arc::new(MemoryStore::default()),
@@ -399,55 +490,25 @@ impl GatewayState {
     pub fn from_config(cfg: &GatewayConfig) -> Self {
         let auth = AkAuth::default();
         for k in &cfg.access_keys {
-            auth.keys.insert(
-                k.ak.clone(),
-                AkInfo {
-                    ak: k.ak.clone(),
-                    product: k.product.clone(),
-                    qps: k.qps,
-                    daily_token_quota: k.daily_token_quota,
-                    tokens_per_minute: k.tokens_per_minute,
-                },
-            );
+            auth.put(AkInfo::from(k), KeySource::Config);
         }
-        let accounts = cfg
-            .accounts
-            .iter()
-            .map(|a| Account {
-                name: a.name.clone(),
-                provider: a.provider.clone(),
-                priority: a.priority,
-                tier: a.tier.clone(),
-                endpoint: a.endpoint.clone(),
-                api_key_env: a.api_key_env.clone(),
-                secret_key_env: a.secret_key_env.clone(),
-                // validated by GatewayConfig::validate, so unwrap-free filter is safe
-                protocols: a
-                    .protocols
-                    .iter()
-                    .filter_map(|w| Protocol::from_wire(w))
-                    .collect(),
-            })
-            .collect();
         Self {
-            auth,
-            pool: AccountPool {
-                accounts,
-                rr: AtomicUsize::new(0),
-            },
+            auth: Arc::new(auth),
+            pool: AccountPool::from_config(cfg),
             ..Default::default()
         }
     }
 
-    /// Rebuild the config-derived state (AK table, account pool) from `cfg`
-    /// while preserving the runtime seams — governance, store, account health,
-    /// and the response cache — from `prev`. In-flight requests keep running on
-    /// their own snapshot; new requests see this one.
+    /// Rebuild the config-derived account pool from `cfg` while preserving the
+    /// runtime seams — key table, governance, store, account health, and the
+    /// response cache — from `prev`. The key table's config-sourced entries are
+    /// re-applied from the new config; admin-created keys are kept. In-flight
+    /// requests keep running on their own snapshot; new requests see this one.
     pub fn reload_from(cfg: &GatewayConfig, prev: &GatewayState) -> Self {
-        let fresh = Self::from_config(cfg);
+        prev.auth.reload_config_keys(&cfg.access_keys);
         Self {
-            auth: fresh.auth,
-            pool: fresh.pool,
+            auth: prev.auth.clone(),
+            pool: AccountPool::from_config(cfg),
             governance: prev.governance.clone(),
             store: prev.store.clone(),
             health: prev.health.clone(),
@@ -558,6 +619,58 @@ mod tests {
             snap.state.store.file_get(&file_id).await.unwrap().is_some(),
             "durable file survived the reload"
         );
+    }
+
+    #[test]
+    fn admin_keys_survive_reload_config_keys_do_not() {
+        let auth = AkAuth::default();
+        auth.put(
+            AkInfo {
+                ak: "ak-config".into(),
+                product: "p".into(),
+                qps: 1.0,
+                daily_token_quota: 10,
+                tokens_per_minute: None,
+            },
+            KeySource::Config,
+        );
+        auth.put(
+            AkInfo {
+                ak: "ak-admin".into(),
+                product: "p".into(),
+                qps: 1.0,
+                daily_token_quota: 10,
+                tokens_per_minute: None,
+            },
+            KeySource::Admin,
+        );
+        // reload with a config that has a different config key
+        let new = GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-config2, product: p, qps: 2, daily_token_quota: 20}]",
+        )
+        .unwrap();
+        auth.reload_config_keys(&new.access_keys);
+        assert!(
+            auth.authenticate("ak-config").is_none(),
+            "old config key dropped"
+        );
+        assert!(
+            auth.authenticate("ak-config2").is_some(),
+            "new config key applied"
+        );
+        assert!(
+            auth.authenticate("ak-admin").is_some(),
+            "admin key preserved"
+        );
+        // patch + revoke
+        let patched = auth
+            .patch("ak-admin", Some(9.0), None, Some(Some(5)))
+            .unwrap();
+        assert_eq!(patched.qps, 9.0);
+        assert_eq!(patched.tokens_per_minute, Some(5));
+        assert!(auth.revoke("ak-admin"));
+        assert!(auth.authenticate("ak-admin").is_none());
+        assert!(!auth.revoke("ak-admin"));
     }
 
     #[test]

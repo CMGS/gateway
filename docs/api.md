@@ -97,3 +97,29 @@ Realtime event shape) for offline development.
 `/internal/*` is an operator surface: keep it off the public load balancer
 (the sample nginx config in [multi-instance](multi-instance.md) restricts it
 to the operator network).
+
+## Admin (dynamic config)
+
+`/admin/*` lets operators change config at runtime without a redeploy. It is
+disabled (routes 404) unless `admin.token_env` names an env var holding a bearer
+token; every request must present `Authorization: Bearer <token>`. Keep the
+surface on a private network regardless.
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/admin/reload` | re-read config from source and swap it in atomically |
+| POST | `/admin/keys` | create/replace a key: `{ak, product, qps, daily_token_quota, tokens_per_minute?}` |
+| PATCH | `/admin/keys/{ak}` | re-quota: any of `qps` / `daily_token_quota` / `tokens_per_minute` (null clears TPM) |
+| DELETE | `/admin/keys/{ak}` | revoke a key |
+
+A reload rebuilds the AK table (config keys), models, providers, and accounts
+while preserving the runtime seams — governance counters, the durable store,
+account health, and the response cache. Storage-backend URL changes
+(`storage.redis_url` / `sqlite_path`) still need a restart. Reload is also
+triggered by `SIGHUP`.
+
+Keys have their own lifecycle: the config file's `access_keys` are the boot
+baseline and are re-applied on every reload, while keys created via
+`/admin/keys` survive reloads (they are dropped only by an explicit DELETE or a
+restart). Persistent, fleet-shared key storage arrives with the Postgres backend
+(see [clustering](https://github.com/cocoonstack/gateway/issues/2)).

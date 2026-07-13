@@ -125,6 +125,11 @@ pub fn app(state: AppState) -> Router {
         .route("/internal/ledger", get(ledger))
         .route("/internal/accounts", get(accounts))
         .route("/admin/reload", post(admin_reload))
+        .route("/admin/keys", post(admin_key_create))
+        .route(
+            "/admin/keys/{ak}",
+            axum::routing::patch(admin_key_patch).delete(admin_key_delete),
+        )
         .layer(axum::middleware::from_fn(track_requests))
         .with_state(state)
 }
@@ -689,6 +694,91 @@ async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response
                 .into_response()
         }
         Err(e) => error_response(500, format!("reload failed: {e}")),
+    }
+}
+
+/// POST /admin/keys — create (or replace) a runtime access key. Admin keys
+/// survive a config reload; the config file remains the boot baseline.
+async fn admin_key_create(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((st, msg)) = admin_auth(&s, &headers) {
+        return error_response(st, msg);
+    }
+    let (Some(ak), Some(product)) = (body["ak"].as_str(), body["product"].as_str()) else {
+        return error_response(400, "ak and product are required");
+    };
+    let info = AkInfo {
+        ak: ak.to_owned(),
+        product: product.to_owned(),
+        qps: body["qps"].as_f64().unwrap_or(0.0),
+        daily_token_quota: body["daily_token_quota"].as_i64().unwrap_or(0),
+        tokens_per_minute: body["tokens_per_minute"].as_i64(),
+    };
+    s.handler.state().auth.put(info, gw_state::KeySource::Admin);
+    (
+        StatusCode::CREATED,
+        Json(json!({ "ak": ak, "status": "created" })),
+    )
+        .into_response()
+}
+
+/// PATCH /admin/keys/{ak} — re-quota an existing key (qps / daily_token_quota /
+/// tokens_per_minute). Only the fields present in the body change.
+async fn admin_key_patch(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(ak): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err((st, msg)) = admin_auth(&s, &headers) {
+        return error_response(st, msg);
+    }
+    // tokens_per_minute is Option<Option<i64>>: absent = leave, null = clear.
+    let tpm = match body.get("tokens_per_minute") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(v) => Some(v.as_i64()),
+    };
+    match s.handler.state().auth.patch(
+        &ak,
+        body["qps"].as_f64(),
+        body["daily_token_quota"].as_i64(),
+        tpm,
+    ) {
+        Some(info) => (
+            StatusCode::OK,
+            Json(json!({
+                "ak": info.ak, "product": info.product, "qps": info.qps,
+                "daily_token_quota": info.daily_token_quota,
+                "tokens_per_minute": info.tokens_per_minute,
+            })),
+        )
+            .into_response(),
+        None => error_response(404, format!("key {ak} not found")),
+    }
+}
+
+/// DELETE /admin/keys/{ak} — revoke a key (config- or admin-sourced). Effective
+/// fleet-wide once every instance's key table reflects it.
+async fn admin_key_delete(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(ak): Path<String>,
+) -> Response {
+    if let Err((st, msg)) = admin_auth(&s, &headers) {
+        return error_response(st, msg);
+    }
+    if s.handler.state().auth.revoke(&ak) {
+        (
+            StatusCode::OK,
+            Json(json!({ "ak": ak, "status": "revoked" })),
+        )
+            .into_response()
+    } else {
+        error_response(404, format!("key {ak} not found"))
     }
 }
 

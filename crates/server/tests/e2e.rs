@@ -122,8 +122,113 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
         StatusCode::OK
     );
     assert_eq!(
-        app.oneshot(chat("ak-v1")).await.unwrap().status(),
+        app.clone().oneshot(chat("ak-v1")).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
+    );
+
+    // --- admin key CRUD, and admin keys survive a reload ---
+    let admin = |method: &str, uri: &str, token: Option<&str>, body: Option<&str>| {
+        let mut b = Request::builder().method(method).uri(uri);
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        match body {
+            Some(j) => b
+                .header("content-type", "application/json")
+                .body(Body::from(j.to_owned()))
+                .unwrap(),
+            None => b.body(Body::empty()).unwrap(),
+        }
+    };
+
+    // create ak-admin at runtime
+    let r = app
+        .clone()
+        .oneshot(admin(
+            "POST",
+            "/admin/keys",
+            Some("s3cret"),
+            Some(r#"{"ak":"ak-admin","product":"demo","qps":100,"daily_token_quota":1000000}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    assert_eq!(
+        app.clone()
+            .oneshot(chat("ak-admin"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+        "admin-created key works immediately"
+    );
+    // create is gated
+    assert_eq!(
+        app.clone()
+            .oneshot(admin(
+                "POST",
+                "/admin/keys",
+                None,
+                Some(r#"{"ak":"x","product":"y"}"#)
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // a reload (back to the v2 file key set) must NOT wipe the admin key
+    assert_eq!(
+        app.clone()
+            .oneshot(reload(Some("s3cret")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(chat("ak-admin"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+        "admin key survives a config reload"
+    );
+
+    // revoke it
+    let r = app
+        .clone()
+        .oneshot(admin(
+            "DELETE",
+            "/admin/keys/ak-admin",
+            Some("s3cret"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        app.clone()
+            .oneshot(chat("ak-admin"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED,
+        "revoked key is rejected"
+    );
+    // patch a nonexistent key → 404
+    assert_eq!(
+        app.oneshot(admin(
+            "PATCH",
+            "/admin/keys/ak-admin",
+            Some("s3cret"),
+            Some(r#"{"qps":5}"#),
+        ))
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::NOT_FOUND
     );
 }
 

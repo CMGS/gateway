@@ -10,6 +10,12 @@ listen:
 # storage:
 #   sqlite_path: /var/lib/gw/store.db
 
+# Dynamic-config admin surface (SIGHUP / POST /admin/reload, key CRUD).
+# Disabled unless token_env names an env var holding a bearer token. Keep it on
+# a private network.
+# admin:
+#   token_env: GW_ADMIN_TOKEN
+
 # AK auth table (local key-table version)
 access_keys:
   - ak: ak-demo-123
