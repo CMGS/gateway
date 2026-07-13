@@ -4,7 +4,7 @@ Single-binary LLM access point in Rust (binary: `gw`): OpenAI- and
 Anthropic-compatible APIs in front of pluggable model providers, with
 key-based auth, quotas, rate limits, failover, and a billing ledger.
 
-**Documentation: [cmgs.github.io/gateway](https://cmgs.github.io/gateway/)** (source in [`docs/`](docs/)).
+**Documentation: [cocoonstack.github.io/gateway](https://cocoonstack.github.io/gateway/)** (source in [`docs/`](docs/)).
 
 ## Highlights
 
@@ -39,7 +39,7 @@ GW_CONFIG=conf/gateway.yaml cargo run -p gw-server
 # GW_TRANSPORT=mock forces zero egress; GW_TRANSPORT=http disables the mock.
 ```
 
-Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Roadmap](ROADMAP.md)
+Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Issues](https://github.com/cocoonstack/gateway/issues)
 
 ## Docker
 
@@ -51,7 +51,7 @@ docker run -p 8080:8080 -v $PWD/conf/gateway.yaml:/etc/gateway.yaml \
 ```
 
 The image binds `0.0.0.0` (`GW_HOST`) and ships a `/health` HEALTHCHECK.
-Published multi-arch to `ghcr.io/cmgs/gateway` on push.
+Published multi-arch to `ghcr.io/cocoonstack/gateway` on push.
 
 ## Development
 

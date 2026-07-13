@@ -27,4 +27,4 @@ client ──► /v1/* (OpenAI + Anthropic surfaces, streaming SSE, realtime WS)
 ## Repository
 
 Source and issue tracker:
-[github.com/CMGS/gateway](https://github.com/CMGS/gateway).
+[github.com/cocoonstack/gateway](https://github.com/cocoonstack/gateway).

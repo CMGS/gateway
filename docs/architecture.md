@@ -64,7 +64,7 @@ default, so the whole pipeline is testable offline:
   `storage.sqlite_path` is configured, surviving restarts.
 - **metrics facade** — `metrics` crate macros throughout; the server
   installs a Prometheus recorder and serves `/metrics`.
-- Planned (see [ROADMAP](../ROADMAP.md)): Redis rate/quota backends (M5).
+- Planned: see the [issue tracker](https://github.com/cocoonstack/gateway/issues).
 
 ## Testing
 

@@ -6,7 +6,7 @@ Install a tagged release (Linux/macOS, x86_64/arm64) with the generated script:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/CMGS/gateway/releases/latest/download/gw-server-installer.sh | sh
+  https://github.com/cocoonstack/gateway/releases/latest/download/gw-server-installer.sh | sh
 ```
 
 Or build from source:
@@ -43,7 +43,7 @@ docker run -p 8080:8080 \
 
 The image is a slim non-root runtime, binds `0.0.0.0`, and has a `/health`
 HEALTHCHECK. Tagged `v*` pushes publish a multi-arch image to
-`ghcr.io/cmgs/gateway`.
+`ghcr.io/cocoonstack/gateway`.
 
 ## Multi-replica
 

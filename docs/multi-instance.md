@@ -20,8 +20,7 @@ shared, what stays local, and what the LB needs to do.
 2. A **shared config** so every instance authenticates the same keys and
    routes the same models (see [Dynamic config](#dynamic-config) below).
 3. A **shared `Store`** if you rely on the ledger/files/batches being visible
-   from any instance — SQLite is per-node. A networked Store (Postgres) is on
-   the roadmap; until then, either pin ledger reads to one node or accept
+   from any instance — SQLite is per-node. A networked Store (Postgres) is planned; until then, either pin ledger reads to one node or accept
    per-node ledgers aggregated at scrape time.
 
 ## Load balancer
@@ -61,4 +60,4 @@ roadmap direction:
    and re-quota keys at runtime — every instance reads the live source, so a
    key issued once is valid fleet-wide immediately.
 
-See the roadmap for status.
+See the [issue tracker](https://github.com/cocoonstack/gateway/issues) for status.
