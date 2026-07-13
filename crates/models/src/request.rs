@@ -41,7 +41,7 @@ pub struct GatewayRequest {
 
 impl GatewayRequest {
     /// The model type to dispatch on, if a v2 param is present.
-    pub fn protocol(&self) -> Option<ap_consts::Protocol> {
+    pub fn protocol(&self) -> Option<gw_consts::Protocol> {
         self.model_param_v2.as_ref().map(|p| p.protocol)
     }
 }
@@ -60,7 +60,7 @@ pub mod domain {
     /// (No derived `Default` — `Protocol` has none; a manual impl lives in the parent module.)
     #[derive(Debug, Clone)]
     pub struct ModelParamV2 {
-        pub protocol: ap_consts::Protocol,
+        pub protocol: gw_consts::Protocol,
         /// public model name from the caller, pre-mapping. Empty if caller sent a wire type directly.
         pub model_name: String,
         /// family-typed params (chat/embeddings/image/audio/video/search).
@@ -70,7 +70,7 @@ pub mod domain {
     }
 
     impl ModelParamV2 {
-        pub fn new(protocol: ap_consts::Protocol) -> Self {
+        pub fn new(protocol: gw_consts::Protocol) -> Self {
             Self {
                 protocol,
                 model_name: String::new(),
@@ -79,7 +79,7 @@ pub mod domain {
             }
         }
 
-        pub fn with_name(protocol: ap_consts::Protocol, name: impl Into<String>) -> Self {
+        pub fn with_name(protocol: gw_consts::Protocol, name: impl Into<String>) -> Self {
             Self {
                 protocol,
                 model_name: name.into(),
@@ -145,12 +145,12 @@ pub mod domain {
         /// AWS SigV4 accounts only: env var holding the secret access key (paired
         /// with `api_key_env` = the access key id). Empty for non-AWS vendors.
         pub secret_key_env: String,
-        pub protocols: Vec<ap_consts::Protocol>,
+        pub protocols: Vec<gw_consts::Protocol>,
     }
 
     impl Account {
         pub fn is_ptu(&self) -> bool {
-            self.tier == ap_consts::account_tier::PTU
+            self.tier == gw_consts::account_tier::PTU
         }
 
         /// Base URL for building the upstream request: the account's endpoint if
@@ -274,12 +274,12 @@ pub mod domain {
         RealtimeParam);
 }
 
-// ap_consts::Protocol has no Default; give ModelParamV2's field a sensible one
+// gw_consts::Protocol has no Default; give ModelParamV2's field a sensible one
 // via a wrapper Default on the whole struct instead.
 impl Default for ModelParamV2 {
     fn default() -> Self {
         Self {
-            protocol: ap_consts::Protocol::OpenaiChat,
+            protocol: gw_consts::Protocol::OpenaiChat,
             model_name: String::new(),
             typed: None,
             raw: serde_json::Value::Null,
@@ -290,7 +290,7 @@ impl Default for ModelParamV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ap_consts::Protocol;
+    use gw_consts::Protocol;
 
     #[test]
     fn dispatch_protocol() {
@@ -318,7 +318,7 @@ mod tests {
         assert_eq!(a.base_url("mock://x"), "https://api.vendor.com");
 
         // key read from the named env var at call time (secret never on the struct)
-        let var = "AP_TEST_ACCOUNT_KEY_SEAM";
+        let var = "GW_TEST_ACCOUNT_KEY_SEAM";
         // SAFETY: the var name is unique to this test and nothing reads it concurrently.
         unsafe { std::env::set_var(var, "sk-secret-123") };
         let a = Account {

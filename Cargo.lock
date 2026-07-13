@@ -33,175 +33,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
-name = "ap-config"
-version = "0.1.0"
-dependencies = [
- "ap-consts",
- "serde",
- "serde_yaml",
- "thiserror",
-]
-
-[[package]]
-name = "ap-consts"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "ap-dag"
-version = "0.1.0"
-dependencies = [
- "ap-config",
- "ap-consts",
- "ap-engines",
- "ap-models",
- "ap-state",
- "async-trait",
- "hex",
- "metrics",
- "serde_json",
- "sha2",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ap-engines"
-version = "0.1.0"
-dependencies = [
- "ap-consts",
- "ap-models",
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "futures",
- "hex",
- "hmac",
- "metrics",
- "reqwest",
- "serde_json",
- "sha2",
- "tokio",
-]
-
-[[package]]
-name = "ap-handler"
-version = "0.1.0"
-dependencies = [
- "ap-config",
- "ap-consts",
- "ap-dag",
- "ap-engines",
- "ap-models",
- "ap-state",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ap-models"
-version = "0.1.0"
-dependencies = [
- "ap-consts",
- "chrono",
- "serde",
- "serde_json",
- "tiktoken-rs",
- "tokio",
-]
-
-[[package]]
-name = "ap-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ap-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ap-config",
- "ap-engines",
- "ap-protocol",
- "ap-state",
- "ap-task",
- "ap-views",
- "axum",
- "futures",
- "metrics-exporter-prometheus",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "ap-state"
-version = "0.1.0"
-dependencies = [
- "ap-config",
- "ap-consts",
- "ap-models",
- "async-trait",
- "dashmap",
- "governor",
- "moka",
- "redis",
- "serde",
- "sqlx",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ap-task"
-version = "0.1.0"
-dependencies = [
- "ap-state",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ap-utils"
-version = "0.1.0"
-dependencies = [
- "chrono",
-]
-
-[[package]]
-name = "ap-views"
-version = "0.1.0"
-dependencies = [
- "ap-config",
- "ap-consts",
- "ap-dag",
- "ap-engines",
- "ap-handler",
- "ap-models",
- "ap-protocol",
- "ap-state",
- "axum",
- "base64",
- "futures",
- "metrics",
- "serde_json",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
 name = "arc-swap"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -880,6 +711,175 @@ dependencies = [
  "smallvec",
  "spinning_top",
  "web-time",
+]
+
+[[package]]
+name = "gw-config"
+version = "0.1.0"
+dependencies = [
+ "gw-consts",
+ "serde",
+ "serde_yaml",
+ "thiserror",
+]
+
+[[package]]
+name = "gw-consts"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "gw-dag"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "gw-config",
+ "gw-consts",
+ "gw-engines",
+ "gw-models",
+ "gw-state",
+ "hex",
+ "metrics",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "gw-engines"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "futures",
+ "gw-consts",
+ "gw-models",
+ "hex",
+ "hmac",
+ "metrics",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "gw-handler"
+version = "0.1.0"
+dependencies = [
+ "gw-config",
+ "gw-consts",
+ "gw-dag",
+ "gw-engines",
+ "gw-models",
+ "gw-state",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "gw-models"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "gw-consts",
+ "serde",
+ "serde_json",
+ "tiktoken-rs",
+ "tokio",
+]
+
+[[package]]
+name = "gw-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "gw-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures",
+ "gw-config",
+ "gw-engines",
+ "gw-protocol",
+ "gw-state",
+ "gw-task",
+ "gw-views",
+ "metrics-exporter-prometheus",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "gw-state"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "governor",
+ "gw-config",
+ "gw-consts",
+ "gw-models",
+ "moka",
+ "redis",
+ "serde",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "gw-task"
+version = "0.1.0"
+dependencies = [
+ "gw-state",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "gw-utils"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+]
+
+[[package]]
+name = "gw-views"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "futures",
+ "gw-config",
+ "gw-consts",
+ "gw-dag",
+ "gw-engines",
+ "gw-handler",
+ "gw-models",
+ "gw-protocol",
+ "gw-state",
+ "metrics",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

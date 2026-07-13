@@ -12,22 +12,22 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use ap_config::GatewayConfig;
-use ap_state::GatewayState;
-use ap_views::AppState;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use gw_config::GatewayConfig;
+use gw_state::GatewayState;
+use gw_views::AppState;
 use serde_json::Value;
 use tower::ServiceExt;
 
 fn app() -> Router {
     let cfg = Arc::new(GatewayConfig::embedded_default().expect("embedded config"));
     let state = Arc::new(GatewayState::from_config(&cfg));
-    ap_views::app(AppState::new(
+    gw_views::app(AppState::new(
         cfg,
         state,
-        Arc::new(ap_engines::MockTransport),
+        Arc::new(gw_engines::MockTransport),
     ))
 }
 
@@ -64,7 +64,7 @@ const ANTHROPIC_MSG_CANONICAL: &str = r#"{
 
 #[test]
 fn canonical_openai_parses_into_protocol_structs() {
-    let resp: ap_protocol::openai::ChatCompletionResponse =
+    let resp: gw_protocol::openai::ChatCompletionResponse =
         serde_json::from_str(OPENAI_CHAT_CANONICAL).expect("canonical openai parses");
     assert_eq!(resp.object, "chat.completion");
     assert_eq!(resp.choices[0].message.role, "assistant");
@@ -73,12 +73,12 @@ fn canonical_openai_parses_into_protocol_structs() {
 
 #[test]
 fn canonical_anthropic_parses_into_protocol_structs() {
-    let resp: ap_protocol::anthropic::MessagesResponse =
+    let resp: gw_protocol::anthropic::MessagesResponse =
         serde_json::from_str(ANTHROPIC_MSG_CANONICAL).expect("canonical anthropic parses");
     assert_eq!(resp.kind, "message");
     assert!(matches!(
         &resp.content[0],
-        ap_protocol::anthropic::ContentBlock::Text { text } if text == "Hello!"
+        gw_protocol::anthropic::ContentBlock::Text { text } if text == "Hello!"
     ));
     assert_eq!(resp.usage.input_tokens, 12);
 }

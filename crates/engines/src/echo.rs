@@ -5,8 +5,8 @@
 //! It is the concrete pattern new engines should follow:
 //! hold the request + a recorder, implement `run()` and `recorder()`.
 
-use ap_models::{GResult, GatewayRequest, GatewayResponse, Recorder, SimpleRecorder};
 use chrono::Utc;
+use gw_models::{GResult, GatewayRequest, GatewayResponse, Recorder, SimpleRecorder};
 
 use crate::engine::{EngineOutcome, ModelEngine};
 
@@ -59,8 +59,8 @@ impl ModelEngine for EchoEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ap_consts::Protocol;
-    use ap_models::ModelParamV2;
+    use gw_consts::Protocol;
+    use gw_models::ModelParamV2;
 
     #[tokio::test]
     async fn echoes_protocol() {

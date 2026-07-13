@@ -1,5 +1,5 @@
 [package]
-name = "ap-protocol"
+name = "gw-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

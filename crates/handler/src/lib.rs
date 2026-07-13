@@ -10,11 +10,11 @@ pub mod plugins;
 
 use std::sync::Arc;
 
-use ap_config::GatewayConfig;
-use ap_dag::DagContext;
-use ap_engines::{EngineOutcome, SharedTransport};
-use ap_models::{GResult, GatewayRequest, GatewayResponse};
-use ap_state::{AkInfo, GatewayState};
+use gw_config::GatewayConfig;
+use gw_dag::DagContext;
+use gw_engines::{EngineOutcome, SharedTransport};
+use gw_models::{GResult, GatewayRequest, GatewayResponse};
+use gw_state::{AkInfo, GatewayState};
 
 pub use offline::{BatchItem, OfflineHandler};
 
@@ -24,7 +24,7 @@ pub struct OnlineHandler {
     pub cfg: Arc<GatewayConfig>,
     pub state: Arc<GatewayState>,
     pub transport: SharedTransport,
-    plan: Arc<ap_dag::Plan>,
+    plan: Arc<gw_dag::Plan>,
 }
 
 impl OnlineHandler {
@@ -37,7 +37,7 @@ impl OnlineHandler {
     ) -> Self {
         #[allow(clippy::expect_used)]
         let plan =
-            Arc::new(ap_dag::Plan::build(ap_dag::default_layers()).expect("static dag topology"));
+            Arc::new(gw_dag::Plan::build(gw_dag::default_layers()).expect("static dag topology"));
         Self {
             cfg,
             state,
@@ -90,7 +90,7 @@ impl OnlineHandler {
             ctx.decide("dlp", format!("redacted {redacted} span(s) inbound"));
         }
 
-        ap_dag::run(&self.plan, &mut ctx).await?;
+        gw_dag::run(&self.plan, &mut ctx).await?;
 
         // --- plugin post-stage: outbound redaction ---
         if let Some(outcome) = ctx.outcome.as_mut() {
@@ -106,13 +106,13 @@ impl OnlineHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ap_consts::Protocol;
-    use ap_models::{ChatMsg, ModelParamV2};
+    use gw_consts::Protocol;
+    use gw_models::{ChatMsg, ModelParamV2};
 
     fn handler() -> OnlineHandler {
         let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
-        OnlineHandler::new(cfg, state, Arc::new(ap_engines::MockTransport))
+        OnlineHandler::new(cfg, state, Arc::new(gw_engines::MockTransport))
     }
 
     fn ak(h: &OnlineHandler) -> AkInfo {
@@ -228,7 +228,7 @@ mod tests {
             if let Some(j) = h.state.store.batch_get(&job.id).await.unwrap()
                 && matches!(
                     j.status,
-                    ap_state::BatchStatus::Completed | ap_state::BatchStatus::Failed
+                    gw_state::BatchStatus::Completed | gw_state::BatchStatus::Failed
                 )
             {
                 break;
@@ -236,7 +236,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let j = h.state.store.batch_get(&job.id).await.unwrap().unwrap();
-        assert_eq!(j.status, ap_state::BatchStatus::Completed);
+        assert_eq!(j.status, gw_state::BatchStatus::Completed);
         assert_eq!(j.results.len(), 2);
         assert!(j.results.iter().all(|r| r.ok && r.total_tokens > 0));
         assert_eq!(

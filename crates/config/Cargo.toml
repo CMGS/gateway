@@ -1,5 +1,5 @@
 [package]
-name = "ap-config"
+name = "gw-config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ publish.workspace = true
 description = "Local file configuration — no config center."
 
 [dependencies]
-ap-consts = { workspace = true }
+gw-consts = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }

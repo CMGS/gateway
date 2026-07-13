@@ -5,8 +5,8 @@
 //! the engine and billing); DLP redacts inbound messages. The post-stage redacts
 //! outbound messages again (in case the upstream echoes sensitive text back).
 
-use ap_config::SecurityConf;
-use ap_models::{Block, GatewayRequest, GatewayResponse};
+use gw_config::SecurityConf;
+use gw_models::{Block, GatewayRequest, GatewayResponse};
 
 /// Blocklist check. Returns Block on a hit (block=true implies hit=true).
 pub fn security_check(sec: &SecurityConf, request: &GatewayRequest) -> Option<Block> {
@@ -156,7 +156,7 @@ fn redact(text: &str) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ap_models::ChatMsg;
+    use gw_models::ChatMsg;
 
     fn sec() -> SecurityConf {
         SecurityConf {

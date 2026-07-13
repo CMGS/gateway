@@ -7,8 +7,8 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ap_models::{GResult, GatewayError};
 use dashmap::DashMap;
+use gw_models::{GResult, GatewayError};
 use sqlx::Row;
 
 /// One billing entry (recorded locally only; no reporting upstream).

@@ -1,5 +1,5 @@
 [package]
-name = "ap-views"
+name = "gw-views"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,14 +7,14 @@ publish.workspace = true
 description = "HTTP view layer: OpenAI/Anthropic-compatible routes on axum."
 
 [dependencies]
-ap-consts = { workspace = true }
-ap-models = { workspace = true }
-ap-protocol = { workspace = true }
-ap-config = { workspace = true }
-ap-state = { workspace = true }
-ap-engines = { workspace = true }
-ap-handler = { workspace = true }
-ap-dag = { workspace = true }
+gw-consts = { workspace = true }
+gw-models = { workspace = true }
+gw-protocol = { workspace = true }
+gw-config = { workspace = true }
+gw-state = { workspace = true }
+gw-engines = { workspace = true }
+gw-handler = { workspace = true }
+gw-dag = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }

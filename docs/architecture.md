@@ -53,7 +53,7 @@ default, so the whole pipeline is testable offline:
   `DispatchTransport`: accounts without an endpoint resolve to `mock://`
   sentinel URLs served in-process by `MockTransport` (deterministic
   vendor-shaped replies); real URLs go over `HttpTransport` (reqwest +
-  rustls). `AP_TRANSPORT=mock` forces zero egress, `AP_TRANSPORT=http`
+  rustls). `GW_TRANSPORT=mock` forces zero egress, `GW_TRANSPORT=http`
   disables the mock. Tests inject `MockTransport` directly.
 - **`TokenEncoder`** — prompt token estimation capability (tiktoken
   cl100k_base BPE default, zero-dependency heuristic fallback). Not yet on

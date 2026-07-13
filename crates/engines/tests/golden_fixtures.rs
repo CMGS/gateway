@@ -9,11 +9,11 @@
 
 use std::sync::Arc;
 
-use ap_consts::Protocol;
-use ap_engines::transport::{Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
-use ap_engines::{ClaudeEngine, ModelEngine, OpenAiEngine, VertexEngine, extract_common_usage};
-use ap_models::{ChatMsg, GResult, GatewayRequest, ModelParamV2};
 use async_trait::async_trait;
+use gw_consts::Protocol;
+use gw_engines::transport::{Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
+use gw_engines::{ClaudeEngine, ModelEngine, OpenAiEngine, VertexEngine, extract_common_usage};
+use gw_models::{ChatMsg, GResult, GatewayRequest, ModelParamV2};
 
 /// Test transport that replays a fixed recorded response body.
 #[derive(Debug)]
@@ -78,7 +78,7 @@ const GO_OPENAI_SSE: &str = "data: {\"id\":\"cmpl-7\",\"object\":\"text_completi
 
 #[tokio::test]
 async fn openai_sse_decodes_go_recorded_stream() {
-    use ap_engines::SseDecoder;
+    use gw_engines::SseDecoder;
     let (events, done) = SseDecoder::decode_all(GO_OPENAI_SSE.as_bytes());
     assert!(done, "must see [DONE] from the recorded stream");
     assert_eq!(events.len(), 1);
@@ -126,7 +126,7 @@ fn claude_req() -> GatewayRequest {
     }
 }
 
-async fn run_claude(fixture: &str) -> GResult<ap_engines::EngineOutcome> {
+async fn run_claude(fixture: &str) -> GResult<gw_engines::EngineOutcome> {
     let transport = Arc::new(FixtureTransport {
         status: 200,
         sse: false,
@@ -189,7 +189,7 @@ fn anthropic_cache_usage_matches_go_recorded() {
 /// that was fixed for OpenAI/Claude — closed centrally in their round-trip helpers).
 #[tokio::test]
 async fn family_and_bespoke_engines_surface_errors() {
-    use ap_engines::{EmbeddingsEngine, ErnieEngine, VertexEngine};
+    use gw_engines::{EmbeddingsEngine, ErnieEngine, VertexEngine};
     let err_body = r#"{"error":{"code":"429","message":"vendor rate limited"}}"#;
 
     async fn expect_err<E: ModelEngine>(engine: E) -> u16 {
@@ -228,8 +228,8 @@ async fn family_and_bespoke_engines_surface_errors() {
 
     // embeddings (family) — also needs typed input to build a request
     let mut p = ModelParamV2::with_name(Protocol::Embeddings, "emb");
-    p.typed = Some(ap_models::TypedParams::Embeddings(
-        ap_models::EmbeddingParams {
+    p.typed = Some(gw_models::TypedParams::Embeddings(
+        gw_models::EmbeddingParams {
             input: vec!["a".into()],
             dimensions: None,
         },

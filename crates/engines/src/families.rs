@@ -7,10 +7,10 @@
 //! The mock protocol flags byte-level vendor differences as deferred to a later
 //! fidelity pass.
 
-use ap_models::{
+use chrono::Utc;
+use gw_models::{
     GResult, GatewayError, GatewayRequest, GatewayResponse, Recorder, SimpleRecorder, TypedParams,
 };
-use chrono::Utc;
 use serde_json::{Value, json};
 
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
@@ -62,7 +62,7 @@ impl Base {
             .unwrap_or_else(|| "mock".to_owned())
     }
 
-    fn param(&self) -> GResult<&ap_models::ModelParamV2> {
+    fn param(&self) -> GResult<&gw_models::ModelParamV2> {
         self.request
             .model_param_v2
             .as_ref()
@@ -147,7 +147,7 @@ macro_rules! family_engine {
 /// Without this, multimodal requests to Gemini silently drop every image and
 /// only the flattened text reaches the vendor — the same class of bug as
 /// dropping images in the OpenAI/Claude engines.
-fn gemini_parts(m: &ap_models::ChatMsg) -> Vec<Value> {
+fn gemini_parts(m: &gw_models::ChatMsg) -> Vec<Value> {
     if let Some(Value::Array(parts)) = &m.parts {
         let mut out = Vec::new();
         for p in parts {
@@ -197,10 +197,10 @@ impl ModelEngine for VertexEngine {
             .message
             .iter()
             .map(|m| {
-                let role = if m.role == ap_consts::role::AI {
-                    ap_consts::role::MODEL
+                let role = if m.role == gw_consts::role::AI {
+                    gw_consts::role::MODEL
                 } else {
-                    ap_consts::role::USER
+                    gw_consts::role::USER
                 };
                 json!({"role": role, "parts": gemini_parts(m)})
             })
@@ -978,8 +978,8 @@ impl ModelEngine for ResponsesEngine {
 mod tests {
     use super::*;
     use crate::transport::MockTransport;
-    use ap_consts::Protocol;
-    use ap_models::{
+    use gw_consts::Protocol;
+    use gw_models::{
         ChatMsg, EmbeddingParams, ImageParams, ModelParamV2, SearchParams, SttParams, TtsParams,
         VideoParams,
     };
@@ -1131,7 +1131,7 @@ mod tests {
     #[tokio::test]
     async fn down_account_fails_upstream() {
         let mut r = req(Protocol::Gemini, "gemini-pro", None);
-        r.account = Some(ap_models::Account {
+        r.account = Some(gw_models::Account {
             name: "mock-vertex-down".into(),
             ..Default::default()
         });

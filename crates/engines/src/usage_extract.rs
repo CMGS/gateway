@@ -4,7 +4,7 @@
 //! .raw_usage_json`; this pure function maps them into the normalized
 //! [`CommonUsage`] view. The DAG post-process node calls it.
 
-use ap_models::CommonUsage;
+use gw_models::CommonUsage;
 use serde_json::Value;
 
 /// Extract a normalized usage view from raw vendor usage JSON.

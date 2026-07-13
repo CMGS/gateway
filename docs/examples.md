@@ -1,6 +1,6 @@
 # Examples
 
-Every snippet below runs against `cargo run -p ap-server` with the embedded
+Every snippet below runs against `cargo run -p gw-server` with the embedded
 demo config (mock upstreams, zero egress) unless it says otherwise. The demo
 key is `ak-demo-123`.
 
@@ -130,7 +130,7 @@ models:
 
 ```bash
 export OPENAI_API_KEY=sk-...
-AP_GATEWAY_CONF=my.yaml cargo run -p ap-server
+GW_CONFIG=my.yaml cargo run -p gw-server
 curl -s localhost:8080/v1/chat/completions \
   -H 'authorization: Bearer ak-live' -H 'content-type: application/json' \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'

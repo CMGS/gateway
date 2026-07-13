@@ -8,10 +8,10 @@ make test        # cargo test --workspace
 make lint        # cargo clippy --workspace --all-targets -- -D warnings
 make fmt         # cargo fmt --all
 make deny        # cargo deny check (advisories + licenses)
-make release     # optimized ap-server binary (--locked)
+make release     # optimized gw-server binary (--locked)
 make dist        # cross-platform release artifacts (mirrors CI)
 make docker      # build the container image
-make run         # cargo run -p ap-server
+make run         # cargo run -p gw-server
 ```
 
 CI runs fmt/clippy/test and `cargo deny` on every push. Releases are cut by
@@ -63,9 +63,9 @@ Unit tests live beside their code; integration tests are in `crates/*/tests/`.
 Engine golden tests assert exact request wire shapes and response parsing
 against recorded fixtures. `crates/server/tests/e2e.rs` boots the full router
 in-process and exercises every surface offline. Tests that need real
-infrastructure gate on an env var (e.g. `AP_TEST_REDIS_URL`) and no-op when it
+infrastructure gate on an env var (e.g. `GW_TEST_REDIS_URL`) and no-op when it
 is unset. A release micro-benchmark lives in `crates/server/tests/bench.rs`:
 
 ```bash
-cargo test --release -p ap-server --test bench -- --ignored --nocapture
+cargo test --release -p gw-server --test bench -- --ignored --nocapture
 ```

@@ -7,10 +7,10 @@
 //! usage subtree into `raw_usage_json` for the CommonUsage DAG node — the
 //! request→upstream→parse boundary this crate follows.
 
-use ap_models::{
+use chrono::Utc;
+use gw_models::{
     GResult, GatewayError, GatewayRequest, GatewayResponse, Recorder, SimpleRecorder, TypedParams,
 };
-use chrono::Utc;
 use serde_json::{Map, Value, json};
 
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
@@ -228,7 +228,7 @@ impl OpenAiEngine {
                     GatewayError::client_closed(format!("upstream stream failed mid-response: {e}"))
                 } else {
                     GatewayError::new(
-                        ap_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
                         502,
                         format!("upstream stream failed: {e}"),
                     )
@@ -340,8 +340,8 @@ impl ModelEngine for OpenAiEngine {
 mod tests {
     use super::*;
     use crate::transport::MockTransport;
-    use ap_consts::Protocol;
-    use ap_models::{ChatMsg, ChatParams, ModelParamV2};
+    use gw_consts::Protocol;
+    use gw_models::{ChatMsg, ChatParams, ModelParamV2};
     use std::sync::Arc;
 
     fn req(stream: bool) -> GatewayRequest {

@@ -8,23 +8,23 @@
 
 use std::sync::Arc;
 
-use ap_config::GatewayConfig;
-use ap_state::GatewayState;
-use ap_views::AppState;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
+use gw_config::GatewayConfig;
+use gw_state::GatewayState;
+use gw_views::AppState;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
 fn app() -> Router {
     let cfg = Arc::new(GatewayConfig::embedded_default().expect("embedded config"));
     let state = Arc::new(GatewayState::from_config(&cfg));
-    ap_views::app(AppState::new(
+    gw_views::app(AppState::new(
         cfg,
         state,
-        Arc::new(ap_engines::MockTransport),
+        Arc::new(gw_engines::MockTransport),
     ))
 }
 
@@ -1339,10 +1339,10 @@ models:
 "#;
     let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
     let state = Arc::new(GatewayState::from_config(&cfg));
-    let app = ap_views::app(AppState::new(
+    let app = gw_views::app(AppState::new(
         cfg,
         state,
-        Arc::new(ap_engines::MockTransport),
+        Arc::new(gw_engines::MockTransport),
     ));
 
     let resp = app

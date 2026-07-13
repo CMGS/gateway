@@ -1,13 +1,13 @@
 //! Local background tasks.
 //!
 //! Currently just one pure in-process task: periodic AK daily quota reset.
-//! Batch job execution lives in ap-handler::offline (spawned on submit) and
+//! Batch job execution lives in gw-handler::offline (spawned on submit) and
 //! needs no separate poller.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ap_state::GatewayState;
+use gw_state::GatewayState;
 
 /// Spawn the daily quota reset loop. Returns the join handle (abort to stop).
 /// `period` is configurable so tests don't wait 24h.

@@ -1,5 +1,5 @@
 [package]
-name = "ap-server"
+name = "gw-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,15 +8,15 @@ publish.workspace = true
 description = "HTTP entrypoint: config + state + mock transport + axum router."
 
 [[bin]]
-name = "ap"
+name = "gw"
 path = "src/main.rs"
 
 [dependencies]
-ap-config = { workspace = true }
-ap-state = { workspace = true }
-ap-engines = { workspace = true }
-ap-views = { workspace = true }
-ap-task = { workspace = true }
+gw-config = { workspace = true }
+gw-state = { workspace = true }
+gw-engines = { workspace = true }
+gw-views = { workspace = true }
+gw-task = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }
@@ -28,7 +28,7 @@ metrics-exporter-prometheus = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 tower = { workspace = true }
 serde_json = { workspace = true }
-ap-protocol = { workspace = true }
+gw-protocol = { workspace = true }
 # ws e2e: loopback connection, zero egress
 tokio-tungstenite = "0.26"
 futures = { workspace = true }

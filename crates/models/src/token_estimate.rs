@@ -190,7 +190,7 @@ pub fn estimate_prompt_tokens(
 
     for msg in messages {
         // storage-role messages are internal bookkeeping, not sent upstream.
-        if msg.role == ap_consts::role::STORAGE {
+        if msg.role == gw_consts::role::STORAGE {
             continue;
         }
         num += per_msg;

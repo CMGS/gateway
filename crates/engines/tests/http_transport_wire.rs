@@ -14,13 +14,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ap_consts::Protocol;
-use ap_engines::http_transport::{DispatchTransport, HttpTransport};
-use ap_engines::transport::{Transport, UpstreamBody, UpstreamRequest};
-use ap_engines::{ModelEngine, OpenAiEngine};
-use ap_models::{ChatMsg, GatewayRequest, ModelParamV2};
 use axum::routing::post;
 use axum::{Json, Router};
+use gw_consts::Protocol;
+use gw_engines::http_transport::{DispatchTransport, HttpTransport};
+use gw_engines::transport::{Transport, UpstreamBody, UpstreamRequest};
+use gw_engines::{ModelEngine, OpenAiEngine};
+use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
 use serde_json::{Value, json};
 
 /// Loopback server that answers OpenAI-shaped chat completions (JSON + SSE).
@@ -171,10 +171,10 @@ async fn engine_through_real_http_transport_end_to_end() {
     // thing separating it from a real vendor is the endpoint URL + credentials in
     // account config.
     let base = spawn_vendor().await;
-    let transport: ap_engines::SharedTransport =
+    let transport: gw_engines::SharedTransport =
         Arc::new(HttpTransport::new(Duration::from_secs(5)).unwrap());
 
-    let account = ap_models::Account {
+    let account = gw_models::Account {
         name: "real-local".into(),
         provider: "local".into(),
         priority: 1,
@@ -198,7 +198,7 @@ async fn engine_through_real_http_transport_end_to_end() {
 async fn per_account_policy_and_connect_retry() {
     use std::collections::HashMap;
 
-    use ap_engines::http_transport::UpstreamPolicy;
+    use gw_engines::http_transport::UpstreamPolicy;
 
     let mut per_account = HashMap::new();
     per_account.insert(
@@ -243,14 +243,14 @@ async fn per_account_policy_and_connect_retry() {
 /// failover threshold) so the DAG never re-bills or faults the account.
 #[tokio::test]
 async fn client_disconnect_midstream_is_499_not_500() {
-    use ap_engines::transport::UpstreamResponse;
     use futures::StreamExt;
+    use gw_engines::transport::UpstreamResponse;
 
     #[derive(Debug)]
     struct StreamTransport;
     #[async_trait::async_trait]
     impl Transport for StreamTransport {
-        async fn send(&self, _req: UpstreamRequest) -> ap_models::GResult<UpstreamResponse> {
+        async fn send(&self, _req: UpstreamRequest) -> gw_models::GResult<UpstreamResponse> {
             let frames = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
@@ -288,14 +288,14 @@ async fn client_disconnect_midstream_is_499_not_500() {
 /// (terminal) so failover never splices a second generation into the stream.
 #[tokio::test]
 async fn midstream_upstream_error_after_send_is_499() {
-    use ap_engines::transport::UpstreamResponse;
     use futures::StreamExt;
+    use gw_engines::transport::UpstreamResponse;
 
     #[derive(Debug)]
     struct FlakyStream;
     #[async_trait::async_trait]
     impl Transport for FlakyStream {
-        async fn send(&self, _req: UpstreamRequest) -> ap_models::GResult<UpstreamResponse> {
+        async fn send(&self, _req: UpstreamRequest) -> gw_models::GResult<UpstreamResponse> {
             let frames: Vec<Result<bytes::Bytes, String>> = vec![
                 Ok(bytes::Bytes::from(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",

@@ -7,18 +7,18 @@
 
 use std::sync::{Arc, Mutex};
 
-use ap_consts::Protocol;
-use ap_engines::transport::{Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
-use ap_engines::{
+use async_trait::async_trait;
+use gw_consts::Protocol;
+use gw_engines::transport::{Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
+use gw_engines::{
     AudioEngine, AudioKind, ClaudeEngine, CohereEngine, CompletionsEngine, DashScopeEngine,
     EmbeddingsEngine, ErnieEngine, ImageEngine, LlamaEngine, MinimaxV1Engine, ModelEngine,
     OpenAiEngine, ResponsesEngine, SearchEngine, VertexEngine, VideoEngine,
 };
-use ap_models::{
+use gw_models::{
     ChatMsg, ChatParams, EmbeddingParams, GResult, GatewayRequest, ImageParams, ModelParamV2,
     SearchParams, SttParams, TtsParams, TypedParams, VideoParams,
 };
-use async_trait::async_trait;
 use serde_json::Value;
 
 /// Captures the request the engine built, replies with a minimal valid body.
@@ -223,7 +223,7 @@ async fn go_live_seam_routes_to_configured_endpoint() {
     // engines must build the REAL URL + auth, not the mock sentinel. This is the
     // switch that flips every engine live — verify it for both a chat-messages
     // engine (Claude, x-api-key) and a family engine (Vertex, Bearer).
-    use ap_models::Account;
+    use gw_models::Account;
 
     // Claude → x-api-key + real /v1/messages endpoint.
     let t = RecordingTransport::new(
@@ -269,11 +269,11 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
     // At go-live the AWS engines must sign with the account's real key pair (from
     // its two env vars), not the mock creds. SigV4 embeds the access key id in the
     // Authorization header's `Credential=<access_key>/...` component.
-    use ap_models::Account;
+    use gw_models::Account;
     // SAFETY: unique test-local var names; no concurrent reader.
     unsafe {
-        std::env::set_var("AP_TEST_AWS_AK", "AKIAREALEXAMPLE123");
-        std::env::set_var("AP_TEST_AWS_SK", "realsecretkeyvalue");
+        std::env::set_var("GW_TEST_AWS_AK", "AKIAREALEXAMPLE123");
+        std::env::set_var("GW_TEST_AWS_SK", "realsecretkeyvalue");
     }
 
     let t = RecordingTransport::new(
@@ -283,8 +283,8 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
     req.account = Some(Account {
         name: "live-bedrock".into(),
         endpoint: "https://bedrock-runtime.eu-west-1.amazonaws.com".into(),
-        api_key_env: "AP_TEST_AWS_AK".into(),
-        secret_key_env: "AP_TEST_AWS_SK".into(),
+        api_key_env: "GW_TEST_AWS_AK".into(),
+        secret_key_env: "GW_TEST_AWS_SK".into(),
         ..Default::default()
     });
     let _ = CohereEngine::new(req, t.clone()).run().await.unwrap();
@@ -308,8 +308,8 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
     );
     // SAFETY: unique test-local var names; no concurrent reader.
     unsafe {
-        std::env::remove_var("AP_TEST_AWS_AK");
-        std::env::remove_var("AP_TEST_AWS_SK");
+        std::env::remove_var("GW_TEST_AWS_AK");
+        std::env::remove_var("GW_TEST_AWS_SK");
     }
 }
 
@@ -317,7 +317,7 @@ async fn go_live_seam_aws_sigv4_uses_real_credentials() {
 async fn go_live_seam_bespoke_dashscope() {
     // bespoke engines are now go-live-ready too: configured endpoint → real URL,
     // Bearer key from the account (unset env → inert "mock", never a panic).
-    use ap_models::Account;
+    use gw_models::Account;
     let t = RecordingTransport::new(
         r#"{"output":{"text":"ok","finish_reason":"stop"},"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#,
     );

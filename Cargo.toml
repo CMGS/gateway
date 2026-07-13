@@ -62,17 +62,17 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 
 # --- internal crates (path deps) ---
-ap-consts = { path = "crates/consts" }
-ap-utils = { path = "crates/utils" }
-ap-models = { path = "crates/models" }
-ap-protocol = { path = "crates/protocol" }
-ap-config = { path = "crates/config" }
-ap-state = { path = "crates/state" }
-ap-engines = { path = "crates/engines" }
-ap-dag = { path = "crates/dag" }
-ap-handler = { path = "crates/handler" }
-ap-task = { path = "crates/task" }
-ap-views = { path = "crates/views" }
+gw-consts = { path = "crates/consts" }
+gw-utils = { path = "crates/utils" }
+gw-models = { path = "crates/models" }
+gw-protocol = { path = "crates/protocol" }
+gw-config = { path = "crates/config" }
+gw-state = { path = "crates/state" }
+gw-engines = { path = "crates/engines" }
+gw-dag = { path = "crates/dag" }
+gw-handler = { path = "crates/handler" }
+gw-task = { path = "crates/task" }
+gw-views = { path = "crates/views" }
 base64 = "0.22"
 tiktoken-rs = "0.12"
 # pure-compute crypto (SigV4 signing, cache keys) — no network capability

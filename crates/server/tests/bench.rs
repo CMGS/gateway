@@ -3,7 +3,7 @@
 //! In-process load against the composed router (no sockets, no network): serial
 //! latency distribution + concurrent throughput. `#[ignore]`d so normal test
 //! runs stay fast — run explicitly with:
-//!   cargo test --release -p ap-server --test bench -- --ignored --nocapture
+//!   cargo test --release -p gw-server --test bench -- --ignored --nocapture
 //!
 //! Note: no external baseline is included here — a comparable baseline would
 //! hard-require networked state/config backends and RPC to the internal network
@@ -15,21 +15,21 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use ap_config::GatewayConfig;
-use ap_state::GatewayState;
-use ap_views::AppState;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use gw_config::GatewayConfig;
+use gw_state::GatewayState;
+use gw_views::AppState;
 use tower::ServiceExt;
 
 fn app() -> Router {
     let cfg = Arc::new(GatewayConfig::embedded_default().expect("embedded config"));
     let state = Arc::new(GatewayState::from_config(&cfg));
-    ap_views::app(AppState::new(
+    gw_views::app(AppState::new(
         cfg,
         state,
-        Arc::new(ap_engines::MockTransport),
+        Arc::new(gw_engines::MockTransport),
     ))
 }
 

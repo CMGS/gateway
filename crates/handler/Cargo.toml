@@ -1,5 +1,5 @@
 [package]
-name = "ap-handler"
+name = "gw-handler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,13 +7,13 @@ publish.workspace = true
 description = "Business orchestration: build DagContext, run the layered DAG."
 
 [dependencies]
-ap-consts = { workspace = true }
-ap-models = { workspace = true }
-ap-config = { workspace = true }
-ap-state = { workspace = true }
+gw-consts = { workspace = true }
+gw-models = { workspace = true }
+gw-config = { workspace = true }
+gw-state = { workspace = true }
 tracing = { workspace = true }
-ap-engines = { workspace = true }
-ap-dag = { workspace = true }
+gw-engines = { workspace = true }
+gw-dag = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 

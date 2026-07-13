@@ -1,6 +1,6 @@
 # Gateway
 
-Single-binary LLM access point in Rust (binary: `ap`): OpenAI- and
+Single-binary LLM access point in Rust (binary: `gw`): OpenAI- and
 Anthropic-compatible APIs in front of pluggable model providers, with
 key-based auth, quotas, rate limits, failover, and a billing ledger.
 

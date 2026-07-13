@@ -5,10 +5,10 @@
 //! answers in the same shapes). AWS engines compute a real SigV4 Authorization
 //! header (pure computation; inert against the mock, live over real HTTP).
 
-use ap_models::{
+use chrono::Utc;
+use gw_models::{
     GResult, GatewayError, GatewayRequest, GatewayResponse, Recorder, SimpleRecorder, TypedParams,
 };
-use chrono::Utc;
 use serde_json::{Value, json};
 
 use crate::engine::{EngineOutcome, ModelEngine};
@@ -73,7 +73,7 @@ impl Base {
             .ok_or_else(|| GatewayError::bad_request("missing model param"))
     }
 
-    fn chat_params(&self) -> Option<&ap_models::ChatParams> {
+    fn chat_params(&self) -> Option<&gw_models::ChatParams> {
         match self.request.model_param_v2.as_ref()?.typed.as_ref()? {
             TypedParams::Chat(p) => Some(p),
             _ => None,
@@ -198,9 +198,9 @@ impl ModelEngine for ErnieEngine {
             .request
             .message
             .iter()
-            .filter(|m| m.role != ap_consts::role::SYSTEM)
+            .filter(|m| m.role != gw_consts::role::SYSTEM)
             .map(|m| {
-                json!({"role": if m.role == ap_consts::role::AI {"assistant"} else {"user"},
+                json!({"role": if m.role == gw_consts::role::AI {"assistant"} else {"user"},
                              "content": m.content})
             })
             .collect();
@@ -265,9 +265,9 @@ impl ModelEngine for MinimaxV1Engine {
             .request
             .message
             .iter()
-            .filter(|m| m.role != ap_consts::role::SYSTEM)
+            .filter(|m| m.role != gw_consts::role::SYSTEM)
             .map(|m| {
-                json!({"sender_type": if m.role == ap_consts::role::AI {"BOT"} else {"USER"},
+                json!({"sender_type": if m.role == gw_consts::role::AI {"BOT"} else {"USER"},
                        "text": m.content})
             })
             .collect();
@@ -285,7 +285,7 @@ impl ModelEngine for MinimaxV1Engine {
         let code = v["base_resp"]["status_code"].as_i64().unwrap_or(0);
         if code != 0 {
             return Err(GatewayError::new(
-                ap_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
+                gw_consts::ErrCode::FED_RESP_STATUS_NOT_ZERO,
                 502,
                 format!("minimax base_resp {code}: {}", v["base_resp"]["status_msg"]),
             ));
@@ -325,10 +325,10 @@ impl ModelEngine for CohereEngine {
         let mut history: Vec<Value> = Vec::new();
         let mut message = String::new();
         for m in &self.base.request.message {
-            if m.role == ap_consts::role::SYSTEM {
+            if m.role == gw_consts::role::SYSTEM {
                 continue;
             }
-            let role = if m.role == ap_consts::role::AI {
+            let role = if m.role == gw_consts::role::AI {
                 "CHATBOT"
             } else {
                 "USER"
@@ -493,8 +493,8 @@ impl ModelEngine for DashScopeEngine {
             .message
             .iter()
             .map(|m| {
-                json!({"role": if m.role == ap_consts::role::AI {"assistant"}
-                                 else if m.role == ap_consts::role::SYSTEM {"system"}
+                json!({"role": if m.role == gw_consts::role::AI {"assistant"}
+                                 else if m.role == gw_consts::role::SYSTEM {"system"}
                                  else {"user"},
                        "content": m.content})
             })
@@ -570,8 +570,8 @@ impl ModelEngine for DashScopeEngine {
 mod tests {
     use super::*;
     use crate::transport::MockTransport;
-    use ap_consts::Protocol;
-    use ap_models::{ChatMsg, ModelParamV2};
+    use gw_consts::Protocol;
+    use gw_models::{ChatMsg, ModelParamV2};
     use std::sync::Arc;
 
     fn req(mt: Protocol, name: &str) -> GatewayRequest {

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use ap_models::{GResult, GatewayError};
+use gw_models::{GResult, GatewayError};
 
 use crate::transport::{MockTransport, Transport, UpstreamBody, UpstreamRequest, UpstreamResponse};
 
@@ -107,7 +107,7 @@ impl Transport for HttpTransport {
                 }
                 Err(e) => {
                     return Err(GatewayError::new(
-                        ap_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
                         502,
                         format!("upstream request failed: {e}"),
                     ));

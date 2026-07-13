@@ -3,8 +3,8 @@
 //! /v1/realtime WebSocket surface, so the factory answers 501-with-pointer for
 //! it on the chat path.
 
-use ap_consts::{ErrCode, Protocol};
-use ap_models::{GResult, GatewayError, GatewayRequest};
+use gw_consts::{ErrCode, Protocol};
+use gw_models::{GResult, GatewayError, GatewayRequest};
 
 use crate::bespoke::{CohereEngine, DashScopeEngine, ErnieEngine, LlamaEngine, MinimaxV1Engine};
 use crate::claude_engine::ClaudeEngine;
@@ -68,7 +68,7 @@ pub fn get_engine(
 mod tests {
     use std::sync::Arc;
 
-    use ap_models::ModelParamV2;
+    use gw_models::ModelParamV2;
 
     use super::*;
     use crate::transport::MockTransport;

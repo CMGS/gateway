@@ -16,14 +16,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ap_config::GatewayConfig;
-use ap_engines::http_transport::HttpTransport;
-use ap_state::GatewayState;
-use ap_views::AppState;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
+use gw_config::GatewayConfig;
+use gw_engines::http_transport::HttpTransport;
+use gw_state::GatewayState;
+use gw_views::AppState;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -117,7 +117,7 @@ accounts:
     let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).expect("config"));
     let state = Arc::new(GatewayState::from_config(&cfg));
     let transport = Arc::new(HttpTransport::new(Duration::from_secs(5)).expect("http transport"));
-    ap_views::app(AppState::new(cfg, state, transport))
+    gw_views::app(AppState::new(cfg, state, transport))
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {

@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use ap_consts::Protocol;
-use ap_models::{GResult, GatewayError};
+use gw_consts::Protocol;
+use gw_models::{GResult, GatewayError};
 use serde_json::{Value, json};
 
 /// A vendor-bound request an engine built, ready to hand to a [`Transport`].
@@ -59,7 +59,7 @@ impl UpstreamResponse {
             while let Some(item) = s.next().await {
                 let bytes = item.map_err(|e| {
                     GatewayError::new(
-                        ap_consts::ErrCode::FED_RESP_RPC_FAILED,
+                        gw_consts::ErrCode::FED_RESP_RPC_FAILED,
                         502,
                         format!("upstream stream failed: {e}"),
                     )
@@ -538,7 +538,7 @@ impl Transport for MockTransport {
         // downtime simulation: account name containing "down" → upstream 503 (triggers DAG failover)
         if req.account.contains("down") {
             return Err(GatewayError::new(
-                ap_consts::ErrCode::FED_RESP_RPC_FAILED,
+                gw_consts::ErrCode::FED_RESP_RPC_FAILED,
                 503,
                 format!("mock upstream unavailable for account {}", req.account),
             ));

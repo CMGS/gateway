@@ -1,5 +1,5 @@
 [package]
-name = "ap-state"
+name = "gw-state"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,9 @@ publish.workspace = true
 description = "In-process gateway state: auth, rate limit, quota, account pool, billing ledger — no external storage."
 
 [dependencies]
-ap-consts = { workspace = true }
-ap-models = { workspace = true }
-ap-config = { workspace = true }
+gw-consts = { workspace = true }
+gw-models = { workspace = true }
+gw-config = { workspace = true }
 dashmap = { workspace = true }
 moka = { workspace = true }
 governor = { workspace = true }

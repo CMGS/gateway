@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use ap_config::GatewayConfig;
-use ap_consts::Protocol;
-use ap_models::Account;
 use dashmap::DashMap;
+use gw_config::GatewayConfig;
+use gw_consts::Protocol;
+use gw_models::Account;
 
 pub mod governance;
 pub mod store;
@@ -84,7 +84,7 @@ impl std::fmt::Debug for RateLimiter {
 }
 
 /// Daily token quota accounting per AK; the daily reset is driven by
-/// ap-task's periodic job calling `reset_all`.
+/// gw-task's periodic job calling `reset_all`.
 #[derive(Debug, Default)]
 pub struct QuotaStore {
     used: DashMap<String, i64>,
@@ -105,7 +105,7 @@ impl QuotaStore {
         *self.used.entry(ak.to_owned()).or_insert(0) += tokens;
     }
 
-    /// Daily reset. Driven by the ap-task background job as an in-process
+    /// Daily reset. Driven by the gw-task background job as an in-process
     /// periodic task.
     pub fn reset_all(&self) {
         self.used.clear();
@@ -308,7 +308,7 @@ impl AccountHealth {
 /// (moka).
 #[derive(Debug)]
 pub struct ResponseCache {
-    entries: moka::sync::Cache<String, (ap_models::GatewayResponse, Duration)>,
+    entries: moka::sync::Cache<String, (gw_models::GatewayResponse, Duration)>,
 }
 
 impl Default for ResponseCache {
@@ -323,22 +323,22 @@ impl Default for ResponseCache {
 }
 
 impl ResponseCache {
-    pub fn get(&self, key: &str) -> Option<ap_models::GatewayResponse> {
+    pub fn get(&self, key: &str) -> Option<gw_models::GatewayResponse> {
         self.entries.get(key).map(|(resp, _)| resp)
     }
 
-    pub fn put(&self, key: String, resp: ap_models::GatewayResponse, ttl: Duration) {
+    pub fn put(&self, key: String, resp: gw_models::GatewayResponse, ttl: Duration) {
         self.entries.insert(key, (resp, ttl));
     }
 }
 
 struct PerEntryTtl;
 
-impl moka::Expiry<String, (ap_models::GatewayResponse, Duration)> for PerEntryTtl {
+impl moka::Expiry<String, (gw_models::GatewayResponse, Duration)> for PerEntryTtl {
     fn expire_after_create(
         &self,
         _key: &String,
-        value: &(ap_models::GatewayResponse, Duration),
+        value: &(gw_models::GatewayResponse, Duration),
         _created_at: Instant,
     ) -> Option<Duration> {
         Some(value.1)
@@ -349,7 +349,7 @@ impl moka::Expiry<String, (ap_models::GatewayResponse, Duration)> for PerEntryTt
     fn expire_after_update(
         &self,
         _key: &String,
-        value: &(ap_models::GatewayResponse, Duration),
+        value: &(gw_models::GatewayResponse, Duration),
         _updated_at: Instant,
         _duration_until_expiry: Option<Duration>,
     ) -> Option<Duration> {

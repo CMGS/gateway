@@ -29,19 +29,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use ap_config::GatewayConfig;
-use ap_dag::DagContext;
-use ap_engines::{SharedTransport, is_implemented};
-use ap_handler::{BatchItem, OfflineHandler, OnlineHandler};
-use ap_models::{
-    ChatMsg, ChatParams, EmbeddingParams, GatewayError, GatewayRequest, ImageParams, ModelParamV2,
-    SttParams, TtsParams, TypedParams,
-};
-use ap_protocol::anthropic::{AnthUsage, MessagesRequest, MessagesResponse};
-use ap_protocol::openai::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Usage,
-};
-use ap_state::{AkInfo, GatewayState};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
@@ -49,6 +36,19 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
+use gw_config::GatewayConfig;
+use gw_dag::DagContext;
+use gw_engines::{SharedTransport, is_implemented};
+use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
+use gw_models::{
+    ChatMsg, ChatParams, EmbeddingParams, GatewayError, GatewayRequest, ImageParams, ModelParamV2,
+    SttParams, TtsParams, TypedParams,
+};
+use gw_protocol::anthropic::{AnthUsage, MessagesRequest, MessagesResponse};
+use gw_protocol::openai::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Usage,
+};
+use gw_state::{AkInfo, GatewayState};
 use serde_json::{Value, json};
 
 const LEDGER_PAGE_DEFAULT: usize = 100;
@@ -148,11 +148,11 @@ async fn realtime_ws(
         .cfg
         .find_model(&model)
         .and_then(|m| m.protocol())
-        .or_else(|| ap_consts::Protocol::from_wire(&model));
+        .or_else(|| gw_consts::Protocol::from_wire(&model));
     let Some(mt) = mt else {
         return error_response(404, format!("unknown model: {model}"));
     };
-    if mt != ap_consts::Protocol::Realtime {
+    if mt != gw_consts::Protocol::Realtime {
         return error_response(400, format!("`{model}` is not a realtime model"));
     }
     let Some(account) = s.handler.state.pool.select_healthy(
@@ -175,7 +175,7 @@ async fn realtime_session(
     s: AppState,
     ak: AkInfo,
     model: String,
-    mt: ap_consts::Protocol,
+    mt: gw_consts::Protocol,
     account: String,
 ) {
     use axum::extract::ws::Message;
@@ -225,7 +225,7 @@ async fn realtime_session(
                     .governance
                     .quota_consume(&ak.ak, it + ot)
                     .await;
-                let record = ap_state::BillingRecord {
+                let record = gw_state::BillingRecord {
                     ak: ak.ak.clone(),
                     product: ak.product.clone(),
                     model: model.clone(),
@@ -307,7 +307,7 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
 }
 
 async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok", "service": "ap" }))
+    Json(json!({ "status": "ok", "service": "gw" }))
 }
 
 /// Configured public models (the gateway's catalog view).
@@ -455,7 +455,7 @@ async fn chat_completions(
             role: m.role.clone(),
             content: m.content_text(),
             parts: m.content.as_ref().and_then(|c| match c {
-                ap_protocol::openai::MessageContent::Parts(p) => Some(Value::Array(p.clone())),
+                gw_protocol::openai::MessageContent::Parts(p) => Some(Value::Array(p.clone())),
                 _ => None,
             }),
             tool_calls: m
@@ -481,7 +481,7 @@ async fn chat_completions(
     });
     let mut param = ModelParamV2::with_name(
         // placeholder type; the resolve_model DAG node maps model_name properly
-        ap_consts::Protocol::OpenaiChat,
+        gw_consts::Protocol::OpenaiChat,
         body.model.clone(),
     );
     param.typed = Some(typed);
@@ -520,7 +520,7 @@ async fn chat_completions(
 
     // tool_calls response: content=null + finish_reason=tool_calls (OpenAI semantics)
     if let Some(tc) = &outcome.response.tool_calls {
-        let calls: Vec<ap_protocol::openai::ToolCall> =
+        let calls: Vec<gw_protocol::openai::ToolCall> =
             serde_json::from_value(tc.clone()).unwrap_or_default();
         let resp = ChatCompletionResponse::tool_calls(
             id,
@@ -554,7 +554,7 @@ fn chat_stream_response(
     model: String,
     started: Instant,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<ap_engines::StreamChunk>(STREAM_CHANNEL_CAP);
+    let (tx, rx) = tokio::sync::mpsc::channel::<gw_engines::StreamChunk>(STREAM_CHANNEL_CAP);
     request.stream_tx = Some(tx.clone());
     let handler = s.handler.clone();
     tokio::spawn(async move {
@@ -567,7 +567,7 @@ fn chat_stream_response(
                     } else {
                         synth_chunks(outcome)
                     };
-                    tail.push(ap_engines::StreamChunk {
+                    tail.push(gw_engines::StreamChunk {
                         usage_totals: Some((
                             outcome.response.prompt_tokens,
                             outcome.response.completion_tokens,
@@ -584,7 +584,7 @@ fn chat_stream_response(
             }
             Err(e) => {
                 let _ = tx
-                    .send(ap_engines::StreamChunk {
+                    .send(gw_engines::StreamChunk {
                         error: Some(e.to_string()),
                         ..Default::default()
                     })
@@ -594,7 +594,7 @@ fn chat_stream_response(
     });
 
     struct St {
-        rx: tokio::sync::mpsc::Receiver<ap_engines::StreamChunk>,
+        rx: tokio::sync::mpsc::Receiver<gw_engines::StreamChunk>,
         queue: std::collections::VecDeque<Event>,
         id: String,
         created: i64,
@@ -677,9 +677,9 @@ fn chat_stream_response(
 
 /// Chunks for engines that returned a buffered response: the full message as
 /// one delta plus a finish marker.
-fn synth_chunks(outcome: &ap_engines::EngineOutcome) -> Vec<ap_engines::StreamChunk> {
+fn synth_chunks(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
     let mut chunks = if outcome.chunks.is_empty() && !outcome.response.message.is_empty() {
-        vec![ap_engines::StreamChunk {
+        vec![gw_engines::StreamChunk {
             delta: outcome.response.message.clone(),
             ..Default::default()
         }]
@@ -687,7 +687,7 @@ fn synth_chunks(outcome: &ap_engines::EngineOutcome) -> Vec<ap_engines::StreamCh
         outcome.chunks.clone()
     };
     if !chunks.iter().any(|c| c.finish_reason.is_some()) {
-        chunks.push(ap_engines::StreamChunk {
+        chunks.push(gw_engines::StreamChunk {
             finish_reason: Some(if outcome.response.finish_reason.is_empty() {
                 "stop".to_owned()
             } else {
@@ -728,7 +728,7 @@ async fn messages(
         ..Default::default()
     });
     let mut param =
-        ModelParamV2::with_name(ap_consts::Protocol::AnthropicMessages, body.model.clone());
+        ModelParamV2::with_name(gw_consts::Protocol::AnthropicMessages, body.model.clone());
     param.typed = Some(typed);
     param.raw = Value::Object(body.extra.clone());
 
@@ -775,12 +775,12 @@ async fn messages(
         if deltas.is_empty() && !outcome.response.message.is_empty() {
             deltas.push(outcome.response.message.clone());
         }
-        let usage = ap_protocol::anthropic::AnthUsage {
+        let usage = gw_protocol::anthropic::AnthUsage {
             input_tokens: outcome.response.prompt_tokens,
             output_tokens: outcome.response.completion_tokens,
         };
         let stop = finish_anthropic(&outcome.response.finish_reason);
-        let events: Vec<Event> = ap_protocol::anthropic::stream_events(
+        let events: Vec<Event> = gw_protocol::anthropic::stream_events(
             &id,
             &outcome.response.model,
             &deltas,
@@ -795,16 +795,16 @@ async fn messages(
     }
 
     // Non-streaming: text + tool_use blocks
-    let mut content: Vec<ap_protocol::anthropic::ContentBlock> = Vec::new();
+    let mut content: Vec<gw_protocol::anthropic::ContentBlock> = Vec::new();
     if !outcome.response.message.is_empty() {
-        content.push(ap_protocol::anthropic::ContentBlock::Text {
+        content.push(gw_protocol::anthropic::ContentBlock::Text {
             text: outcome.response.message.clone(),
         });
     }
     if let Some(Value::Array(blocks)) = &outcome.response.tool_calls {
         for b in blocks {
             if b["type"] == "tool_use" {
-                content.push(ap_protocol::anthropic::ContentBlock::ToolUse {
+                content.push(gw_protocol::anthropic::ContentBlock::ToolUse {
                     id: b["id"].as_str().unwrap_or_default().to_owned(),
                     name: b["name"].as_str().unwrap_or_default().to_owned(),
                     input: b["input"].clone(),
@@ -833,7 +833,7 @@ async fn run_family(
     typed: TypedParams,
     messages: Vec<ChatMsg>,
 ) -> Result<DagContext, Response> {
-    let mut param = ModelParamV2::with_name(ap_consts::Protocol::OpenaiChat, model);
+    let mut param = ModelParamV2::with_name(gw_consts::Protocol::OpenaiChat, model);
     param.typed = Some(typed);
     let request = GatewayRequest {
         is_online: true,
@@ -881,7 +881,7 @@ async fn completions(
         temperature: body["temperature"].as_f64(),
         ..Default::default()
     });
-    let mut param = ModelParamV2::with_name(ap_consts::Protocol::Completions, model);
+    let mut param = ModelParamV2::with_name(gw_consts::Protocol::Completions, model);
     param.typed = Some(typed);
     let request = GatewayRequest {
         is_online: true,
@@ -942,7 +942,7 @@ async fn responses(
     let stream = body["stream"].as_bool().unwrap_or(false);
     // native passthrough: the whole Responses-shaped body rides in `raw`;
     // resolve_model maps `model` → Protocol::Responses → ResponsesEngine.
-    let mut param = ModelParamV2::with_name(ap_consts::Protocol::Responses, model);
+    let mut param = ModelParamV2::with_name(gw_consts::Protocol::Responses, model);
     param.raw = body;
     let request = GatewayRequest {
         is_online: true,
@@ -974,7 +974,7 @@ async fn responses(
 /// usage (input_tokens/output_tokens — the Responses dialect). Synthesizes a
 /// single delta when the engine returned a buffered (non-streaming) reply.
 fn responses_sse(
-    outcome: &ap_engines::EngineOutcome,
+    outcome: &gw_engines::EngineOutcome,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<>> {
     let r = &outcome.response;
     let mut events: Vec<Event> = Vec::new();
@@ -1375,7 +1375,7 @@ mod tests {
         app(AppState::new(
             cfg,
             state,
-            Arc::new(ap_engines::MockTransport),
+            Arc::new(gw_engines::MockTransport),
         ))
     }
 

@@ -1,6 +1,6 @@
 # Gateway
 
-Single-binary LLM access point in Rust (binary: `ap`): OpenAI- and
+Single-binary LLM access point in Rust (binary: `gw`): OpenAI- and
 Anthropic-compatible APIs in front of pluggable model providers, with
 key-based auth, quotas, rate limits, failover, and a billing ledger.
 
@@ -20,7 +20,7 @@ key-based auth, quotas, rate limits, failover, and a billing ledger.
 
 ```bash
 # Run with the embedded demo config (mock upstreams, zero egress)
-cargo run -p ap-server
+cargo run -p gw-server
 
 # Chat completion
 curl -s localhost:8080/v1/chat/completions \
@@ -33,10 +33,10 @@ curl -sN localhost:8080/v1/messages \
   -d '{"model":"claude-sonnet","stream":true,"max_tokens":128,"messages":[{"role":"user","content":"hi"}]}'
 
 # Your own config
-AP_GATEWAY_CONF=conf/gateway.yaml cargo run -p ap-server
+GW_CONFIG=conf/gateway.yaml cargo run -p gw-server
 
 # Go live: give an account `endpoint` + `api_key_env` in the config — that's it.
-# AP_TRANSPORT=mock forces zero egress; AP_TRANSPORT=http disables the mock.
+# GW_TRANSPORT=mock forces zero egress; GW_TRANSPORT=http disables the mock.
 ```
 
 Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/providers.md) · [Governance](docs/governance.md) · [Observability](docs/observability.md) · [Deployment](docs/deployment.md) · [Configuration](docs/configuration.md) · [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Roadmap](ROADMAP.md)
@@ -47,10 +47,10 @@ Guides: [Examples](docs/examples.md) · [API](docs/api.md) · [Providers](docs/p
 docker build -t gateway .
 docker run -p 8080:8080 gateway            # embedded demo config
 docker run -p 8080:8080 -v $PWD/conf/gateway.yaml:/etc/gateway.yaml \
-  -e AP_GATEWAY_CONF=/etc/gateway.yaml gateway
+  -e GW_CONFIG=/etc/gateway.yaml gateway
 ```
 
-The image binds `0.0.0.0` (`AP_HOST`) and ships a `/health` HEALTHCHECK.
+The image binds `0.0.0.0` (`GW_HOST`) and ships a `/health` HEALTHCHECK.
 Published multi-arch to `ghcr.io/cmgs/gateway` on push.
 
 ## Development
@@ -61,7 +61,7 @@ make test     # cargo test --workspace
 make lint     # clippy -D warnings
 make fmt      # cargo fmt --all
 make deny     # cargo deny check (advisories + licenses)
-make release  # optimized ap-server binary (--locked)
+make release  # optimized gw-server binary (--locked)
 make docker   # build the container image
 ```
 

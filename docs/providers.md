@@ -51,7 +51,7 @@ same name wins over the preset.
 3. Start the gateway. Requests egress to the real vendor and the ledger records
    real usage.
 
-`AP_TRANSPORT` overrides transport routing: unset routes `mock://` sentinel
+`GW_TRANSPORT` overrides transport routing: unset routes `mock://` sentinel
 URLs in-process and real URLs over HTTP; `mock` forces zero egress; `http`
 disables the mock so a misconfigured account fails loudly.
 

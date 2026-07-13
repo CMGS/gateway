@@ -1,4 +1,4 @@
-BIN := ap
+BIN := gw
 
 .PHONY: all build release test lint fmt fmt-check deny dist dist-plan docker run clean
 
@@ -8,7 +8,7 @@ build:
 	cargo build --workspace
 
 release:
-	cargo build --release -p ap-server --locked
+	cargo build --release -p gw-server --locked
 
 test:
 	cargo test --workspace
@@ -36,7 +36,7 @@ docker:
 	docker build -t gateway .
 
 run:
-	cargo run -p ap-server
+	cargo run -p gw-server
 
 clean:
 	cargo clean

@@ -6,7 +6,7 @@
 //! is sequential-in-topo-order, which is behavior-compatible for these nodes.
 //! Layer topologies are declared in code for now.
 
-use ap_models::{GResult, GatewayError};
+use gw_models::{GResult, GatewayError};
 
 use crate::context::DagContext;
 
@@ -122,14 +122,14 @@ mod tests {
 
     fn test_ctx() -> DagContext {
         use std::sync::Arc;
-        let cfg = Arc::new(ap_config::GatewayConfig::embedded_default().unwrap());
-        let state = Arc::new(ap_state::GatewayState::from_config(&cfg));
+        let cfg = Arc::new(gw_config::GatewayConfig::embedded_default().unwrap());
+        let state = Arc::new(gw_state::GatewayState::from_config(&cfg));
         DagContext::new(
             cfg,
             state,
-            Arc::new(ap_engines::MockTransport),
+            Arc::new(gw_engines::MockTransport),
             Default::default(),
-            ap_state::AkInfo {
+            gw_state::AkInfo {
                 ak: "t".into(),
                 product: "demo".into(),
                 qps: 10.0,

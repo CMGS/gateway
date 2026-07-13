@@ -1,9 +1,9 @@
 //! The default node set for the online chat pipeline.
 //! Metrics-reporting nodes are dropped by design.
 
-use ap_consts::{ErrCode, Protocol};
-use ap_models::{GResult, GatewayError};
-use ap_state::BillingRecord;
+use gw_consts::{ErrCode, Protocol};
+use gw_models::{GResult, GatewayError};
+use gw_state::BillingRecord;
 
 use crate::context::DagContext;
 use crate::executor::{DagNode, Layer};
@@ -97,7 +97,7 @@ impl DagNode for CacheLookup {
             ctx.decide("cache_lookup", format!("hit ttl={ttl}s"));
             metrics::counter!("gateway_cache_hits_total").increment(1);
             ctx.cache_hit = true;
-            ctx.outcome = Some(ap_engines::EngineOutcome::ok(cached));
+            ctx.outcome = Some(gw_engines::EngineOutcome::ok(cached));
         } else {
             ctx.decide("cache_lookup", "miss".to_owned());
         }
@@ -343,7 +343,7 @@ impl DagNode for CallEngine {
         }
         let threshold = ctx.cfg.stability.failure_threshold;
         let cooldown = std::time::Duration::from_secs(ctx.cfg.stability.cooldown_seconds);
-        let engine = ap_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
+        let engine = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
         match engine.run().await {
             Ok(outcome) => {
                 if let Some(a) = ctx.request.account.as_ref() {
@@ -397,7 +397,7 @@ impl DagNode for CallEngine {
                     ),
                 );
                 ctx.request.account = Some(next.clone());
-                let retry = ap_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
+                let retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
                 match retry.run().await {
                     Ok(mut outcome) => {
                         ctx.state.health.record_success(&next.name);
@@ -430,7 +430,7 @@ impl DagNode for CommonUsageNode {
         if let Some(outcome) = ctx.outcome.as_mut() {
             let resp = &mut outcome.response;
             resp.common_usage =
-                ap_engines::extract_common_usage(&resp.raw_usage_json, resp.is_messages_protocol);
+                gw_engines::extract_common_usage(&resp.raw_usage_json, resp.is_messages_protocol);
         }
         Ok(())
     }
@@ -461,18 +461,18 @@ impl DagNode for CostCalc {
         // rounding correctly for future rates.
         let (prompt, completion, total) = match &resp.common_usage {
             Some(u) => {
-                let ti = ap_models::TokenInput {
+                let ti = gw_models::TokenInput {
                     prompt: u.platform_input,
                     read_cache: u.read_cache,
                     write_cache: u.write_cache,
                     completion: u.completion,
                     reasoning: u.reason,
                 };
-                let rate = ap_models::TokenRate::default();
+                let rate = gw_models::TokenRate::default();
                 (
                     u.platform_input + u.read_cache + u.write_cache,
                     u.completion + u.reason,
-                    ap_models::platform_total(&ti, &rate),
+                    gw_models::platform_total(&ti, &rate),
                 )
             }
             None => (

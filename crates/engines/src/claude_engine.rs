@@ -5,10 +5,10 @@
 //! content_block_delta → message_delta → message_stop). Marks `is_messages_protocol`
 //! so the usage extractor applies the Anthropic field map.
 
-use ap_models::{
+use chrono::Utc;
+use gw_models::{
     GResult, GatewayError, GatewayRequest, GatewayResponse, Recorder, SimpleRecorder, TypedParams,
 };
-use chrono::Utc;
 use serde_json::{Map, Value, json};
 
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
@@ -40,11 +40,11 @@ impl ClaudeEngine {
         let mut system_text = String::new();
         let mut messages: Vec<Value> = Vec::new();
         for m in &self.request.message {
-            if m.role == ap_consts::role::SYSTEM {
+            if m.role == gw_consts::role::SYSTEM {
                 system_text.push_str(&m.content);
                 continue;
             }
-            let role = if m.role == ap_consts::role::AI {
+            let role = if m.role == gw_consts::role::AI {
                 "assistant"
             } else {
                 "user"
@@ -266,8 +266,8 @@ impl ModelEngine for ClaudeEngine {
 mod tests {
     use super::*;
     use crate::transport::MockTransport;
-    use ap_consts::Protocol;
-    use ap_models::{ChatMsg, ChatParams, ModelParamV2};
+    use gw_consts::Protocol;
+    use gw_models::{ChatMsg, ChatParams, ModelParamV2};
     use std::sync::Arc;
 
     fn base_req() -> GatewayRequest {

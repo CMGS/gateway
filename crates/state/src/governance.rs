@@ -135,7 +135,7 @@ impl Governance for RedisGovernance {
         } else {
             (qps.ceil() as i64, Duration::from_secs(1))
         };
-        self.incr_window(&format!("ap:rate:{key}"), 1, window).await <= limit
+        self.incr_window(&format!("gw:rate:{key}"), 1, window).await <= limit
     }
     async fn quota_check(&self, ak: &str, limit: i64) -> bool {
         self.quota_used(ak).await < limit
@@ -143,7 +143,7 @@ impl Governance for RedisGovernance {
     async fn quota_used(&self, ak: &str) -> i64 {
         let mut conn = self.conn.clone();
         match redis::cmd("GET")
-            .arg(format!("ap:quota:{ak}"))
+            .arg(format!("gw:quota:{ak}"))
             .query_async::<Option<i64>>(&mut conn)
             .await
         {
@@ -157,7 +157,7 @@ impl Governance for RedisGovernance {
     async fn quota_consume(&self, ak: &str, tokens: i64) {
         let mut conn = self.conn.clone();
         let _ = redis::cmd("INCRBY")
-            .arg(format!("ap:quota:{ak}"))
+            .arg(format!("gw:quota:{ak}"))
             .arg(tokens)
             .query_async::<i64>(&mut conn)
             .await;
@@ -171,7 +171,7 @@ impl Governance for RedisGovernance {
             let res: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
                 .arg(cursor)
                 .arg("MATCH")
-                .arg("ap:quota:*")
+                .arg("gw:quota:*")
                 .arg("COUNT")
                 .arg(512)
                 .query_async(&mut conn)
@@ -190,12 +190,12 @@ impl Governance for RedisGovernance {
         }
     }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
-        self.incr_window(&format!("ap:qpm:{key}"), 1, window).await <= limit
+        self.incr_window(&format!("gw:qpm:{key}"), 1, window).await <= limit
     }
     async fn token_window_check(&self, key: &str, limit: i64, window: Duration) -> bool {
         let mut conn = self.conn.clone();
         let used = redis::cmd("GET")
-            .arg(format!("ap:tpm:{key}"))
+            .arg(format!("gw:tpm:{key}"))
             .query_async::<Option<i64>>(&mut conn)
             .await
             .ok()
@@ -205,7 +205,7 @@ impl Governance for RedisGovernance {
         used < limit
     }
     async fn token_window_add(&self, key: &str, tokens: i64, window: Duration) {
-        self.incr_window(&format!("ap:tpm:{key}"), tokens, window)
+        self.incr_window(&format!("gw:tpm:{key}"), tokens, window)
             .await;
     }
 }
@@ -214,10 +214,10 @@ impl Governance for RedisGovernance {
 mod tests {
     use super::*;
 
-    /// Set AP_TEST_REDIS_URL (e.g. redis://127.0.0.1:16379) to run this.
+    /// Set GW_TEST_REDIS_URL (e.g. redis://127.0.0.1:16379) to run this.
     #[tokio::test]
     async fn redis_governance_enforces_limits() {
-        let Ok(url) = std::env::var("AP_TEST_REDIS_URL") else {
+        let Ok(url) = std::env::var("GW_TEST_REDIS_URL") else {
             return;
         };
         let g = RedisGovernance::connect(&url).await.expect("redis connect");

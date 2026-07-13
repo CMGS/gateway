@@ -1,20 +1,20 @@
 //! Service entrypoint.
 //!
-//! Load local config (AP_GATEWAY_CONF path, else the embedded default), build
-//! in-process state, select the upstream transport (`AP_TRANSPORT`), spawn local
+//! Load local config (GW_CONFIG path, else the embedded default), build
+//! in-process state, select the upstream transport (`GW_TRANSPORT`), spawn local
 //! background tasks, serve the views router with graceful shutdown
 //! (SIGINT/SIGTERM → drain).
 //!
 //! Accounts with a configured `endpoint` egress to real vendors; accounts
-//! without one are served by the in-process mock. `AP_TRANSPORT=mock` forces
+//! without one are served by the in-process mock. `GW_TRANSPORT=mock` forces
 //! zero egress. `tracing` is local structured logging to stdout only.
 
 use std::env;
 use std::sync::Arc;
 
-use ap_config::GatewayConfig;
-use ap_state::GatewayState;
-use ap_views::AppState;
+use gw_config::GatewayConfig;
+use gw_state::GatewayState;
+use gw_views::AppState;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -25,20 +25,20 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = match env::var("AP_GATEWAY_CONF") {
+    let cfg = match env::var("GW_CONFIG") {
         Ok(path) => {
             tracing::info!("loading config from {path}");
             GatewayConfig::load(&path)?
         }
         Err(_) => {
-            tracing::info!("using embedded default config (set AP_GATEWAY_CONF to override)");
+            tracing::info!("using embedded default config (set GW_CONFIG to override)");
             GatewayConfig::embedded_default()?
         }
     };
 
-    // AP_HOST / AP_PORT win over the config file (AP_HOST=0.0.0.0 for containers).
-    let host = env::var("AP_HOST").unwrap_or_else(|_| cfg.listen.host.clone());
-    let port = env::var("AP_PORT")
+    // GW_HOST / GW_PORT win over the config file (GW_HOST=0.0.0.0 for containers).
+    let host = env::var("GW_HOST").unwrap_or_else(|_| cfg.listen.host.clone());
+    let port = env::var("GW_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(cfg.listen.port);
@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(cfg);
     let mut state = GatewayState::from_config(&cfg);
     if !cfg.storage.redis_url.is_empty() {
-        match ap_state::RedisGovernance::connect(&cfg.storage.redis_url).await {
+        match gw_state::RedisGovernance::connect(&cfg.storage.redis_url).await {
             Ok(g) => {
                 state.governance = Arc::new(g);
                 tracing::info!(url = %cfg.storage.redis_url, "governance = redis");
@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     }
     if !cfg.storage.sqlite_path.is_empty() {
         state.store = Arc::new(
-            ap_state::SqliteStore::open_with_cap(
+            gw_state::SqliteStore::open_with_cap(
                 &cfg.storage.sqlite_path,
                 cfg.storage.ledger_max_rows,
             )
@@ -76,13 +76,13 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Local background task: AK daily quota reset
-    let quota_task = ap_task::spawn_quota_reset(state.clone(), ap_task::DAILY);
+    let quota_task = gw_task::spawn_quota_reset(state.clone(), gw_task::DAILY);
 
     let transport = select_transport(&cfg)?;
     let app_state = AppState::new(cfg, state, transport);
 
     let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder()?;
-    let router = ap_views::app(app_state).route(
+    let router = gw_views::app(app_state).route(
         "/metrics",
         axum::routing::get(move || {
             let prometheus = prometheus.clone();
@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("ap listening on http://{addr}");
+    tracing::info!("gw listening on http://{addr}");
 
     // graceful shutdown (drain on SIGINT/SIGTERM)
     axum::serve(listener, router)
@@ -99,15 +99,15 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     quota_task.abort();
-    tracing::info!("ap drained and exiting");
+    tracing::info!("gw drained and exiting");
     Ok(())
 }
 
-/// Choose the upstream transport from `AP_TRANSPORT`: `mock` forces zero egress,
+/// Choose the upstream transport from `GW_TRANSPORT`: `mock` forces zero egress,
 /// `http` forces real HTTP (accounts without an endpoint fail loudly), anything
 /// else routes `mock://` sentinels in-process and real URLs over HTTP.
-fn select_transport(cfg: &GatewayConfig) -> anyhow::Result<ap_engines::SharedTransport> {
-    use ap_engines::http_transport::UpstreamPolicy;
+fn select_transport(cfg: &GatewayConfig) -> anyhow::Result<gw_engines::SharedTransport> {
+    use gw_engines::http_transport::UpstreamPolicy;
     let default_policy = UpstreamPolicy::default();
     let per_account: std::collections::HashMap<String, UpstreamPolicy> = cfg
         .accounts
@@ -126,14 +126,14 @@ fn select_transport(cfg: &GatewayConfig) -> anyhow::Result<ap_engines::SharedTra
             )
         })
         .collect();
-    Ok(match env::var("AP_TRANSPORT").as_deref() {
+    Ok(match env::var("GW_TRANSPORT").as_deref() {
         Ok("mock") => {
             tracing::info!("transport = mock (zero egress)");
-            std::sync::Arc::new(ap_engines::MockTransport)
+            std::sync::Arc::new(gw_engines::MockTransport)
         }
         Ok("http") => {
             tracing::info!("transport = http (accounts without an endpoint fail)");
-            std::sync::Arc::new(ap_engines::http_transport::HttpTransport::with_policies(
+            std::sync::Arc::new(gw_engines::http_transport::HttpTransport::with_policies(
                 default_policy,
                 per_account,
             )?)
@@ -141,7 +141,7 @@ fn select_transport(cfg: &GatewayConfig) -> anyhow::Result<ap_engines::SharedTra
         _ => {
             tracing::info!("transport = auto (mock:// in-process, real URLs over HTTP)");
             std::sync::Arc::new(
-                ap_engines::http_transport::DispatchTransport::with_policies(
+                gw_engines::http_transport::DispatchTransport::with_policies(
                     default_policy,
                     per_account,
                 )?,

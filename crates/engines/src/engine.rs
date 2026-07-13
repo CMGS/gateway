@@ -4,8 +4,8 @@
 //! tuple. Rust folds the `(response, http_code, block)` triple into
 //! `EngineOutcome` and the trailing `error` into the `Result`.
 
-use ap_consts::ErrCode;
-use ap_models::{Block, GResult, GatewayError, GatewayResponse, Recorder};
+use gw_consts::ErrCode;
+use gw_models::{Block, GResult, GatewayError, GatewayResponse, Recorder};
 use serde_json::Value;
 
 /// Detect a vendor error envelope and turn it into a `GatewayError`.
@@ -80,4 +80,4 @@ pub trait ModelEngine: Send + Sync {
     fn recorder(&self) -> &dyn Recorder;
 }
 
-pub use ap_models::StreamChunk;
+pub use gw_models::StreamChunk;

@@ -2,11 +2,11 @@
 
 One YAML file configures the gateway. Resolution order:
 
-1. `AP_GATEWAY_CONF=<path>` — explicit config file
+1. `GW_CONFIG=<path>` — explicit config file
 2. otherwise the embedded default (the repo's `conf/gateway.yaml`)
 
-`AP_HOST` / `AP_PORT` override `listen.host` / `listen.port` at runtime
-(the container image sets `AP_HOST=0.0.0.0`).
+`GW_HOST` / `GW_PORT` override `listen.host` / `listen.port` at runtime
+(the container image sets `GW_HOST=0.0.0.0`).
 
 ## Sections
 
@@ -121,10 +121,10 @@ log line per request goes to stdout.
 ```bash
 export OPENAI_KEY=sk-...        # your key, in your environment
 # account in YAML: endpoint: "https://api.openai.com", api_key_env: "OPENAI_KEY"
-cargo run -p ap-server
+cargo run -p gw-server
 ```
 
 Accounts with an `endpoint` egress to it; accounts without one are served
-by the in-process mock. `AP_TRANSPORT` overrides the routing: `mock`
+by the in-process mock. `GW_TRANSPORT` overrides the routing: `mock`
 forces zero egress (nothing leaves the process), `http` disables the mock
 so misconfigured accounts fail loudly instead of returning fake data.

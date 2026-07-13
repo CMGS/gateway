@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use ap_consts::ErrCode;
+use gw_consts::ErrCode;
 
 /// Result alias used across the gateway.
 pub type GResult<T> = Result<T, GatewayError>;

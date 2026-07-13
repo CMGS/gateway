@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use ap_config::GatewayConfig;
-use ap_engines::{EngineOutcome, SharedTransport};
-use ap_models::GatewayRequest;
-use ap_state::{AkInfo, GatewayState};
+use gw_config::GatewayConfig;
+use gw_engines::{EngineOutcome, SharedTransport};
+use gw_models::GatewayRequest;
+use gw_state::{AkInfo, GatewayState};
 
 pub struct DagContext {
     // --- environment (read-only) ---

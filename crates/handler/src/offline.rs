@@ -3,8 +3,8 @@
 //! Submission runs in the background immediately; status/results are
 //! queryable in-process; no external queue is involved.
 
-use ap_models::{ChatMsg, GatewayRequest, ModelParamV2};
-use ap_state::{AkInfo, BatchItemResult, BatchJob, BatchStatus};
+use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
+use gw_state::{AkInfo, BatchItemResult, BatchJob, BatchStatus};
 
 use crate::OnlineHandler;
 
@@ -32,7 +32,7 @@ impl OfflineHandler {
         ak: AkInfo,
         model: String,
         items: Vec<BatchItem>,
-    ) -> ap_models::GResult<BatchJob> {
+    ) -> gw_models::GResult<BatchJob> {
         let job = self
             .online
             .state
@@ -53,7 +53,7 @@ impl OfflineHandler {
                     ak: ak.ak.clone(),
                     message: item.messages,
                     model_param_v2: Some(ModelParamV2::with_name(
-                        ap_consts::Protocol::OpenaiChat, // rewritten by the resolve_model node
+                        gw_consts::Protocol::OpenaiChat, // rewritten by the resolve_model node
                         model.clone(),
                     )),
                     ..Default::default()

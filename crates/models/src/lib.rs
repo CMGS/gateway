@@ -1,6 +1,6 @@
 //! Core domain models for the gateway.
 //!
-//! Layer L1: depends only on `ap-consts`. Holds the request/response types the
+//! Layer L1: depends only on `gw-consts`. Holds the request/response types the
 //! whole pipeline threads through, the unified error model, and the usage view.
 
 pub mod cost;

@@ -1,9 +1,9 @@
 //! Local file configuration.
 //!
 //! There is no config center: everything comes from a local YAML file. Layer L1 —
-//! depends only on ap-consts.
+//! depends only on gw-consts.
 
-use ap_consts::Protocol;
+use gw_consts::Protocol;
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
