@@ -152,7 +152,10 @@ mod tests {
         let mut ctx = test_ctx();
         let plan = Plan::build(vec![layer]).unwrap();
         run(&plan, &mut ctx).await.unwrap();
-        assert_eq!(ctx.decisions, vec!["a: ran", "b: ran", "c: ran"]);
+        assert_eq!(
+            ctx.decision_lines().collect::<Vec<_>>(),
+            vec!["a: ran", "b: ran", "c: ran"]
+        );
     }
 
     #[tokio::test]

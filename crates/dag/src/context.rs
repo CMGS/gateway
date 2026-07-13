@@ -23,8 +23,9 @@ pub struct DagContext {
     // --- produced along the way ---
     /// engine result, set by the model_access layer.
     pub outcome: Option<EngineOutcome>,
-    /// human-readable decision trail.
-    pub decisions: Vec<String>,
+    /// decision trail as (stage, detail); joined only when read, so the hot
+    /// path allocates the detail once instead of a second joined string.
+    pub decisions: Vec<(&'static str, String)>,
     /// Request-level cache hit (downstream nodes short-circuit on this and skip
     /// account/engine/billing).
     pub cache_hit: bool,
@@ -53,7 +54,12 @@ impl DagContext {
         }
     }
 
-    pub fn decide(&mut self, node: &str, what: impl AsRef<str>) {
-        self.decisions.push(format!("{node}: {}", what.as_ref()));
+    pub fn decide(&mut self, node: &'static str, what: impl Into<String>) {
+        self.decisions.push((node, what.into()));
+    }
+
+    /// The decision trail as `"stage: detail"` lines.
+    pub fn decision_lines(&self) -> impl Iterator<Item = String> + '_ {
+        self.decisions.iter().map(|(n, w)| format!("{n}: {w}"))
     }
 }

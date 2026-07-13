@@ -46,8 +46,10 @@ open-source impl now, alternatives pluggable":
 - [x] OpenAI-protocol path verified live against an OpenAI-compatible
       upstream: non-stream + streaming SSE + streamed-usage billing all
       confirmed end to end (provider preset + `endpoint:` override)
-- [ ] Anthropic / Gemini live verification (pending credentials); recorded
-      live fixtures replayable offline
+- [x] Anthropic live verification: `/v1/messages` non-stream + streaming
+      event sequence + usage billing confirmed against a real Claude
+      upstream
+- [ ] Gemini live verification (pending a Gemini-capable upstream)
 - [ ] Streaming fidelity hardening per provider: SSE frame alignment
       across vendors
 - [ ] Provider auth: bearer (OpenAI), x-api-key + anthropic-version

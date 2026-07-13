@@ -99,7 +99,7 @@ impl DagNode for CacheLookup {
             ctx.cache_hit = true;
             ctx.outcome = Some(ap_engines::EngineOutcome::ok(cached));
         } else {
-            ctx.decide("cache_lookup", "miss");
+            ctx.decide("cache_lookup", "miss".to_owned());
         }
         ctx.cache_key = Some(key);
         Ok(())
@@ -168,7 +168,7 @@ impl DagNode for SelectAccount {
                     format!("no healthy upstream account serves model type `{mt}`"),
                 )
             })?;
-        ctx.decide("select_account", &account.name);
+        ctx.decide("select_account", account.name.clone());
         ctx.request.account = Some(account);
         Ok(())
     }

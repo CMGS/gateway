@@ -96,8 +96,7 @@ impl OnlineHandler {
         if let Some(outcome) = ctx.outcome.as_mut() {
             let n = plugins::dlp_redact_response(&self.cfg.security, &mut outcome.response);
             if n > 0 {
-                ctx.decisions
-                    .push(format!("dlp: redacted {n} span(s) outbound"));
+                ctx.decide("dlp", format!("redacted {n} span(s) outbound"));
             }
         }
         Ok(ctx)
@@ -140,8 +139,8 @@ mod tests {
         assert_eq!(ledger.len(), 1);
         assert!(ledger[0].cost_micros > 0);
         assert_eq!(ledger[0].account, "mock-openai-1");
-        assert!(ctx.decisions.iter().any(|d| d.starts_with("resolve_model")));
-        assert!(ctx.decisions.iter().any(|d| d.starts_with("cost_calc")));
+        assert!(ctx.decisions.iter().any(|(n, _)| *n == "resolve_model"));
+        assert!(ctx.decisions.iter().any(|(n, _)| *n == "cost_calc"));
     }
 
     #[tokio::test]
@@ -202,7 +201,7 @@ mod tests {
         let (_, ledger) = h.state.store.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(ledger.last().unwrap().account, "mock-hunyuan-paygo");
         assert!(ledger.last().unwrap().ptu_spillover);
-        assert!(ctx.decisions.iter().any(|d| d.contains("failover")));
+        assert!(ctx.decisions.iter().any(|(_, w)| w.contains("failover")));
     }
 
     #[tokio::test]
