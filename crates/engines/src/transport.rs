@@ -357,7 +357,8 @@ impl MockTransport {
         }))
     }
 
-    /// Vertex/Gemini generateContent wire shape.
+    /// Vertex/Gemini generateContent wire shape (SSE frames when streaming —
+    /// Gemini has no `[DONE]` sentinel; the stream just ends).
     fn vertex_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "vertex")?;
         let user: String = body["contents"]
@@ -368,6 +369,20 @@ impl MockTransport {
             .unwrap_or_default();
         let reply = format!("[mock-vertex] you said: {user}");
         let (pt, ct) = (Self::tokens(&user) + 3, Self::tokens(&reply));
+        if req.stream {
+            let mid = reply.len() / 2;
+            let (a, b) = reply.split_at(mid);
+            let frames = [
+                json!({"candidates":[{"content":{"role":"model","parts":[{"text": a}]},"index":0}]}),
+                json!({"candidates":[{"content":{"role":"model","parts":[{"text": b}]},"index":0}]}),
+                json!({"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP","index":0}],
+                       "usageMetadata":{"promptTokenCount":pt,"candidatesTokenCount":ct,"totalTokenCount":pt+ct}}),
+            ];
+            return Ok(UpstreamResponse {
+                status: 200,
+                body: UpstreamBody::Sse(Self::sse_bytes(&frames, false)),
+            });
+        }
         Self::ok_json(json!({
             "candidates": [{"content": {"role": "model", "parts": [{"text": reply}]},
                              "finishReason": "STOP"}],
@@ -565,7 +580,7 @@ impl Transport for MockTransport {
             self.llama_reply(&req)
         } else if u.contains("/messages") {
             self.anthropic_reply(&req)
-        } else if u.contains(":generateContent") {
+        } else if u.contains(":generateContent") || u.contains(":streamGenerateContent") {
             self.vertex_reply(&req)
         } else if u.contains("/embeddings") {
             self.embeddings_reply(&req)

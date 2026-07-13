@@ -475,6 +475,37 @@ async fn chat_stream_tools_emit_tool_call_chunks() {
 }
 
 #[tokio::test]
+async fn gemini_stream_emits_incremental_deltas() {
+    let app = app();
+    let body = r#"{"model":"gemini-pro","stream":true,"messages":[{"role":"user","content":"stream me gemini"}]}"#;
+    let resp = app
+        .oneshot(post("/v1/chat/completions", Some("ak-demo-123"), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    let mut deltas = 0;
+    let mut assembled = String::new();
+    let mut saw_usage = false;
+    for f in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        if f == "[DONE]" {
+            continue;
+        }
+        let v: Value = serde_json::from_str(f).unwrap();
+        if let Some(d) = v["choices"][0]["delta"]["content"].as_str() {
+            deltas += 1;
+            assembled.push_str(d);
+        }
+        if v["usage"]["total_tokens"].as_i64().unwrap_or(0) > 0 {
+            saw_usage = true;
+        }
+    }
+    assert!(deltas >= 2, "expected incremental deltas, got {deltas}");
+    assert!(assembled.contains("you said: stream me gemini"));
+    assert!(saw_usage, "final frame must carry usage");
+}
+
+#[tokio::test]
 async fn messages_errors_are_anthropic_shaped() {
     let app = app();
     // no api key → authentication_error with the anthropic discriminator

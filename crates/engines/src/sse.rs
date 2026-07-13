@@ -20,9 +20,8 @@ impl SseDecoder {
         // chunk separately would corrupt it permanently.
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
-        // events are separated by a blank line
-        while let Some(pos) = self.buf.windows(2).position(|w| w == b"\n\n") {
-            let event: Vec<u8> = self.buf.drain(..pos + 2).collect();
+        while let Some(end) = event_boundary(&self.buf) {
+            let event: Vec<u8> = self.buf.drain(..end).collect();
             let event = String::from_utf8_lossy(&event);
             for line in event.lines() {
                 let line = line.strip_suffix('\r').unwrap_or(line);
@@ -49,6 +48,25 @@ impl SseDecoder {
         let events = d.feed(bytes);
         (events, d.is_done())
     }
+}
+
+/// Index just past the first blank-line event separator. Vendors frame with
+/// either LF (`\n\n`, OpenAI) or CRLF (`\r\n\r\n`, Google) — a decoder that
+/// only splits on `\n\n` never completes a CRLF-framed event.
+fn event_boundary(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if buf[i] == b'\n' {
+            if buf[i + 1] == b'\n' {
+                return Some(i + 2);
+            }
+            if buf.len() > i + 2 && buf[i + 1] == b'\r' && buf[i + 2] == b'\n' {
+                return Some(i + 3);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -83,6 +101,18 @@ mod tests {
         assert!(std::str::from_utf8(a).is_err(), "split must land mid-char");
         assert!(d.feed(a).is_empty());
         assert_eq!(d.feed(b), vec![r#"{"t":"你好😀"}"#]);
+    }
+
+    #[test]
+    fn crlf_framed_events_split() {
+        // Google frames SSE with \r\n\r\n — must split just like \n\n.
+        let mut d = SseDecoder::default();
+        let got = d.feed(b"data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\r\n\r\n");
+        assert_eq!(got, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
+        // boundary split across network chunks mid-CRLF
+        let mut d = SseDecoder::default();
+        assert!(d.feed(b"data: x\r\n\r").is_empty());
+        assert_eq!(d.feed(b"\n"), vec!["x"]);
     }
 
     #[test]

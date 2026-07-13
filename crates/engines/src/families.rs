@@ -87,6 +87,21 @@ impl Base {
         body: Value,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
+        self.send_upstream_raw(url, headers, body, stream)
+            .await?
+            .buffered()
+            .await
+    }
+
+    /// Like [`Self::send_upstream`] but leaves a live SSE stream undrained so
+    /// the caller can pump it incrementally.
+    async fn send_upstream_raw(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Value,
+        stream: bool,
+    ) -> GResult<UpstreamResponse> {
         let param = self.param()?;
         let up = UpstreamRequest {
             protocol: param.protocol,
@@ -97,10 +112,7 @@ impl Base {
             stream,
             account: self.account(),
         };
-        match self.transport.send(up).await {
-            Ok(reply) => reply.buffered().await,
-            Err(e) => Err(e),
-        }
+        self.transport.send(up).await
     }
 
     /// POST body to `url` with Bearer auth, expect JSON back (non-streaming).
@@ -202,10 +214,17 @@ fn parse_data_uri(url: &str) -> Option<(&str, &str)> {
 
 family_engine!(VertexEngine);
 
-#[async_trait::async_trait]
-impl ModelEngine for VertexEngine {
-    /// Gemini generateContent: contents/parts request, candidates/usageMetadata response.
-    async fn run(&self) -> GResult<EngineOutcome> {
+impl VertexEngine {
+    /// Gemini API auth: the x-goog-api-key header — an API key is not an OAuth
+    /// Bearer token and Google rejects it as one.
+    fn gemini_headers(&self) -> Vec<(String, String)> {
+        vec![
+            ("content-type".into(), "application/json".into()),
+            ("x-goog-api-key".into(), self.base.api_key()),
+        ]
+    }
+
+    fn build_body(&self) -> GResult<Value> {
         let contents: Vec<Value> = self
             .base
             .request
@@ -238,45 +257,144 @@ impl ModelEngine for VertexEngine {
                 body["generationConfig"] = gen_cfg;
             }
         }
-        // Gemini API: /v1beta path, auth via the x-goog-api-key header — an API
-        // key is not an OAuth Bearer token and Google rejects it as one.
+        Ok(body)
+    }
+
+    /// Native Gemini streaming: `:streamGenerateContent?alt=sse` frames are
+    /// decoded as they arrive and forwarded through `stream_tx` when the
+    /// request carries one (same live-pump contract as the OpenAI engine).
+    async fn run_stream(&self) -> GResult<EngineOutcome> {
+        use futures::StreamExt;
+        let body = self.build_body()?;
+        let url = format!(
+            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            self.base.base_url("mock://vertex.googleapis.com"),
+            self.base.param()?.model_name
+        );
+        let reply = self
+            .base
+            .send_upstream_raw(&url, self.gemini_headers(), body, true)
+            .await?;
+        let status = reply.status;
+        let mut resp = GatewayResponse {
+            model: self.base.param()?.model_name.clone(),
+            http_code: status as i64,
+            ..Default::default()
+        };
+        let mut full = String::new();
+        let mut chunks = Vec::new();
+        let tx = self.base.request.stream_tx.clone();
+        let mut sent_any = false;
+        match reply.body {
+            UpstreamBody::Json(b) => {
+                // a stream request answered with JSON is an error body
+                let v: Value = serde_json::from_slice(&b)
+                    .map_err(|e| GatewayError::internal("parse gemini reply").with_source(e))?;
+                if let Some(err) = crate::engine::vendor_error(status, &v) {
+                    return Err(err);
+                }
+                return Err(GatewayError::internal(
+                    "expected sse from streamGenerateContent",
+                ));
+            }
+            UpstreamBody::Sse(b) => {
+                let (events, _done) = SseDecoder::decode_all(&b);
+                for ev in events {
+                    let v: Value = serde_json::from_slice(ev.as_bytes()).map_err(|e| {
+                        GatewayError::internal("parse gemini sse frame").with_source(e)
+                    })?;
+                    chunks.extend(vertex_apply_frame(&v, status, &mut resp, &mut full)?);
+                }
+            }
+            UpstreamBody::SseStream(mut s) => {
+                let mut dec = SseDecoder::default();
+                while let Some(item) = s.next().await {
+                    let bytes = item.map_err(|e| {
+                        if sent_any {
+                            GatewayError::client_closed(format!(
+                                "upstream stream failed mid-response: {e}"
+                            ))
+                        } else {
+                            GatewayError::new(
+                                gw_consts::ErrCode::FED_RESP_RPC_FAILED,
+                                502,
+                                format!("upstream stream failed: {e}"),
+                            )
+                        }
+                    })?;
+                    for data in dec.feed(&bytes) {
+                        let v: Value = serde_json::from_str(&data).map_err(|e| {
+                            GatewayError::internal("parse gemini sse frame").with_source(e)
+                        })?;
+                        for chunk in vertex_apply_frame(&v, status, &mut resp, &mut full)? {
+                            match &tx {
+                                Some(tx) => {
+                                    tx.send(chunk).await.map_err(|_| {
+                                        GatewayError::client_closed("client stream closed")
+                                    })?;
+                                    sent_any = true;
+                                }
+                                None => chunks.push(chunk),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        resp.message = full;
+        if resp.total_tokens == 0 {
+            resp.total_tokens = resp.prompt_tokens + resp.completion_tokens;
+        }
+        resp.raw_usage_json = vertex_raw_usage(&resp);
+        Ok(EngineOutcome {
+            response: resp,
+            http_code: status,
+            chunks,
+            // true only when chunks actually went through the live channel — a
+            // buffered SSE body leaves them in `chunks` for the view to replay.
+            streamed_live: sent_any,
+            ..Default::default()
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelEngine for VertexEngine {
+    /// Gemini generateContent: contents/parts request, candidates/usageMetadata
+    /// response; `:streamGenerateContent?alt=sse` when the request streams.
+    async fn run(&self) -> GResult<EngineOutcome> {
+        if self.base.request.stream {
+            return self.run_stream().await;
+        }
+        let body = self.build_body()?;
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
             self.base.base_url("mock://vertex.googleapis.com"),
             self.base.param()?.model_name
         );
-        let headers = vec![
-            ("content-type".into(), "application/json".into()),
-            ("x-goog-api-key".into(), self.base.api_key()),
-        ];
-        let (status, v) = self.base.round_trip_with(&url, headers, body).await?;
+        let (status, v) = self
+            .base
+            .round_trip_with(&url, self.gemini_headers(), body)
+            .await?;
         let text: String = v["candidates"][0]["content"]["parts"]
             .as_array()
             .map(|ps| ps.iter().filter_map(|p| p["text"].as_str()).collect())
             .unwrap_or_default();
-        let um = &v["usageMetadata"];
-        let (pt, ct) = (
-            um["promptTokenCount"].as_i64().unwrap_or(0),
-            um["candidatesTokenCount"].as_i64().unwrap_or(0),
-        );
-        // usage dialect is normalized to the openai shape at the engine boundary
-        // (CommonUsage extraction follows the openai field table)
-        let raw_usage =
-            json!({"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct});
-        let resp = GatewayResponse {
+        let mut resp = GatewayResponse {
             message: text,
             model: self.base.param()?.model_name.clone(),
             finish_reason: v["candidates"][0]["finishReason"]
                 .as_str()
                 .unwrap_or_default()
                 .to_lowercase(),
-            prompt_tokens: pt,
-            completion_tokens: ct,
-            total_tokens: pt + ct,
-            raw_usage_json: raw_usage.to_string().into_bytes(),
             http_code: status as i64,
             ..Default::default()
         };
+        vertex_apply_usage(&v["usageMetadata"], &mut resp);
+        if resp.total_tokens == 0 {
+            resp.total_tokens = resp.prompt_tokens + resp.completion_tokens;
+        }
+        resp.raw_usage_json = vertex_raw_usage(&resp);
         Ok(EngineOutcome {
             response: resp,
             http_code: status,
@@ -287,6 +405,75 @@ impl ModelEngine for VertexEngine {
     fn recorder(&self) -> &dyn Recorder {
         &self.base.recorder
     }
+}
+
+/// Apply one `streamGenerateContent` frame to the accumulating response;
+/// returns the chunks the frame yields. usageMetadata is cumulative — the
+/// last frame's counts win.
+fn vertex_apply_frame(
+    v: &Value,
+    status: u16,
+    resp: &mut GatewayResponse,
+    full: &mut String,
+) -> GResult<Vec<StreamChunk>> {
+    if let Some(err) = crate::engine::vendor_error(status, v) {
+        return Err(err);
+    }
+    let mut chunks = Vec::new();
+    let text: String = v["candidates"][0]["content"]["parts"]
+        .as_array()
+        .map(|ps| ps.iter().filter_map(|p| p["text"].as_str()).collect())
+        .unwrap_or_default();
+    if !text.is_empty() {
+        full.push_str(&text);
+        chunks.push(StreamChunk {
+            delta: text,
+            ..Default::default()
+        });
+    }
+    if let Some(fr) = v["candidates"][0]["finishReason"].as_str() {
+        resp.finish_reason = fr.to_lowercase();
+        chunks.push(StreamChunk {
+            finish_reason: Some(resp.finish_reason.clone()),
+            ..Default::default()
+        });
+    }
+    vertex_apply_usage(&v["usageMetadata"], resp);
+    Ok(chunks)
+}
+
+/// Fold a `usageMetadata` object into the response. Cumulative — the last
+/// frame's counts win. thinking models report `thoughtsTokenCount` outside
+/// `candidatesTokenCount`; OpenAI semantics fold reasoning into completion,
+/// so map thoughts → reasoning ⊆ completion or billing loses them.
+fn vertex_apply_usage(um: &Value, resp: &mut GatewayResponse) {
+    if um.is_null() {
+        return;
+    }
+    if let Some(pt) = um["promptTokenCount"].as_i64() {
+        resp.prompt_tokens = pt;
+    }
+    let thoughts = um["thoughtsTokenCount"].as_i64().unwrap_or(0);
+    if let Some(cand) = um["candidatesTokenCount"].as_i64() {
+        resp.completion_tokens = cand + thoughts;
+        resp.reasoning_tokens = thoughts;
+    }
+    if let Some(tt) = um["totalTokenCount"].as_i64() {
+        resp.total_tokens = tt;
+    }
+}
+
+/// usage dialect normalized to the openai shape at the engine boundary
+/// (CommonUsage extraction follows the openai field table).
+fn vertex_raw_usage(resp: &GatewayResponse) -> Vec<u8> {
+    json!({
+        "prompt_tokens": resp.prompt_tokens,
+        "completion_tokens": resp.completion_tokens,
+        "total_tokens": resp.total_tokens,
+        "completion_tokens_details": {"reasoning_tokens": resp.reasoning_tokens},
+    })
+    .to_string()
+    .into_bytes()
 }
 
 // ---------------------------------------------------------------- Embeddings
@@ -1032,6 +1219,19 @@ mod tests {
         assert!(out.response.message.contains("you said: hello families"));
         assert!(out.response.total_tokens > 0);
         assert_eq!(out.response.finish_reason, "stop");
+    }
+
+    #[tokio::test]
+    async fn vertex_stream_decodes_frames() {
+        let mut r = req(Protocol::Gemini, "gemini-pro", None);
+        r.stream = true;
+        let e = VertexEngine::new(r, t());
+        let out = e.run().await.unwrap();
+        assert!(out.chunks.len() >= 3, "chunks: {:?}", out.chunks);
+        assert!(out.response.message.contains("you said: hello families"));
+        assert_eq!(out.response.finish_reason, "stop");
+        assert!(out.response.prompt_tokens > 0 && out.response.completion_tokens > 0);
+        assert!(out.chunks.iter().any(|c| c.finish_reason.is_some()));
     }
 
     #[tokio::test]
