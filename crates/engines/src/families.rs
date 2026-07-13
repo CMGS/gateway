@@ -444,8 +444,10 @@ fn vertex_apply_frame(
 
 /// Fold a `usageMetadata` object into the response. Cumulative — the last
 /// frame's counts win. thinking models report `thoughtsTokenCount` outside
-/// `candidatesTokenCount`; OpenAI semantics fold reasoning into completion,
-/// so map thoughts → reasoning ⊆ completion or billing loses them.
+/// `candidatesTokenCount` (live-verified on generativelanguage.googleapis.com:
+/// totalTokenCount == prompt + candidates + thoughts); OpenAI semantics fold
+/// reasoning into completion, so map thoughts → reasoning ⊆ completion or
+/// billing loses them.
 fn vertex_apply_usage(um: &Value, resp: &mut GatewayResponse) {
     if um.is_null() {
         return;

@@ -309,10 +309,21 @@ async fn realtime_session(
     }
 }
 
+/// Whether a client frame (text or binary) is the OpenAI-dialect generation
+/// trigger. Both frame kinds are checked so a binary-encoded event cannot
+/// slip past the governance gate.
+fn is_response_create(payload: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(payload)
+        .map(|v| v["type"] == "response.create")
+        .unwrap_or(false)
+}
+
 /// Bridge one realtime session to a real upstream over WebSocket: a transparent
-/// relay (the client speaks the vendor's realtime dialect through us) plus the
-/// gateway's own concerns — auth, per-generation governance gates on
-/// `response.create`, and billing from the vendor's `response.done` usage.
+/// relay plus the gateway's own concerns — auth, per-generation governance
+/// gates on `response.create`, and billing from the vendor's `response.done`
+/// usage. Gating and billing speak the OpenAI Realtime dialect; a vendor with
+/// a different wire shape needs its own adapter before it can be metered (the
+/// unmetered-session warning below is the operator's misconfiguration signal).
 async fn realtime_bridge(
     mut client: axum::extract::ws::WebSocket,
     s: AppState,
@@ -367,29 +378,44 @@ async fn realtime_bridge(
     let (mut up_tx, mut up_rx) = upstream.split();
     let (mut cl_tx, mut cl_rx) = client.split();
 
+    let mut generations = 0u64;
+    let mut billed_turns = 0u64;
     loop {
         tokio::select! {
             m = cl_rx.next() => match m {
                 Some(Ok(CMsg::Text(t))) => {
                     // gate each generation trigger, not every control frame
-                    let is_generate = serde_json::from_str::<Value>(&t)
-                        .map(|v| v["type"] == "response.create")
-                        .unwrap_or(false);
-                    if is_generate && let Some(denied) = realtime_gate(&s, &ak).await {
-                        if cl_tx
-                            .send(CMsg::Text(send_err(denied).to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                    if is_response_create(t.as_bytes()) {
+                        if let Some(denied) = realtime_gate(&s, &ak).await {
+                            if cl_tx
+                                .send(CMsg::Text(send_err(denied).to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
+                        generations += 1;
                     }
                     if up_tx.send(UMsg::text(t.to_string())).await.is_err() {
                         break;
                     }
                 }
                 Some(Ok(CMsg::Binary(b))) => {
+                    if is_response_create(&b) {
+                        if let Some(denied) = realtime_gate(&s, &ak).await {
+                            if cl_tx
+                                .send(CMsg::Text(send_err(denied).to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                        generations += 1;
+                    }
                     if up_tx.send(UMsg::binary(b)).await.is_err() {
                         break;
                     }
@@ -407,6 +433,7 @@ async fn realtime_bridge(
                         let ot = usage["output_tokens"].as_i64().unwrap_or(0);
                         if it + ot > 0 {
                             bill_realtime_turn(&s, &ak, &model, mt, &account.name, it, ot).await;
+                            billed_turns += 1;
                         }
                     }
                     if cl_tx.send(CMsg::Text(t.to_string().into())).await.is_err() {
@@ -422,6 +449,14 @@ async fn realtime_bridge(
                 Some(Ok(_)) => {} // ping/pong handled by the ws stacks
             },
         }
+    }
+    if generations > 0 && billed_turns == 0 {
+        tracing::warn!(
+            account = %account.name,
+            model = %model,
+            generations,
+            "realtime bridge relayed generations but billed nothing — vendor dialect not recognized?"
+        );
     }
 }
 
