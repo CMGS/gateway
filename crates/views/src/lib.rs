@@ -180,12 +180,13 @@ async fn realtime_ws(
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
+    // one consistent snapshot for the whole accept decision (cfg + state)
+    let snap = s.handler.config.load();
     // Auth: header, or the gw-api-key.<ak> subprotocol for browser clients
     let ak = match authenticate(&s, &headers) {
         Ok(ak) => ak,
         Err((st, msg)) => {
-            match ws_subprotocol_ak(&headers).and_then(|k| s.handler.state().auth.authenticate(&k))
-            {
+            match ws_subprotocol_ak(&headers).and_then(|k| snap.state.auth.authenticate(&k)) {
                 Some(ak) => ak,
                 None => return error_response(st, msg),
             }
@@ -195,10 +196,8 @@ async fn realtime_ws(
         return error_response(400, "model query param is required");
     };
     // Resolve: public name or wire name, must be the Realtime family
-    let mt = s
-        .handler
-        .cfg()
-        .find_model(&model)
+    let model_conf = snap.cfg.find_model(&model);
+    let mt = model_conf
         .and_then(|m| m.protocol())
         .or_else(|| gw_consts::Protocol::from_wire(&model));
     let Some(mt) = mt else {
@@ -207,14 +206,11 @@ async fn realtime_ws(
     if mt != gw_consts::Protocol::Realtime {
         return error_response(400, format!("`{model}` is not a realtime model"));
     }
-    let Some(account) = s.handler.state().pool.select_healthy(
+    let Some(account) = snap.state.pool.select_healthy(
         mt,
-        s.handler
-            .cfg()
-            .find_model(&model)
-            .and_then(|m| m.provider.as_deref()),
+        model_conf.and_then(|m| m.provider.as_deref()),
         &[],
-        &s.handler.state().health,
+        &snap.state.health,
     ) else {
         return error_response(503, format!("no healthy upstream account serves `{model}`"));
     };
@@ -736,11 +732,13 @@ async fn admin_key_patch(
     if let Err((st, msg)) = admin_auth(&s, &headers) {
         return error_response(st, msg);
     }
-    // tokens_per_minute is Option<Option<i64>>: absent = leave, null = clear.
+    // tokens_per_minute is Option<Option<i64>>: absent = leave, null = clear, a
+    // number = set. A malformed value leaves it unchanged (never silently drops
+    // the cap), matching how qps/daily_token_quota ignore malformed input.
     let tpm = match body.get("tokens_per_minute") {
-        None => None,
         Some(Value::Null) => Some(None),
-        Some(v) => Some(v.as_i64()),
+        Some(v) if v.is_i64() || v.is_u64() => Some(v.as_i64()),
+        _ => None,
     };
     match s.handler.state().auth.patch(
         &ak,

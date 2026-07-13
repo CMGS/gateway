@@ -219,16 +219,44 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
     );
     // patch a nonexistent key → 404
     assert_eq!(
-        app.oneshot(admin(
-            "PATCH",
-            "/admin/keys/ak-admin",
+        app.clone()
+            .oneshot(admin(
+                "PATCH",
+                "/admin/keys/ak-admin",
+                Some("s3cret"),
+                Some(r#"{"qps":5}"#),
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // malformed tokens_per_minute in PATCH must not silently drop the cap:
+    // set a cap, then PATCH a non-integer value → cap unchanged
+    app.clone()
+        .oneshot(admin(
+            "POST",
+            "/admin/keys",
             Some("s3cret"),
-            Some(r#"{"qps":5}"#),
+            Some(r#"{"ak":"ak-tpm","product":"demo","qps":100,"daily_token_quota":1000000,"tokens_per_minute":50}"#),
         ))
         .await
-        .unwrap()
-        .status(),
-        StatusCode::NOT_FOUND
+        .unwrap();
+    let r = app
+        .oneshot(admin(
+            "PATCH",
+            "/admin/keys/ak-tpm",
+            Some("s3cret"),
+            Some(r#"{"tokens_per_minute":5.5}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let j = body_json(r).await;
+    assert_eq!(
+        j["tokens_per_minute"], 50,
+        "malformed tpm must leave the cap unchanged, not clear it"
     );
 }
 

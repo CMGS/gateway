@@ -65,9 +65,27 @@ impl AkAuth {
         self.keys.get(ak).map(|e| e.value().0.clone())
     }
 
-    /// Insert or replace a key with the given provenance.
+    /// Insert or replace a key. Config ownership is sticky: an admin write to a
+    /// config-declared key updates its values but keeps it `Config`, so removing
+    /// it from the config file and reloading still revokes it. Config can claim
+    /// an admin key (when the file starts declaring it). Atomic via the entry
+    /// lock so the source can't flip under a concurrent write.
     pub fn put(&self, info: AkInfo, source: KeySource) {
-        self.keys.insert(info.ak.clone(), (info, source));
+        use dashmap::mapref::entry::Entry;
+        match self.keys.entry(info.ak.clone()) {
+            Entry::Occupied(mut e) => {
+                let sticky_config = e.get().1 == KeySource::Config && source == KeySource::Admin;
+                let source = if sticky_config {
+                    KeySource::Config
+                } else {
+                    source
+                };
+                e.insert((info, source));
+            }
+            Entry::Vacant(e) => {
+                e.insert((info, source));
+            }
+        }
     }
 
     /// Update quota fields of an existing key in place; returns the new view.
@@ -97,10 +115,14 @@ impl AkAuth {
         self.keys.remove(ak).is_some()
     }
 
-    /// Re-apply the config file's key set: drop every config-sourced key and
-    /// re-add from `keys`, leaving admin-created keys untouched.
+    /// Re-apply the config file's key set, leaving admin-created keys untouched.
+    /// Surviving config keys are upserted in place (never briefly absent, so a
+    /// concurrent `authenticate` can't spuriously 401 during a reload); only
+    /// config keys dropped from the new config are removed.
     pub fn reload_config_keys(&self, keys: &[gw_config::AkConf]) {
-        self.keys.retain(|_, (_, src)| *src == KeySource::Admin);
+        let wanted: std::collections::HashSet<&str> = keys.iter().map(|k| k.ak.as_str()).collect();
+        self.keys
+            .retain(|ak, (_, src)| *src == KeySource::Admin || wanted.contains(ak.as_str()));
         for k in keys {
             self.put(AkInfo::from(k), KeySource::Config);
         }
@@ -671,6 +693,70 @@ mod tests {
         assert!(auth.revoke("ak-admin"));
         assert!(auth.authenticate("ak-admin").is_none());
         assert!(!auth.revoke("ak-admin"));
+    }
+
+    #[test]
+    fn reload_never_briefly_drops_a_surviving_config_key() {
+        let auth = AkAuth::default();
+        auth.put(
+            AkInfo {
+                ak: "ak-keep".into(),
+                product: "p".into(),
+                qps: 1.0,
+                daily_token_quota: 10,
+                tokens_per_minute: None,
+            },
+            KeySource::Config,
+        );
+        // reload with a config that still contains ak-keep (plus a new key): a
+        // surviving key must never be observed absent (upsert, not remove+add)
+        let cfg = GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-keep, product: p, qps: 2, daily_token_quota: 20}, {ak: ak-add, product: p, qps: 1, daily_token_quota: 5}]",
+        )
+        .unwrap();
+        auth.reload_config_keys(&cfg.access_keys);
+        assert!(auth.authenticate("ak-keep").is_some());
+        assert!(auth.authenticate("ak-add").is_some());
+        // the surviving key picked up its new quota
+        assert_eq!(auth.authenticate("ak-keep").unwrap().daily_token_quota, 20);
+    }
+
+    #[test]
+    fn admin_overwrite_of_a_config_key_stays_revocable_by_config() {
+        let auth = AkAuth::default();
+        let info = |ak: &str| AkInfo {
+            ak: ak.into(),
+            product: "p".into(),
+            qps: 1.0,
+            daily_token_quota: 10,
+            tokens_per_minute: None,
+        };
+        auth.put(info("ak-x"), KeySource::Config);
+        // an admin write to a config key updates values but keeps Config ownership
+        auth.put(info("ak-x"), KeySource::Admin);
+        // reload with a config that no longer declares ak-x → it must be revoked
+        let cfg = GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-other, product: p, qps: 1, daily_token_quota: 5}]",
+        )
+        .unwrap();
+        auth.reload_config_keys(&cfg.access_keys);
+        assert!(
+            auth.authenticate("ak-x").is_none(),
+            "config revocation must not be defeated by a prior admin overwrite"
+        );
+        // config can still claim a genuinely admin-only key by declaring it
+        auth.put(info("ak-adm"), KeySource::Admin);
+        let cfg2 = GatewayConfig::from_yaml(
+            "listen: {host: h, port: 1}\naccess_keys: [{ak: ak-adm, product: p, qps: 1, daily_token_quota: 5}]",
+        )
+        .unwrap();
+        auth.reload_config_keys(&cfg2.access_keys);
+        let cfg3 = GatewayConfig::from_yaml("listen: {host: h, port: 1}\naccess_keys: []").unwrap();
+        auth.reload_config_keys(&cfg3.access_keys);
+        assert!(
+            auth.authenticate("ak-adm").is_none(),
+            "config-claimed key is revocable by config"
+        );
     }
 
     #[test]
