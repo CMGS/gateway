@@ -410,8 +410,10 @@ impl Store for MemoryStore {
     }
 
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
-        if let Some(mut j) = self.jobs.get_mut(id) {
-            j.results.push(result);
+        if let Some(mut j) = self.jobs.get_mut(id)
+            && !j.results.iter().any(|r| r.index == result.index)
+        {
+            j.results.push(result); // first-writer-wins (matches the SQL backends)
         }
         Ok(())
     }
@@ -1060,12 +1062,13 @@ impl Store for PostgresStore {
     }
 
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
+        // first-writer-wins: a reclaimed stale executor must not overwrite the
+        // new owner's result (which would let a terminal batch's output mutate,
+        // or leave a completed batch holding a failed item result)
         sqlx::query(
             "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens)
              VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (batch_id, idx) DO UPDATE SET
-               ok = EXCLUDED.ok, message = EXCLUDED.message,
-               total_tokens = EXCLUDED.total_tokens",
+             ON CONFLICT (batch_id, idx) DO NOTHING",
         )
         .bind(id)
         .bind(result.index as i64)
@@ -1299,6 +1302,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_result_is_first_writer_wins() {
+        let store = MemoryStore::default();
+        let job = store.batch_create("ak", "default", "m", 1).await.unwrap();
+        let push = |ok, msg: &str| {
+            store.batch_push_result(
+                &job.id,
+                BatchItemResult {
+                    index: 0,
+                    ok,
+                    message: msg.into(),
+                    total_tokens: 1,
+                },
+            )
+        };
+        push(true, "owner").await.unwrap();
+        // a stale worker's later write for the same item must not overwrite it
+        push(false, "stale").await.unwrap();
+        let got = store.batch_get(&job.id).await.unwrap().unwrap();
+        assert_eq!(got.results.len(), 1);
+        assert!(got.results[0].ok);
+        assert_eq!(got.results[0].message, "owner");
+    }
+
+    #[tokio::test]
     async fn ledger_retention_caps_both_stores() {
         let mem = MemoryStore::with_ledger_cap(2);
         for m in ["a", "b", "c"] {
@@ -1436,6 +1463,22 @@ mod tests {
         let got = store.batch_get(&b.id).await.unwrap().unwrap();
         assert_eq!(got.status, BatchStatus::Running);
         assert_eq!(got.results.len(), 1);
+        // first-writer-wins: a reclaimed stale worker can't overwrite the result
+        store
+            .batch_push_result(
+                &b.id,
+                BatchItemResult {
+                    index: 0,
+                    ok: false,
+                    message: "stale".into(),
+                    total_tokens: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let got = store.batch_get(&b.id).await.unwrap().unwrap();
+        assert_eq!(got.results.len(), 1);
+        assert!(got.results[0].ok && got.results[0].message == "ok");
 
         assert!(store.distributed_batches());
         let qmsgs = vec![

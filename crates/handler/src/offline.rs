@@ -79,12 +79,10 @@ impl OfflineHandler {
         {
             tracing::error!(error = %e, batch = %id, "batch status write failed");
         }
-        // resume past items already recorded by a prior (crashed) executor, so
-        // a reclaim re-runs and re-bills at most the one item that was in flight;
-        // seed any_fail from those prior results so a pre-crash failure still
-        // makes the resumed batch terminal-Failed. A read failure here means we
-        // can't know what's already done — re-running everything would re-bill,
-        // so fail the job instead.
+        // resume past items already recorded by a prior (crashed) executor, so a
+        // reclaim re-runs at most the one item that was in flight. A read failure
+        // means we can't know what's already done — re-running everything would
+        // re-bill, so fail the job instead.
         let prior = match store.batch_get(id).await {
             Ok(Some(job)) => job.results,
             Ok(None) => return, // the batch row vanished; nothing to run
@@ -100,10 +98,6 @@ impl OfflineHandler {
         };
         let done_indices: std::collections::HashSet<usize> =
             prior.iter().map(|r| r.index).collect();
-        let mut any_fail = prior.iter().any(|r| !r.ok);
-        // a result that failed to persist leaves the batch incomplete — it must
-        // not then be reported Completed
-        let mut writes_ok = true;
         use std::sync::atomic::Ordering::Relaxed;
         // A background heartbeat refreshes claimed_at so a single slow item isn't
         // judged stale mid-run; it also flips `lost` if the fence token stops
@@ -188,22 +182,29 @@ impl OfflineHandler {
                     total_tokens: 0,
                 },
             };
-            any_fail |= !result.ok;
+            // don't persist a result for a batch we've already lost — the new
+            // owner's run of this item is authoritative
+            if lost.load(Relaxed) {
+                break;
+            }
             if let Err(e) = store.batch_push_result(id, result).await {
                 tracing::error!(error = %e, batch = %id, "batch result write failed");
-                writes_ok = false;
             }
         }
         hb.abort();
         if lost.load(Relaxed) {
             return; // the reclaiming instance owns the terminal status now
         }
-        // Completed only if every result persisted; a lost write means missing
-        // results, so report Failed rather than a Completed-but-incomplete batch.
-        let done = if any_fail || !writes_ok {
-            BatchStatus::Failed
-        } else {
-            BatchStatus::Completed
+        // Re-derive the terminal status from the PERSISTED result set (the union
+        // of our first-writer results and any racing/prior executor's), not our
+        // in-memory view — so the status can't contradict what's stored. Complete
+        // only when every item has a result and all succeeded; any failure or
+        // missing (unpersisted) result → Failed.
+        let done = match store.batch_get(id).await {
+            Ok(Some(job)) if job.results.len() == job.total && job.results.iter().all(|r| r.ok) => {
+                BatchStatus::Completed
+            }
+            _ => BatchStatus::Failed,
         };
         // fenced terminal write: applies only if we still hold the claim, so a
         // reclaim during the last item can't be clobbered by a stale status
