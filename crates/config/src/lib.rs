@@ -61,9 +61,7 @@ pub struct AkConf {
     /// Tenant this key belongs to; empty = the implicit `default` tenant.
     #[serde(default)]
     pub tenant: String,
-    /// requests per second allowed for this AK.
     pub qps: f64,
-    /// daily token budget for this AK.
     pub daily_token_quota: i64,
     /// tokens-per-minute window limit; None = unlimited.
     #[serde(default)]
@@ -117,14 +115,12 @@ pub struct AccountConf {
     /// "ptu" (provisioned throughput, preferred) or "paygo" (default).
     #[serde(default)]
     pub tier: String,
-    /// Upstream base URL; empty = the engine uses the mock:// sentinel (default,
-    /// routes through MockTransport). A real URL routes to the real endpoint
-    /// (HttpTransport) — going live is a pure config change.
+    /// Upstream base URL; empty = mock:// (MockTransport). A real URL routes to
+    /// the real endpoint — going live is a pure config change.
     #[serde(default)]
     pub endpoint: String,
-    /// Env var name holding this account's API key (empty = use mock credentials).
-    /// Real secrets never land in the config file; the process reads the env var
-    /// by this name at request time.
+    /// Env var name holding this account's API key (empty = mock credentials);
+    /// read at request time, so real secrets never land in the config file.
     #[serde(default)]
     pub api_key_env: String,
     /// Upstream request timeout (seconds); unset = 60.
@@ -153,8 +149,7 @@ fn default_priority() -> i32 {
 /// Local security policy (rule-based; no cloud security service).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SecurityConf {
-    /// Blocklist: a hit triggers Block. Normalized to lower-case (empties
-    /// dropped) at load, so matching is case-insensitive without per-request work.
+    /// Blocklist terms; normalized to lower-case (empties dropped) at load.
     #[serde(default)]
     pub blocklist: Vec<String>,
     /// Whether to DLP-redact inbound/outbound content (emails/phone numbers).
@@ -202,8 +197,7 @@ pub struct StorageConf {
     /// Redis URL for shared rate/quota governance across replicas; empty = in-process.
     #[serde(default)]
     pub redis_url: String,
-    /// Share the response cache in Redis too (needs `redis_url`); off = each
-    /// instance caches in-process (a miss just recomputes).
+    /// Share the response cache in Redis too (needs `redis_url`).
     #[serde(default)]
     pub shared_cache: bool,
     /// Keep at most this many billing records (oldest pruned first); 0 = unlimited.
@@ -211,9 +205,8 @@ pub struct StorageConf {
     pub ledger_max_rows: u64,
 }
 
-/// Admin surface gate. `/admin/*` is disabled unless `token_env` names an env
-/// var holding a bearer token; requests must present it. Keep the admin surface
-/// off the public load balancer regardless (bind it to a private network).
+/// Admin surface gate: `/admin/*` is disabled unless `token_env` names an env
+/// var holding a bearer token. Keep the surface off the public LB regardless.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AdminConf {
     /// Env var holding the admin bearer token; empty = admin surface disabled.
@@ -263,27 +256,23 @@ pub struct TenantConf {
     /// Models this tenant may call; None = every configured model.
     #[serde(default)]
     pub models: Option<Vec<String>>,
-    /// Default per-model daily token caps, applied per key (each of the
-    /// tenant's keys is metered separately against the same value).
+    /// Default per-model daily token caps, metered per key.
     #[serde(default)]
     pub model_quotas: std::collections::HashMap<String, i64>,
     /// Where an over-quota request degrades to instead of hard-failing;
     /// None = pass through unmetered (the per-AK daily cap still backstops).
     #[serde(default)]
     pub fallback_model: Option<String>,
-    /// Env var holding this tenant's admin bearer token: it manages only this
-    /// tenant's keys/usage on `/admin/*`. Empty = no tenant-scoped admin.
+    /// Env var holding this tenant's scoped admin token; empty = none.
     #[serde(default)]
     pub admin_token_env: String,
-    /// Per-model charged-price overrides for this tenant (else the model's
-    /// list price applies).
+    /// Per-model charged-price overrides (else the model's list price applies).
     #[serde(default)]
     pub model_prices: std::collections::HashMap<String, PriceConf>,
 }
 
 impl TenantConf {
-    /// The tenant admin token, read from its env var at call time; `None` when
-    /// unconfigured (this tenant has no scoped admin access).
+    /// The tenant admin token, read from its env var at call time.
     pub fn admin_token(&self) -> Option<String> {
         if self.admin_token_env.is_empty() {
             return None;
@@ -299,7 +288,7 @@ impl TenantConf {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConf {
     pub name: String,
-    /// openai | anthropic | gemini
+    /// openai | anthropic | gemini | deepseek | openrouter
     pub kind: String,
     #[serde(default)]
     pub api_key_env: String,
@@ -388,9 +377,7 @@ pub struct GatewayConfig {
     /// Admin surface gate (dynamic config reload / key management).
     #[serde(default)]
     pub admin: AdminConf,
-    /// Bumped on each live reload so cache keys change when the model mapping
-    /// might have (a preserved response cache must not serve a pre-reload entry
-    /// for a remapped model).
+    /// Stable hash of the source document; see [`Self::generation`].
     #[serde(skip)]
     generation: u64,
     /// name → index lookups, built once after parse to avoid per-request scans.
@@ -413,11 +400,8 @@ impl GatewayConfig {
         cfg.normalize()?;
         cfg.validate()?;
         cfg.build_indices();
-        // generation = a stable hash of the source document, so every replica
-        // that loads the same published config agrees on it (fleet-stable) and a
-        // new document changes it (reload invalidates the shared cache). A
-        // per-process counter would start at 0 on each instance and let a
-        // restarted node hit another config's cache entries.
+        // a hash of the document, not a per-process counter: every replica must
+        // agree on it, and a restarted node must not hit stale cache entries
         cfg.generation = stable_hash(yaml);
         Ok(cfg)
     }
@@ -490,8 +474,7 @@ impl GatewayConfig {
                 protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
             });
         }
-        // blocklist is matched case-insensitively; lower-case (and drop empties)
-        // once here so `security_check` needn't rebuild the term list per request
+        // lower-case once here so security_check needn't rebuild the list per request
         self.security.blocklist = self
             .security
             .blocklist
@@ -543,8 +526,7 @@ impl GatewayConfig {
         check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
         check_unique("provider", self.providers.iter().map(|p| p.name.as_str()))?;
         check_unique("tenant", self.tenants.iter().map(|t| t.name.as_str()))?;
-        // A typo'd tenant on a key would otherwise silently fall back to the
-        // unrestricted default tenant — reject undeclared references at load.
+        // a typo'd tenant would silently fall back to the unrestricted default — reject at load
         for k in &self.access_keys {
             if !self.is_known_tenant(&k.tenant) {
                 return Err(ConfigError::UnknownTenant {
@@ -580,8 +562,7 @@ impl GatewayConfig {
         for k in &self.access_keys {
             self.check_models_known(format!("access key {}", k.ak), k.model_quotas.keys())?;
         }
-        // account health and failover exclusion key by name — duplicates would
-        // cool down / exclude the wrong physical account.
+        // health/failover key by name — a duplicate would cool down the wrong account
         check_unique("account", self.accounts.iter().map(|a| a.name.as_str()))?;
         Ok(())
     }
@@ -641,7 +622,6 @@ impl GatewayConfig {
         self.access_keys.get(*self.ak_idx.get(ak)?)
     }
 
-    /// Look up a public model name (e.g. "gpt-4o").
     pub fn find_model(&self, name: &str) -> Option<&ModelConf> {
         self.models.get(*self.model_idx.get(name)?)
     }
@@ -666,8 +646,7 @@ impl GatewayConfig {
     }
 }
 
-/// Deterministic hash of the config document, stable across processes of the
-/// same binary (fleet-wide) — the response-cache generation.
+/// Deterministic hash of the config document, stable across processes.
 fn stable_hash(yaml: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::hash::DefaultHasher::new();
@@ -684,9 +663,8 @@ fn index_by<T>(items: &[T], key: impl Fn(&T) -> &str) -> std::collections::HashM
         .collect()
 }
 
-/// Reject duplicate and empty names — name lookups are last-wins, so a
-/// duplicate is ambiguous, and an empty name is unreachable (e.g. a tenant
-/// named "" can never be referenced: empty key tenants coerce to `default`).
+/// Reject duplicate and empty names: lookups are last-wins (a duplicate is
+/// ambiguous) and an empty name is unreferenceable.
 fn check_unique<'a>(
     kind: &'static str,
     names: impl Iterator<Item = &'a str>,
@@ -897,7 +875,6 @@ accounts: []
 access_keys: []
 "#;
         let cfg = GatewayConfig::from_yaml(yaml).unwrap();
-        // lower-cased, empties dropped (whitespace preserved — matching is contains)
         assert_eq!(cfg.security.blocklist, vec!["example.com", "  badword "]);
     }
 

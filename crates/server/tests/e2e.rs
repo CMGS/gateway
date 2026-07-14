@@ -262,7 +262,6 @@ fn get(uri: &str) -> Request<Body> {
         .expect("request")
 }
 
-/// Admin-surface request: optional bearer + optional JSON body.
 fn admin(method: &str, uri: &str, token: Option<&str>, body: Option<&str>) -> Request<Body> {
     let mut b = Request::builder().method(method).uri(uri);
     if let Some(t) = token {
@@ -277,7 +276,6 @@ fn admin(method: &str, uri: &str, token: Option<&str>, body: Option<&str>) -> Re
     }
 }
 
-/// GET with the demo AK — the files/batches read surfaces require auth.
 fn get_authed(uri: &str) -> Request<Body> {
     Request::builder()
         .uri(uri)
@@ -654,8 +652,6 @@ access_keys:
     assert_eq!(tenants, vec!["acme", "beta"], "global usage sees all");
 }
 
-/// Set GW_TEST_PG_URL (e.g. postgres://postgres:gwtest@127.0.0.1:15432/gw) to
-/// run this: the PUT /admin/config success path against a real config store.
 #[tokio::test]
 async fn admin_config_publish_reloads_from_store() {
     let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
@@ -1177,8 +1173,6 @@ async fn chat_stream_tools_emit_tool_call_chunks() {
 }
 
 async fn assert_incremental_stream(model: &str, content: &str) {
-    // incremental deltas are only observable with outbound DLP off — the shipped
-    // default enables it, which (correctly) buffers the stream before redacting.
     let yaml = gw_config::DEFAULT_YAML.replace("dlp_redact: true", "dlp_redact: false");
     let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
     let state = Arc::new(GatewayState::from_config(&cfg));
@@ -1684,7 +1678,6 @@ async fn files_and_batches_are_tenant_isolated() {
             .unwrap()
     };
 
-    // ak-demo-123 (tenant default) uploads a file
     let upload = json!({"purpose": "batch", "file": "secret default-tenant content"}).to_string();
     let resp = app
         .clone()
@@ -1694,7 +1687,6 @@ async fn files_and_batches_are_tenant_isolated() {
     assert_eq!(resp.status(), StatusCode::OK);
     let file_id = body_json(resp).await["id"].as_str().unwrap().to_owned();
 
-    // ak-acme-1 (tenant acme) must not read metadata, content, or reuse the file
     for uri in [
         format!("/v1/files/{file_id}"),
         format!("/v1/files/{file_id}/content"),
@@ -1722,7 +1714,6 @@ async fn files_and_batches_are_tenant_isolated() {
         "cross-tenant input_file_id must 404"
     );
 
-    // the owner still sees its own file
     let resp = app
         .clone()
         .oneshot(get_as(&format!("/v1/files/{file_id}"), "ak-demo-123"))
@@ -1730,7 +1721,6 @@ async fn files_and_batches_are_tenant_isolated() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // a batch submitted by default is invisible to acme
     let submit = json!({"model":"gpt-4o-mini","items":[
         {"messages":[{"role":"user","content":"one"}]}]})
     .to_string();
@@ -1769,8 +1759,6 @@ async fn realtime_entitlement_blocks_unentitled_tenant() {
         axum::serve(listener, application).await.unwrap();
     });
 
-    // ak-acme-1 (tenant acme) is entitled only to gpt-4o; a realtime session
-    // for a non-entitled model must be refused at accept, not admitted.
     let mut req = format!("ws://{addr}/v1/realtime?model=realtime")
         .into_client_request()
         .unwrap();
@@ -1781,7 +1769,6 @@ async fn realtime_entitlement_blocks_unentitled_tenant() {
         "unentitled tenant must not open a realtime session"
     );
 
-    // the unrestricted default tenant still connects
     let mut ok = format!("ws://{addr}/v1/realtime?model=realtime")
         .into_client_request()
         .unwrap();
@@ -1790,9 +1777,6 @@ async fn realtime_entitlement_blocks_unentitled_tenant() {
     assert!(tokio_tungstenite::connect_async(ok).await.is_ok());
 }
 
-/// A provider whose realtime turns can't be gated before generation (no
-/// `response.create`/`response.created` signal — Gemini Live et al.) is refused
-/// at accept rather than served as an ungovernable, bill-after-the-fact session.
 #[tokio::test]
 async fn realtime_refuses_ungovernable_provider() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -1834,8 +1818,6 @@ models:
 async fn dlp_redacts_streaming_output_from_the_vendor() {
     use futures::StreamExt;
 
-    // a vendor that streams PII the (already-redacted) request never contained,
-    // to isolate OUTBOUND streaming DLP.
     #[derive(Debug)]
     struct PiiStream;
     #[async_trait::async_trait]
@@ -1916,8 +1898,6 @@ async fn batch_response_never_leaks_the_owning_key() {
 
 #[tokio::test]
 async fn blocklist_covers_the_responses_body() {
-    // a blocked term in the Responses native input (not a chat message) must
-    // still be blocked, not bypass the filter.
     let yaml = r#"
 listen: {host: 127.0.0.1, port: 0}
 security: {blocklist: ["forbiddenword"]}
@@ -1937,7 +1917,6 @@ accounts: [{name: a, provider: openai, protocols: ["responses"]}]
         .oneshot(post("/v1/responses", Some("ak-b"), body))
         .await
         .unwrap();
-    // blocked → served the filter message, not the vendor reply
     let j = body_json(resp).await;
     assert_ne!(
         j["output"][0]["content"][0]["text"], "please say forbiddenword",
@@ -1947,8 +1926,6 @@ accounts: [{name: a, provider: openai, protocols: ["responses"]}]
 
 #[tokio::test]
 async fn outbound_dlp_redacts_the_responses_body() {
-    // vendor-introduced PII in the Responses native body (response_v2) must be
-    // redacted, not returned verbatim.
     #[derive(Debug)]
     struct PiiResponses;
     #[async_trait::async_trait]
@@ -2151,8 +2128,6 @@ async fn responses_api_streaming_full_pipeline() {
 
 #[tokio::test]
 async fn responses_stream_is_incremental_with_dlp_off() {
-    // with outbound DLP off the Responses stream is incremental (multiple
-    // output_text.delta frames), not one buffered blob.
     let yaml = gw_config::DEFAULT_YAML.replace("dlp_redact: true", "dlp_redact: false");
     let cfg = Arc::new(GatewayConfig::from_yaml(&yaml).unwrap());
     let state = Arc::new(GatewayState::from_config(&cfg));
@@ -2227,7 +2202,6 @@ access_keys: [{ak: ak-c, product: demo, qps: 100, daily_token_quota: 1000000}]
 models: [{name: cachem, protocol: openai-chat, cache_ttl_seconds: 300}]
 accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
 "#;
-    // a changed config (extra model) → different generation hash → cache invalidated
     const YAML2: &str = r#"
 listen: {host: 127.0.0.1, port: 0}
 admin: {token_env: GW_TEST_ADMIN_CACHEGEN}
@@ -2258,7 +2232,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
             .unwrap()
     };
 
-    // first call misses and bills; second is a cache hit (not billed)
     for _ in 0..2 {
         let r = app
             .clone()
@@ -2269,7 +2242,6 @@ accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
     }
     assert_eq!(count(app.clone()).await, 1, "second call was a cache hit");
 
-    // reloading a changed config changes the generation → prior entry unreachable
     let r = app
         .clone()
         .oneshot(admin("POST", "/admin/reload", Some("cg-secret"), None))
@@ -2566,10 +2538,6 @@ models:
     assert_eq!(records[0].total_tokens, 13);
 }
 
-/// Server-VAD: the upstream auto-starts a turn (`response.created`) with no
-/// client `response.create`. The bridge must gate it like a manual turn — admit
-/// the first (billing it), then deny an over-quota second turn by cancelling it
-/// upstream and erroring the client, so it never bills.
 #[tokio::test]
 async fn realtime_bridge_gates_server_vad_turns() {
     use axum::routing::any;
@@ -2588,9 +2556,6 @@ async fn realtime_bridge_gates_server_vad_turns() {
                 let Ok(v) = serde_json::from_str::<Value>(&t) else {
                     continue;
                 };
-                // VAD trigger: auto-start a response with no response.create. Then
-                // race real generation against a gateway cancel — mirroring a real
-                // upstream that aborts (zero usage) when the gateway denies the turn.
                 if v["type"] == "input_audio_buffer.append" {
                     let _ = socket
                         .send(send(serde_json::json!({"type":"response.created"})))
@@ -2633,8 +2598,6 @@ async fn realtime_bridge_gates_server_vad_turns() {
         .unwrap();
     });
 
-    // daily_token_quota 10: the first turn's 1000-token reserve admits (spent
-    // was under), settling to 13; the second sees spent 13 >= 10 and is denied
     let yaml = format!(
         r#"
 listen: {{host: 127.0.0.1, port: 0}}
@@ -2667,7 +2630,6 @@ models:
     let (mut ws, _) = tokio_tungstenite::connect_async(req)
         .await
         .expect("ws connect");
-    // drain session.created
     let _ = ws.next().await.unwrap().unwrap();
 
     let append = || {
@@ -2691,7 +2653,6 @@ models:
         "first turn admitted and billed"
     );
 
-    // read to a brief idle gap so a leaked frame after the error is caught too
     ws.send(append()).await.unwrap();
     let mut saw_error = false;
     let mut leaked_output = false;

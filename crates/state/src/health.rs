@@ -150,7 +150,6 @@ fn cd_key(name: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Set GW_TEST_REDIS_URL (e.g. redis://127.0.0.1:16379) to run this.
     #[tokio::test]
     async fn redis_health_trips_and_recovers() {
         let Ok(url) = std::env::var("GW_TEST_REDIS_URL") else {

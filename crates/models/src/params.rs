@@ -1,10 +1,6 @@
-//! Typed per-family model params.
-//!
-//! Rather than one param struct per vendor across 65 vendors (heavy field
-//! duplication), this collapses into **protocol-family params** + `raw`
-//! passthrough: vendors in the same family share one typed param set,
-//! vendor-specific fields pass through verbatim in `ModelParamV2.raw`
-//! (serde_json::Value); byte-level vendor parity lands with live integration.
+//! Typed per-family model params: vendors in the same protocol family share
+//! one typed param set; vendor-specific fields pass through verbatim in
+//! `ModelParamV2.raw`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

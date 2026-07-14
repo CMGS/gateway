@@ -15,11 +15,9 @@ const DEFAULT_COMPLETION_RESERVE: i64 = 256;
 const MAX_RESERVE: i64 = 1_000_000;
 
 /// preprocess/model_quota: per-(AK, model) daily token cap — AK override, else
-/// tenant default, else unmetered (no counter is ever touched). Over-quota
-/// degrades to the tenant's fallback model when one is configured; otherwise
-/// the request passes and the per-AK daily cap stays the hard backstop.
-/// Runs before resolve_model so a swap re-routes protocol, entitlement, and
-/// cache to the served model.
+/// tenant default, else unmetered (the per-AK daily cap backstops). Over-quota
+/// degrades to the tenant's fallback model when one is configured. Runs before
+/// resolve_model so a swap re-routes protocol, entitlement, and cache.
 pub struct ModelQuotaGate;
 
 #[async_trait::async_trait]
@@ -141,9 +139,8 @@ impl DagNode for TenantEntitlement {
     }
 }
 
-/// preprocess/cache_lookup: request-level cache lookup (in-memory, TTL-based).
-/// On a hit, outcome is produced directly and the downstream account/rate-limit/
-/// engine/billing nodes all short-circuit.
+/// preprocess/cache_lookup: request-level TTL cache. On a hit the outcome is
+/// produced directly and the downstream nodes all short-circuit.
 pub struct CacheLookup;
 
 #[async_trait::async_trait]
@@ -192,16 +189,14 @@ fn cache_key_of(ctx: &DagContext) -> Option<String> {
     use sha2::{Digest, Sha256};
     let param = ctx.request.model_param_v2.as_ref()?;
     let mut h = Sha256::new();
-    // config generation: a reload may have remapped the model, so a pre-reload
-    // entry must not be served under the same key.
+    // generation: a reload may have remapped the model — a pre-reload entry must not match
     h.update(ctx.cfg.generation().to_le_bytes());
     h.update(param.model_name.as_bytes());
     h.update(serde_json::to_vec(&ctx.request.message).ok()?);
     if let Some(t) = &param.typed {
         h.update(serde_json::to_vec(t).ok()?);
     }
-    // `raw` params (seed, response_format, vendor extras) change the output;
-    // omitting them would collide distinct requests onto one entry
+    // raw params (seed, vendor extras) change the output — omitting them would collide entries
     if !param.raw.is_null() {
         h.update(serde_json::to_vec(&param.raw).ok()?);
     }
@@ -228,8 +223,7 @@ fn reserve_estimate(req: &gw_models::GatewayRequest) -> i64 {
 }
 
 /// preprocess/quota_check: AK daily-quota admission. Reserves the estimate
-/// atomically (admitted while spent-before < limit), so concurrent in-flight
-/// requests count against the budget instead of all passing a stale check;
+/// atomically so concurrent in-flight requests count against the budget;
 /// billing settles to actuals and a failed pipeline refunds in the handler.
 pub struct QuotaCheck;
 
@@ -471,10 +465,8 @@ impl DagNode for AkTpmLimit {
 }
 
 /// model_access/call_engine: factory dispatch + engine execution + failover.
-///
-/// On an upstream 5xx, the failed account is excluded and reselected once (a
-/// PTU -> paygo spill sets `ptu_spillover`); a second failure is propagated
-/// as-is.
+/// On an upstream 5xx the failed account is excluded and reselected once (a
+/// PTU → paygo spill sets `ptu_spillover`); a second failure propagates as-is.
 pub struct CallEngine;
 
 #[async_trait::async_trait]
@@ -590,8 +582,7 @@ impl DagNode for CommonUsageNode {
     }
 }
 
-/// post_process/cost_calc: local billing + quota consumption + ledger (metrics
-/// reporting dropped by design).
+/// post_process/cost_calc: local billing + quota consumption + ledger.
 pub struct CostCalc;
 
 #[async_trait::async_trait]
@@ -632,9 +623,8 @@ impl DagNode for CostCalc {
             ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
             return bill(ctx, pt, ct, pt.saturating_add(ct)).await;
         }
-        // default rate is 1:1 (total == prompt+completion); the formula carries
-        // future weighted rates. saturating sums so a malformed usage subtree
-        // can't overflow the billed totals.
+        // default rate is 1:1; the formula carries future weighted rates.
+        // saturating sums so a malformed usage subtree can't overflow the totals
         let (prompt, completion, total) = match &resp.common_usage {
             Some(u) => {
                 let ti = gw_models::TokenInput {
@@ -665,8 +655,7 @@ impl DagNode for CostCalc {
 
 /// Consume quota/TPM and write the ledger record for one served request.
 async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) -> GResult<()> {
-    // clamp before metering so a hostile usage report can't overflow a shared
-    // quota counter (see gw_state::MAX_METERED_TOKENS)
+    // clamp before metering so a hostile usage report can't overflow a shared counter
     let (prompt, completion, total) = (
         gw_state::clamp_tokens(prompt),
         gw_state::clamp_tokens(completion),

@@ -1,28 +1,6 @@
-//! HTTP view layer.
-//!
-//! Layer L5. Routes:
-//!   GET  /health                    liveness
-//!   GET  /v1/models                 configured public models
-//!   POST /v1/chat/completions       OpenAI-compatible (stream + non-stream)
-//!   POST /v1/completions            OpenAI legacy text completions (non-stream)
-//!   POST /v1/messages               Anthropic-compatible (stream + non-stream)
-//!   POST /v1/responses              OpenAI Responses API (stream + non-stream)
-//!   POST /v1/embeddings             OpenAI-compatible embeddings
-//!   POST /v1/images/generations     OpenAI-compatible image generation
-//!   POST /v1/images/edits           OpenAI-compatible image edit (source + mask)
-//!   POST /v1/audio/speech           TTS (returns audio bytes)
-//!   POST /v1/audio/transcriptions   STT (JSON carries b64 audio)
-//!   POST /v1/batches                offline batch submit (inline items or input_file_id)
-//!   GET  /v1/batches/{id}           batch status/results
-//!   POST /v1/files                  file upload (batch input JSONL)
-//!   GET  /v1/files/{id}             file metadata
-//!   GET  /v1/files/{id}/content     file content download
-//!   GET  /internal/ledger           local billing ledger (observability surface trimmed for the zero-egress local build)
-//!   GET  /internal/accounts         account pool view
-//!
-//! Views parse/validate, authenticate the AK, build a `GatewayRequest`, call the
-//! handler, shape the wire response, and emit one structured access-log line per
-//! request (fields: ak/model/account/tokens/cost/latency).
+//! HTTP view layer (L5): parse/validate, authenticate the AK, build a
+//! `GatewayRequest`, call the handler, shape the wire response, and emit one
+//! structured access-log line per request.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -53,8 +31,7 @@ use serde_json::{Value, json};
 
 const LEDGER_PAGE_DEFAULT: usize = 100;
 const STREAM_CHANNEL_CAP: usize = 64;
-/// Tokens reserved against the AK daily quota per admitted realtime turn, before
-/// the turn's actual usage is known; settled to the real total at billing.
+/// Per-turn token reserve against the AK daily quota; settled to actuals at billing.
 const REALTIME_TURN_RESERVE: i64 = 1_000;
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -105,15 +82,12 @@ impl AppState {
         self
     }
 
-    /// Reload config from source and atomically swap it in (derived state
-    /// rebuilt, runtime seams preserved). Storage-backend changes (redis/sqlite
-    /// URLs) need a restart and are ignored here.
+    /// Reload config from source and swap it in atomically; storage-backend
+    /// (redis/sqlite URL) changes need a restart and are ignored here.
     pub async fn reload(&self) -> Result<(), String> {
         let loader = self.loader.as_ref().ok_or("reload not configured")?;
         let cfg = loader().await?;
-        // per-account upstream policy is baked into the transport at boot, not part
-        // of the config-derived state; push the reloaded timeouts/retries in so a
-        // published policy change takes effect without a restart.
+        // upstream policy is baked in at boot, not config-derived — push reloaded values explicitly
         let (default, per_account) = upstream_policies(&cfg);
         self.handler
             .config
@@ -125,8 +99,7 @@ impl AppState {
     }
 }
 
-/// The default + per-account [`UpstreamPolicy`] map derived from a config. Used
-/// at boot and re-derived on reload so a config change updates the transport.
+/// The default + per-account [`UpstreamPolicy`] map derived from a config.
 pub fn upstream_policies(
     cfg: &GatewayConfig,
 ) -> (
@@ -189,8 +162,7 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Counts every response (all statuses, every surface) with bounded labels:
-/// the matched route template and the status code.
+/// Counts every response with bounded labels: route template and status code.
 async fn track_requests(
     matched: Option<axum::extract::MatchedPath>,
     req: axum::extract::Request,
@@ -210,10 +182,8 @@ async fn track_requests(
     resp
 }
 
-/// The AK carried in the `Sec-WebSocket-Protocol` list as `gw-api-key.<ak>` —
-/// the one place a browser WebSocket can put a credential (it cannot set
-/// arbitrary headers); same pattern as OpenAI's realtime browser auth. A query
-/// parameter would leak the key into every LB access log.
+/// The AK carried as `gw-api-key.<ak>` in `Sec-WebSocket-Protocol` — the one
+/// header a browser WebSocket can set; a query param would leak into LB logs.
 fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<String> {
     headers
         .get("sec-websocket-protocol")?
@@ -225,10 +195,8 @@ fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// GET /v1/realtime?model=... (WebSocket upgrade).
-/// An account with a real endpoint bridges the session to the vendor's
-/// realtime WebSocket; an endpoint-less account serves the local mock session
-/// (session.created / input_text → response.delta×n → response.done).
+/// GET /v1/realtime?model=... (WebSocket upgrade): bridge to the vendor's
+/// realtime WebSocket, or the local mock session for an endpoint-less account.
 async fn realtime_ws(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -237,7 +205,6 @@ async fn realtime_ws(
 ) -> Response {
     // one consistent snapshot for the whole accept decision (cfg + state)
     let snap = s.handler.config.load();
-    // browsers can't set ws headers; the key may ride the subprotocol
     let ak = match authenticate(&s, &headers).await {
         Ok(ak) => ak,
         Err((st, msg)) => {
@@ -267,8 +234,7 @@ async fn realtime_ws(
     if mt != gw_consts::Protocol::Realtime {
         return error_response(400, format!("`{model}` is not a realtime model"));
     }
-    // same tenant entitlement gate the REST surfaces enforce (TenantEntitlement
-    // DAG node) — the realtime surface must not be an entitlement bypass.
+    // same tenant entitlement gate as REST — realtime must not be a bypass
     if !snap.cfg.tenant_allows_model(&ak.tenant, &model) {
         return error_response(
             403,
@@ -293,9 +259,7 @@ async fn realtime_ws(
     if account.endpoint.is_empty() {
         ws.on_upgrade(move |socket| realtime_session(socket, s, ak, model, mt, account.name))
     } else if is_gemini_realtime(&account.provider) {
-        // no pre-generation gate signal for this dialect — serving it would relay
-        // output and bill only after the fact, bypassing quota/entitlement, so
-        // refuse rather than run an ungovernable session
+        // no pre-generation gate signal in this dialect — refuse rather than bill after the fact
         error_response(
             501,
             format!(
@@ -308,11 +272,9 @@ async fn realtime_ws(
     }
 }
 
-/// A realtime turn admitted by [`realtime_gate`]: the freshly re-authenticated
-/// key (so billing attributes to the key's current product/tenant/quotas, not
-/// the stale handshake snapshot), the tokens reserved against the AK daily quota
-/// and (when a TPM cap is set) the AK TPM window, and the admission day so the
-/// paired settle/refund lands on the same bucket.
+/// A turn admitted by [`realtime_gate`]: the freshly re-authenticated key, the
+/// reserves taken (daily quota + optional TPM window), and the admission day so
+/// the paired settle/refund lands on the same bucket.
 struct RealtimeAdmit {
     ak: AkInfo,
     reserved: i64,
@@ -322,8 +284,7 @@ struct RealtimeAdmit {
 }
 
 impl RealtimeAdmit {
-    /// Refund this turn's unsettled reserves (daily quota + any TPM window) — for
-    /// a turn dropped before its boundary frame arrived.
+    /// Refund this turn's unsettled reserves — for a turn dropped before its boundary frame.
     async fn refund(&self, gov: &dyn gw_state::Governance) {
         gov.quota_settle(&self.ak.ak, -self.reserved, self.at).await;
         if let Some(tpm) = self.tpm_reserved {
@@ -333,19 +294,11 @@ impl RealtimeAdmit {
     }
 }
 
-/// The full governance chain the REST path runs (tenant + AK QPS, product/model
-/// QPM, per-(AK, model) quota, AK daily quota, AK TPM), applied per realtime
-/// generation. Re-fetches the key each turn (the handshake snapshot is stale),
-/// so a key banned/expired/revoked or a model de-entitled mid-session stops
-/// generating and current limit values apply. `Err` carries the denial message.
-///
-/// The AK daily quota and AK TPM window each reserve a fixed per-turn estimate
-/// (settled to actuals at billing) so concurrent turns across parallel sockets
-/// count against the budget instead of all passing a stale check — matching the
-/// REST path, which reserves both. The per-(AK, model) counter stays soft
-/// check-then-consume, as it does on REST. Reserves are taken last so a denial
-/// from any check above never leaves a reservation behind; if the TPM reserve
-/// fails the daily reserve just taken is rolled back before returning.
+/// The REST governance chain applied per realtime generation, with the key
+/// re-fetched each turn so mid-session bans/de-entitlements take effect. The
+/// daily-quota and TPM reserves are taken last so a denial from any earlier
+/// check never leaves a reservation behind; a failed TPM reserve rolls back
+/// the daily reserve just taken. `Err` carries the denial message.
 async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<RealtimeAdmit, String> {
     let snap = s.handler.config.load();
     let (cfg, state) = (&snap.cfg, &snap.state);
@@ -406,7 +359,6 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<Realtim
             .token_window_reserve(&ak.ak, REALTIME_TURN_RESERVE, tpm, gw_consts::MINUTE)
             .await
         {
-            // roll back the daily reserve taken just above, then deny
             gov.quota_settle(&ak.ak, -REALTIME_TURN_RESERVE, at).await;
             return Err(format!(
                 "token-per-minute limit exceeded for ak {} (tpm {tpm})",
@@ -425,12 +377,10 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<Realtim
     })
 }
 
-/// Settle one realtime generation: close its admission reserves to the turn's
-/// actual total, then (for a turn that produced tokens) accrue the per-(AK,
-/// model) counter and write the ledger/metrics. A zero-usage terminal frame
-/// (cancelled/errored turn) refunds the reserves and writes nothing. Uses the
-/// shared [`gw_state::billing_record`] pricing so it can't drift from the
-/// request-pipeline path.
+/// Settle one realtime turn's admission reserves to its actual total, then
+/// accrue counters and write the ledger; a zero-usage terminal frame refunds
+/// and writes nothing. Pricing shares [`gw_state::billing_record`] with the
+/// request pipeline so the two can't drift.
 async fn bill_realtime_turn(
     s: &AppState,
     admit: &RealtimeAdmit,
@@ -441,14 +391,12 @@ async fn bill_realtime_turn(
     ot: i64,
 ) {
     let ak = &admit.ak;
-    // clamp parts AND total (a hostile count can't overflow a shared counter,
-    // and governance agrees with the ledger, which also caps total)
+    // clamp parts and total so a hostile count can't overflow shared counters
     let (it, ot) = (gw_state::clamp_tokens(it), gw_state::clamp_tokens(ot));
     let total = gw_state::clamp_tokens(it.saturating_add(ot));
     let state = s.handler.state();
     let gov = &state.governance;
-    // settle the admission reserves to this turn's actual total on the reserved
-    // day/window; an ungated dialect passes reserved = 0 (a plain consume/add)
+    // reserved = 0 for an ungated dialect — the settle degenerates to a plain add
     gov.quota_settle(&ak.ak, total - admit.reserved, admit.at)
         .await;
     match admit.tpm_reserved {
@@ -495,7 +443,7 @@ async fn bill_realtime_turn(
     }
 }
 
-/// One mock realtime session (upstream is mocked).
+/// One mock realtime session.
 async fn realtime_session(
     mut socket: axum::extract::ws::WebSocket,
     s: AppState,
@@ -572,38 +520,31 @@ async fn realtime_session(
     }
 }
 
-/// Whether a client frame (text or binary) is the OpenAI-dialect generation
-/// trigger. Both frame kinds are checked so a binary-encoded event cannot
-/// slip past the governance gate.
+/// Whether a client frame is the OpenAI-dialect generation trigger; text and
+/// binary are both checked so a binary-encoded event can't slip past the gate.
 fn is_response_create(payload: &[u8]) -> bool {
     serde_json::from_slice::<Value>(payload)
         .map(|v| v["type"] == "response.create")
         .unwrap_or(false)
 }
 
-/// A non-OpenAI realtime dialect (Gemini Live family) — no `response.create`/
-/// `response.created` turn-start signal, so the gateway can't gate it before
-/// generation, and it's metered off the vendor's own turn-complete frame.
+/// A non-OpenAI realtime dialect (Gemini Live family): no turn-start signal to
+/// gate before generation; metered off the vendor's own turn-complete frame.
 fn is_gemini_realtime(provider: &str) -> bool {
     matches!(provider, "google" | "gemini" | "vertex")
 }
 
-/// Whether `frame` is a server-initiated (VAD) turn start the gateway must gate:
-/// OpenAI's `response.created`. Non-OpenAI dialects have no such gated auto-start.
+/// Whether `frame` is a server-initiated (VAD) turn start the gateway must gate.
 fn realtime_turn_started(provider: &str, frame: &Value) -> bool {
     !is_gemini_realtime(provider) && frame["type"] == "response.created"
 }
 
-/// Per-dialect realtime turn boundary → the turn's (input, output) tokens.
-/// `Some` for a per-turn TERMINAL frame — including `Some((0, 0))` for a
-/// cancelled/empty turn, so its admission reservation is settled/refunded rather
-/// than orphaned at the FIFO head — and `None` for any non-boundary frame. Keyed
-/// by the account's provider so non-OpenAI vendors are metered, not relayed free.
+/// Per-dialect turn boundary → the turn's (input, output) tokens: `Some((0, 0))`
+/// for a cancelled/empty turn (so its reservation settles instead of orphaning),
+/// `None` for a non-boundary frame. Keyed by provider so every dialect is metered.
 fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
     let usage = if is_gemini_realtime(provider) {
-        // Gemini Live: cumulative usageMetadata rides multiple frames, so settle
-        // only on turnComplete (the one turn boundary) — not generationComplete,
-        // which would double-count.
+        // cumulative usage rides many frames — settle only on turnComplete or it double-counts
         if frame["serverContent"]["turnComplete"] != Value::Bool(true) {
             return None;
         }
@@ -615,8 +556,7 @@ fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
             .unwrap_or(0);
         (it, ot)
     } else {
-        // OpenAI Realtime: a turn ends on response.done (any status, incl.
-        // cancelled/failed, which may carry zero usage).
+        // a turn ends on response.done, any status, possibly with zero usage
         if frame["type"] != "response.done" {
             return None;
         }
@@ -630,11 +570,10 @@ fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
     Some((usage.0.max(0), usage.1.max(0)))
 }
 
-/// Bridge one realtime session to a real upstream over WebSocket: a transparent
-/// relay plus auth, per-generation governance gates, and per-turn billing. Only
-/// the OpenAI Realtime dialect reaches here — `realtime_ws` refuses providers it
-/// can't gate before generation (see [`is_gemini_realtime`]); the Gemini metering
-/// in [`realtime_usage`] is dormant groundwork for a future Gemini Live adapter.
+/// Bridge one realtime session to a real upstream over WebSocket: transparent
+/// relay plus auth, per-generation gates, and per-turn billing. Only the OpenAI
+/// dialect reaches here — [`realtime_ws`] refuses providers it can't gate; the
+/// Gemini metering in [`realtime_usage`] is groundwork for a future adapter.
 async fn realtime_bridge(
     mut client: axum::extract::ws::WebSocket,
     s: AppState,
@@ -689,15 +628,11 @@ async fn realtime_bridge(
     let (mut cl_tx, mut cl_rx) = client.split();
 
     let mut generations = 0u64;
-    // upstream turn-boundary frames recognized (any dialect) — zero while
-    // generations flowed signals an unmetered dialect.
+    // boundary frames recognized; zero while generations flowed = unmetered dialect
     let mut recognized = 0u64;
-    // turns admitted (reserved) but not yet settled, oldest first — one active
-    // response at a time keeps this FIFO; drained on each turn-boundary frame,
-    // refunded on exit so a dropped turn's reserves never leak.
+    // admitted turns awaiting settle, FIFO; refunded on exit so reserves never leak
     let mut pending: std::collections::VecDeque<RealtimeAdmit> = std::collections::VecDeque::new();
-    // set when a server-VAD turn is denied: swallow that turn's upstream frames
-    // (its output must not reach the client) until its terminal frame arrives.
+    // denied server-VAD turn: swallow its upstream frames until its terminal frame
     let mut suppress = false;
     loop {
         tokio::select! {
@@ -757,18 +692,13 @@ async fn realtime_bridge(
                     let mut relay = true;
                     if let Ok(v) = serde_json::from_str::<Value>(&t) {
                         if suppress {
-                            // swallow the denied turn's output until its boundary
                             relay = false;
                             if realtime_usage(&account.provider, &v).is_some() {
-                                suppress = false; // turn ended; resume relaying
+                                suppress = false;
                             }
                         }
-                        // Server-VAD: OpenAI auto-starts a turn (`response.created`)
-                        // with no client `response.create`, so gate it here when no
-                        // manually-gated turn is pending. This gives automatic turns
-                        // the same admission + fresh-key attribution as manual ones;
-                        // a denied turn is cancelled upstream, error'd downstream, and
-                        // its output frames are suppressed so nothing leaks.
+                        // server-VAD: OpenAI auto-starts a turn with no client
+                        // response.create — gate it here like a manual one
                         else if realtime_turn_started(&account.provider, &v) && pending.is_empty() {
                             match realtime_gate(&s, &ak, &model).await {
                                 Ok(admit) => pending.push_back(admit),
@@ -784,22 +714,16 @@ async fn realtime_bridge(
                                 }
                             }
                         } else if let Some((it, ot)) = realtime_usage(&account.provider, &v) {
-                            // a turn ended — settle the matching admitted turn (FIFO),
-                            // so a zero-usage terminal frame refunds its reserve here
-                            // instead of orphaning it at the head. A boundary with no
-                            // gated turn (ungated dialect) bills unreserved, and only
-                            // when it produced tokens.
+                            // turn boundary — settle the matching admitted turn (FIFO);
+                            // a boundary with no gated turn bills unreserved
                             match pending.pop_front() {
                                 Some(a) => {
                                     bill_realtime_turn(&s, &a, &model, mt, &account.name, it, ot)
                                         .await
                                 }
                                 None if it.saturating_add(ot) > 0 => {
-                                    // ungated boundary: a denied server-VAD turn's
-                                    // partial usage, or a dialect with no
-                                    // response.created. Re-authenticate for fresh
-                                    // billing identity rather than the stale
-                                    // handshake key (falls back to it if deleted).
+                                    // re-authenticate so billing uses the key's current
+                                    // identity, not the stale handshake snapshot
                                     let billed = s
                                         .handler
                                         .state()
@@ -844,8 +768,7 @@ async fn realtime_bridge(
             },
         }
     }
-    // refund reserves for turns that never reached a boundary frame (session
-    // dropped mid-generation)
+    // refund reserves for turns that never reached a boundary frame
     if !pending.is_empty() {
         let state = s.handler.state();
         for a in pending {
@@ -862,9 +785,7 @@ async fn realtime_bridge(
     }
 }
 
-/// One structured access-log line per served request
-/// (ak/model/account/prompt_tokens/.../latency_ms); local
-/// stdout only (zero-egress default build).
+/// One structured access-log line per served request; local stdout only.
 fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
     let (model, mt) = ctx
         .request
@@ -1012,8 +933,7 @@ fn error_response(status: u16, message: impl Into<String>) -> Response {
         .into_response()
 }
 
-/// Who an admin bearer token speaks for: the global operator, or one tenant
-/// (which may only touch its own keys and usage).
+/// Who an admin bearer token speaks for: the global operator or one tenant.
 enum AdminScope {
     Global,
     Tenant(String),
@@ -1029,10 +949,9 @@ impl AdminScope {
     }
 }
 
-/// Admin surface gate: a bearer check against the global admin token first
-/// (a tenant token colliding with it grants global, never the reverse), then
-/// each tenant's scoped token. Disabled (404) while no admin token of any kind
-/// is configured, so probing the surface can't tell it apart from a
+/// Admin gate: the global token is checked first (a colliding tenant token
+/// grants global, never the reverse), then each tenant's token. 404 while no
+/// admin token is configured, so probing can't tell the surface from a
 /// nonexistent route.
 #[allow(clippy::result_large_err)] // admin plane, not hot; boxing would noise every call site
 fn admin_auth(s: &AppState, headers: &HeaderMap) -> Result<AdminScope, Response> {
@@ -1094,10 +1013,8 @@ fn ct_eq(a: &str, b: &str) -> bool {
             == 0
 }
 
-/// POST /admin/reload — re-read config from source and swap it in atomically
-/// (AK table / models / providers / accounts rebuilt; governance, store,
-/// account health, and cache preserved). Storage-backend URL changes need a
-/// restart.
+/// POST /admin/reload — re-read config from source and swap it in atomically;
+/// governance, store, health, and cache are preserved.
 async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
@@ -1195,9 +1112,7 @@ async fn admin_key_create(
         .into_response()
 }
 
-/// PATCH /admin/keys/{ak} — re-quota or re-state an existing key (qps /
-/// daily_token_quota / tokens_per_minute / expires_at_epoch_secs / banned).
-/// Only the fields present in the body change.
+/// PATCH /admin/keys/{ak} — only the fields present in the body change.
 async fn admin_key_patch(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -1208,12 +1123,10 @@ async fn admin_key_patch(
         Ok(scope) => scope,
         Err(r) => return r,
     };
-    // 404, not 403: don't leak other tenants' key existence
     if let Err(r) = scoped_key(&s, &scope, &ak).await {
         return r;
     }
-    // absent = leave, null = clear, number = set; malformed (incl. u64
-    // overflow) leaves the field unchanged rather than clearing a cap
+    // absent = leave, null = clear, number = set; malformed (incl. u64 overflow) leaves unchanged
     let tri = |field: &str| match body.get(field) {
         Some(Value::Null) => Some(None),
         Some(v) if v.is_i64() || v.is_u64() => v.as_i64().map(Some),
@@ -1250,8 +1163,7 @@ async fn admin_key_patch(
     }
 }
 
-/// DELETE /admin/keys/{ak} — revoke a key (config- or admin-sourced). Effective
-/// fleet-wide once every instance's key table reflects it.
+/// DELETE /admin/keys/{ak} — revoke a key (config- or admin-sourced).
 async fn admin_key_delete(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -1275,10 +1187,8 @@ async fn admin_key_delete(
     }
 }
 
-/// PUT /admin/config — validate and publish a new config document to the
-/// fleet config store, then reload this instance immediately (peers converge
-/// via the store's change feed). Global admin only; requires the Postgres
-/// config store.
+/// PUT /admin/config — validate, publish to the fleet config store, and reload
+/// this instance; peers converge via the store's change feed. Global admin only.
 async fn admin_config_put(State(s): State<AppState>, headers: HeaderMap, body: String) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
@@ -1309,8 +1219,7 @@ async fn admin_config_put(State(s): State<AppState>, headers: HeaderMap, body: S
     }
 }
 
-/// GET /admin/keys — the key table, scoped: a tenant admin sees only its own
-/// tenant's keys.
+/// GET /admin/keys — the key table, scoped: a tenant admin sees only its own keys.
 async fn admin_key_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let scope = match admin_auth(&s, &headers) {
         Ok(scope) => scope,
@@ -1406,9 +1315,8 @@ fn anthropic_gateway_error(e: GatewayError) -> Response {
     anthropic_error(e.http_status, e.message)
 }
 
-/// Run the pipeline on its own task so a client disconnect cannot cancel it
-/// mid-billing: once a request is admitted, quota/ledger accounting runs to
-/// completion even if the response can no longer be delivered.
+/// Run the pipeline on its own task so a client disconnect can't cancel it
+/// mid-billing: once admitted, quota/ledger accounting runs to completion.
 async fn run_pipeline(s: &AppState, request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
     let handler = s.handler.clone();
     match tokio::spawn(async move { handler.run(request, ak).await }).await {
@@ -1421,8 +1329,7 @@ fn next_id(prefix: &str) -> String {
     format!("{prefix}-local-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
-/// finish_reason cross-protocol mapping (terminal-state conversion):
-/// anthropic → openai side.
+/// finish_reason mapping, anthropic → openai.
 fn finish_openai(fr: &str) -> String {
     match fr {
         "" | "end_turn" | "stop_sequence" | "COMPLETE" | "complete" => "stop".to_owned(),
@@ -1432,7 +1339,7 @@ fn finish_openai(fr: &str) -> String {
     }
 }
 
-/// openai → anthropic side.
+/// finish_reason mapping, openai → anthropic.
 fn finish_anthropic(fr: &str) -> String {
     match fr {
         "" | "stop" => "end_turn".to_owned(),
@@ -1457,7 +1364,6 @@ async fn chat_completions(
         return error_response(400, "messages must not be empty");
     }
 
-    // full passthrough, including unrecognized fields
     let messages: Vec<ChatMsg> = body
         .messages
         .iter()
@@ -1548,16 +1454,11 @@ async fn chat_completions(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
-/// Run the pipeline on its own task, forwarding stream chunks through a
-/// bounded channel — the backpressure seam. Engines without live streaming
-/// yield their buffered chunks after the run; a final chunk carries the usage
-/// totals; billing stays in the pipeline tail either way.
-///
-/// When outbound DLP is enabled the response can't stream token-by-token —
-/// redaction needs the whole message (a masked span may straddle deltas), and a
-/// live delta would leave the client before the pipeline's post-stage scrubs it.
-/// So DLP forces buffering: no live channel, and the tail is synthesized from the
-/// already-redacted final message rather than the raw decoded deltas.
+/// Run the pipeline on its own task, forwarding stream chunks through a bounded
+/// channel (the backpressure seam); a final chunk carries the usage totals.
+/// Outbound DLP forces buffering — a masked span may straddle deltas — so the
+/// tail is then synthesized from the already-redacted final message instead of
+/// the raw decoded deltas.
 fn spawn_stream_pipeline(
     s: &AppState,
     mut request: GatewayRequest,
@@ -1658,7 +1559,6 @@ fn chat_stream_response(
                 }
                 Some(c) => {
                     if !c.delta.is_empty() {
-                        // move the delta text (owned chunk, field not read again)
                         let chunk =
                             ChatCompletionChunk::content(&st.id, st.created, &st.model, c.delta);
                         if let Ok(payload) = serde_json::to_string(&chunk) {
@@ -1708,8 +1608,7 @@ fn chat_stream_response(
     Sse::new(stream)
 }
 
-/// Chunks for engines that returned a buffered response: the full message as
-/// one delta plus tool calls and a finish marker.
+/// Chunks for an engine that returned a buffered response.
 fn synth_chunks(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
     let mut chunks = if outcome.chunks.is_empty() && !outcome.response.message.is_empty() {
         vec![gw_engines::StreamChunk {
@@ -1740,9 +1639,8 @@ fn synth_chunks(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamCh
     chunks
 }
 
-/// The stream tail under outbound DLP: the whole redacted message as one delta,
-/// then tool calls and finish. Unlike [`synth_chunks`] it never replays the raw
-/// decoded deltas (which are pre-redaction), so no unmasked text ever leaves.
+/// The stream tail under outbound DLP: unlike [`synth_chunks`] it never replays
+/// the raw pre-redaction deltas, so no unmasked text ever leaves.
 fn redacted_stream_tail(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
     let mut chunks = Vec::new();
     if !outcome.response.message.is_empty() {
@@ -1810,7 +1708,6 @@ async fn messages(
             .iter()
             .map(|m| {
                 let mut msg = ChatMsg::text(m.role.clone(), m.text());
-                // preserve multimodal content blocks (image/text) for the engine
                 if m.content.is_array() {
                     msg.parts = Some(m.content.clone());
                 }
@@ -1821,7 +1718,6 @@ async fn messages(
         ..Default::default()
     };
 
-    // standard anthropic event sequence, emitted incrementally
     if body.stream {
         let model = body.model.clone();
         return messages_stream_response(s, request, ak, model, started).into_response();
@@ -1863,9 +1759,8 @@ async fn messages(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
-/// The anthropic tool_use blocks for an engine's tool_calls value: native
-/// blocks pass through; OpenAI-shaped calls (a cross-protocol model behind
-/// /v1/messages) run through the dsl's data-driven openai→anthropic mapping.
+/// tool_use blocks for an engine's tool_calls: native blocks pass through;
+/// OpenAI-shaped calls run through the dsl's openai→anthropic mapping.
 fn anthropic_tool_blocks(tool_calls: &Option<Value>) -> Vec<Value> {
     let Some(Value::Array(blocks)) = tool_calls else {
         return Vec::new();
@@ -1895,10 +1790,9 @@ fn anthropic_tool_blocks(tool_calls: &Option<Value>) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// Streaming /v1/messages: pipeline chunks re-emitted incrementally as the
-/// anthropic event sequence. message_start goes out before upstream usage is
-/// known, so its input_tokens is 0; the final message_delta carries the real
-/// counts (SDKs accumulate usage from message_delta).
+/// Streaming /v1/messages as the anthropic event sequence. message_start goes
+/// out before usage is known (input_tokens 0); the final message_delta carries
+/// the real counts, which SDKs accumulate from.
 fn messages_stream_response(
     s: AppState,
     request: GatewayRequest,
@@ -1914,11 +1808,9 @@ fn messages_stream_response(
         id: String,
         model: String,
         started_msg: bool,
-        /// index of the open text content block, if any.
         text_idx: Option<usize>,
         next_idx: usize,
-        /// OpenAI-shaped tool-call fragments from a cross-protocol upstream,
-        /// accumulated until the stream ends (arguments arrive in pieces).
+        /// OpenAI-shaped tool-call fragments, accumulated until the stream ends.
         tool_frags: Option<Value>,
         pending_finish: Option<String>,
         ended: bool,
@@ -2062,7 +1954,6 @@ fn messages_stream_response(
                                 st.emit_tool_block(&block);
                             }
                         } else {
-                            // cross-protocol fragments: assemble, convert at end
                             gw_engines::merge_tool_call_fragments(&mut st.tool_frags, tc);
                         }
                     }
@@ -2083,7 +1974,7 @@ fn messages_stream_response(
     Sse::new(stream)
 }
 
-/// Shared: run a non-chat family request through the pipeline.
+/// Run a non-chat family request through the pipeline.
 async fn run_family(
     s: &AppState,
     ak: AkInfo,
@@ -2106,10 +1997,8 @@ async fn run_family(
     }
 }
 
-/// POST /v1/embeddings (OpenAI-compatible embeddings surface)
-/// POST /v1/completions (legacy text-completion surface; prompt shape, not chat).
-/// The prompt is handed as a single user message to CompletionsEngine (sends
-/// `{prompt}`); response is shaped as `text_completion`. Non-streaming.
+/// POST /v1/completions (legacy text completions; non-stream). The prompt rides
+/// as a single user message to CompletionsEngine.
 async fn completions(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -2177,9 +2066,8 @@ async fn completions(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
-/// POST /v1/responses (OpenAI Responses API surface, native body passthrough).
-/// The whole request body rides as `raw` through ResponsesEngine; returns the
-/// engine's native Responses response passthrough.
+/// POST /v1/responses — native passthrough: the whole body rides as `raw`
+/// through ResponsesEngine and its native response is returned as-is.
 async fn responses(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -2198,7 +2086,6 @@ async fn responses(
         return error_response(400, "input is required");
     }
     let stream = body["stream"].as_bool().unwrap_or(false);
-    // native passthrough: the whole Responses-shaped body rides in `raw`
     let mut param = ModelParamV2::with_name(gw_consts::Protocol::Responses, model.clone());
     param.raw = body;
     let request = GatewayRequest {
@@ -2227,10 +2114,8 @@ async fn responses(
     }
 }
 
-/// Streaming /v1/responses: pipeline chunks re-emitted incrementally as the
-/// Responses SSE dialect (`response.created` → `response.output_text.delta`× →
-/// `response.completed` with input/output token usage → `[DONE]`). Live for
-/// real vendors; buffered-then-redacted when outbound DLP is on.
+/// Streaming /v1/responses as the Responses SSE dialect; live for real vendors,
+/// buffered-then-redacted when outbound DLP is on.
 fn responses_stream_response(
     s: AppState,
     request: GatewayRequest,
@@ -2324,6 +2209,7 @@ fn responses_stream_response(
     Sse::new(stream)
 }
 
+/// POST /v1/embeddings (OpenAI-compatible surface)
 async fn embeddings(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -2397,9 +2283,8 @@ async fn images_generations(
     }
 }
 
-/// POST /v1/images/edits (source image + optional mask + prompt).
-/// Same engine as generations; presence of `image` routes to the edit endpoint.
-/// Client sends the image as base64 JSON, matching the audio surface.
+/// POST /v1/images/edits — same engine as generations; presence of `image`
+/// routes to the edit endpoint; the image arrives as base64 JSON.
 async fn images_edits(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -2482,8 +2367,7 @@ async fn audio_speech(
     }
 }
 
-/// POST /v1/audio/transcriptions (STT; JSON carries b64 audio instead of a
-/// multipart upload; field semantics match. Multipart support is future work)
+/// POST /v1/audio/transcriptions (STT; JSON carries b64 audio, not multipart).
 async fn audio_transcriptions(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -2514,7 +2398,6 @@ async fn audio_transcriptions(
     }
 }
 
-/// Parse the `messages` array of a batch request object into engine messages.
 fn parse_batch_messages(v: &Value) -> Vec<ChatMsg> {
     v["messages"]
         .as_array()
@@ -2544,7 +2427,6 @@ async fn batches_submit(
     let mut model = body["model"].as_str().unwrap_or_default().to_owned();
     let mut batch_items = Vec::new();
 
-    // inline `items`, or an uploaded JSONL `input_file_id` (OpenAI batch pattern)
     if let Some(file_id) = body["input_file_id"].as_str() {
         // another tenant's file answers 404, not 403 — don't leak its existence
         let file = match s.handler.state().store.file_get(file_id).await {
@@ -2594,8 +2476,8 @@ async fn batches_submit(
         .into_response()
 }
 
-/// POST /v1/files (file upload; batch input JSONL, etc). Uses a JSON `file`
-/// field (string content) instead of multipart, matching the audio/images surfaces.
+/// POST /v1/files — a JSON `file` string field instead of multipart, matching
+/// the audio/images surfaces.
 async fn files_upload(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -2632,8 +2514,7 @@ async fn files_upload(
         .into_response()
 }
 
-/// GET /v1/files/{id} (file metadata). A file owned by another tenant answers
-/// 404 (not 403), so sequential ids can't be probed for cross-tenant existence.
+/// GET /v1/files/{id}; another tenant's file answers 404, not 403.
 async fn files_get(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -2871,7 +2752,6 @@ mod tests {
         let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
-        // ak-tpm-tiny: tokens_per_minute 10, below the 1000-token turn reserve
         let ak = s
             .handler
             .state()

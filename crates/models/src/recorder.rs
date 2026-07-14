@@ -1,24 +1,18 @@
-//! Timing recorder and security-block result.
-//!
-//! `Recorder` tracks per-request latency bookkeeping; `Block` represents a
-//! content-safety verdict as a trimmed, object-safe value type.
+//! Timing recorder (`Recorder`) and the content-safety verdict (`Block`).
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-/// Per-request latency recorder (subset of the full timing surface).
-///
-/// The full timing surface has around a dozen methods; only the ones the
-/// engine layer and post-processing actually consume are implemented here.
-/// Object-safe so it can be held as `Arc<dyn Recorder>` on a `GatewayResponse`.
+/// Per-request latency recorder — the subset of the full timing surface the
+/// engine layer and post-processing consume. Object-safe so it can be held as
+/// `Arc<dyn Recorder>` on a `GatewayResponse`.
 pub trait Recorder: Send + Sync + std::fmt::Debug {
     fn start_time(&self) -> DateTime<Utc>;
     fn report_to_map(&self) -> HashMap<String, serde_json::Value>;
 }
 
-/// A recorder that measures from construction and reports nothing extra.
-/// Handy default when full timing granularity isn't needed.
+/// Measures from construction and reports nothing extra — the handy default.
 #[derive(Debug, Clone)]
 pub struct SimpleRecorder {
     start: DateTime<Utc>,
@@ -98,11 +92,8 @@ impl Recorder for TimingRecorder {
     }
 }
 
-/// Content-safety verdict.
-///
-/// A plain value type since the fields fully describe the verdict.
-/// Invariant: a blocked verdict is always a hit; a hit is not necessarily a
-/// block.
+/// Content-safety verdict. Invariant: a blocked verdict is always a hit; a hit
+/// is not necessarily a block.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Block {
     pub block: bool,

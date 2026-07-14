@@ -1,15 +1,9 @@
-//! Service entrypoint.
-//!
-//! Load config (GW_CONFIG path, else the embedded default; with
-//! `storage.postgres_url` set the Postgres config store is the source of truth
-//! and the file only seeds it), build state with the configured backends,
-//! select the upstream transport (`GW_TRANSPORT`), spawn local background
-//! tasks and the config change feed, serve the views router with graceful
-//! shutdown (SIGINT/SIGTERM → drain).
-//!
-//! Accounts with a configured `endpoint` egress to real vendors; accounts
-//! without one are served by the in-process mock. `GW_TRANSPORT=mock` forces
-//! zero egress. `tracing` is local structured logging to stdout only.
+//! Service entrypoint: load config (GW_CONFIG path, else the embedded default;
+//! with `storage.postgres_url` the config store is the source of truth and the
+//! file only seeds it), build state, select the transport (`GW_TRANSPORT`),
+//! spawn background tasks and the config change feed, serve with graceful
+//! shutdown. Accounts with an `endpoint` egress to real vendors; the rest are
+//! served by the in-process mock; `GW_TRANSPORT=mock` forces zero egress.
 
 use std::env;
 use std::sync::Arc;
@@ -27,8 +21,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Reloads re-read the captured source; with storage.postgres_url the
-    // config store is the source of truth and the file only seeds it.
+    // reloads re-read this captured source
     let config_source = env::var("GW_CONFIG").ok();
     let read_source_text = {
         let src = config_source.clone();
@@ -121,8 +114,7 @@ async fn main() -> anyhow::Result<()> {
         app_state = app_state.with_config_store(store.clone());
     }
 
-    // fleet batch drain: on a distributed store any instance claims and runs
-    // submitted batches (local stores execute on the submitting instance)
+    // fleet batch drain: on a distributed store any instance claims submitted batches
     if distributed_batches {
         let offline = app_state.offline.clone();
         tokio::spawn(async move {

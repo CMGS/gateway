@@ -135,12 +135,10 @@ impl Base {
         parse_json_reply(reply)
     }
 
-    /// Bespoke-engine POST (no buffering): merges `param.raw` passthrough
-    /// fields into the body (typed fields stay authoritative via `or_insert`)
-    /// and ensures a JSON content-type, so every field the caller set reaches
-    /// the vendor — matching the openai/claude engines. For the AWS engines
-    /// content-type is currently an unsigned header — signing it into SigV4 is
-    /// a live-integration refinement.
+    /// Bespoke-engine POST (no buffering): merges `param.raw` passthrough into
+    /// the body (typed fields stay authoritative) and ensures a JSON
+    /// content-type, so every field the caller set reaches the vendor. For the
+    /// AWS engines content-type is currently an unsigned header.
     pub async fn post_raw(
         &self,
         url: &str,

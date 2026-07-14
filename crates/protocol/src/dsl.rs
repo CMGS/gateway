@@ -1,12 +1,8 @@
-//! Declarative response-transform DSL.
-//!
-//! Converts one vendor's response shape into another (e.g. OpenAI → Anthropic)
-//! by interpreting a JSON `MappingSpec` of rules, rather than hardcoding each
-//! conversion. Supported ops: `copy`, `default`, `map_enum`, `copy_if` (field
-//! remapping + enum translation: finish_reason ↔ stop_reason, usage token
-//! renames) and `collect` (wrapping message content/tool_calls into typed
-//! content blocks, with `$value` templates, `#` array-wildcard sources, and
-//! `parse_json` — this is the OpenAI→Anthropic content conversion).
+//! Declarative response-transform DSL: converts one vendor's response shape
+//! into another (e.g. OpenAI → Anthropic) by interpreting a JSON `MappingSpec`
+//! instead of hardcoding each conversion. Ops: `copy`, `default`, `map_enum`,
+//! `copy_if`, and `collect` (wrapping content/tool_calls into typed blocks,
+//! with `$value` templates, `#` array-wildcards, and `parse_json`).
 
 use std::collections::HashMap;
 

@@ -1,8 +1,5 @@
-//! `GatewayRequest` — the unified engine request.
-//!
-//! Several fields reference large internal domain types (`Account`,
-//! `UserConf`, `ProductConf`, `ModelParamInterface`, …), represented by the
-//! types in [`domain`].
+//! `GatewayRequest` — the unified engine request — and the [`domain`] types it
+//! references.
 
 use std::collections::HashMap;
 
@@ -11,18 +8,13 @@ pub use domain::*;
 /// Everything an engine needs to serve one request.
 #[derive(Debug, Default, Clone)]
 pub struct GatewayRequest {
-    /// upstream account serving the request.
     pub account: Option<Account>,
-    /// history + prompt (v1).
     pub message: Vec<ChatMsg>,
-    /// pressure/load test flag (v1).
     pub pressure: bool,
-    /// streaming output (v1).
     pub stream: bool,
     pub user_config: UserConf,
     pub product_config: ProductConf,
     pub origin_product_config: Option<ProductConf>,
-    /// v2 params — the model-type-bearing payload.
     pub model_param_v2: Option<ModelParamV2>,
     pub ak: String,
     /// proxy region (sg/us).
@@ -30,12 +22,10 @@ pub struct GatewayRequest {
     pub storage_info_collect: StorageInfoCollect,
     pub is_online: bool,
     pub extra_params: ReqExtraParam,
-    /// metrics tags to attach.
     pub metrics_map: HashMap<String, String>,
     pub realtime_params: RealtimeParam,
-    /// When set, a streaming-capable engine forwards chunks here as they
-    /// arrive from the vendor instead of buffering; the bounded channel is
-    /// the backpressure seam.
+    /// When set, a streaming-capable engine forwards chunks here as they arrive
+    /// instead of buffering; the bounded channel is the backpressure seam.
     pub stream_tx: Option<tokio::sync::mpsc::Sender<crate::StreamChunk>>,
 }
 
@@ -61,19 +51,16 @@ pub mod domain {
 
     use crate::params::TypedParams;
 
-    /// Typed, dispatch-aware payload for a model call.
-    /// `protocol` is the dispatch key; `model_name` is the public model name the
-    /// caller sent (e.g. "gpt-4o") which config maps to a Protocol; `typed` holds
-    /// the family-typed params; vendor extras ride in `raw`.
+    /// Typed, dispatch-aware payload for a model call: `protocol` is the
+    /// dispatch key, `typed` the family params, vendor extras ride in `raw`.
     #[derive(Debug, Clone)]
     pub struct ModelParamV2 {
         pub protocol: gw_consts::Protocol,
-        /// public model name from the caller, pre-mapping. Empty if caller sent a wire type directly.
+        /// public model name from the caller; empty if a wire type was sent directly.
         pub model_name: String,
         /// original caller model when a quota fallback swapped `model_name`;
         /// the response echoes it and the ledger records both.
         pub fallback_from: Option<String>,
-        /// family-typed params (chat/embeddings/image/audio/video/search).
         pub typed: Option<TypedParams>,
         /// untyped vendor extras, passed through verbatim.
         pub raw: Value,
@@ -114,14 +101,13 @@ pub mod domain {
         }
     }
 
-    /// One chat turn.
-    /// `content` is the flattened text; multimodal parts and tool-call fields ride
-    /// alongside so engines can rebuild the vendor wire form losslessly.
+    /// One chat turn: `content` is the flattened text; multimodal parts and
+    /// tool-call fields ride alongside for lossless vendor rebuild.
     #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
     pub struct ChatMsg {
         pub role: String,
         pub content: String,
-        /// original multimodal parts array ([{type:"text"|"image_url",...}]); takes priority over content when present.
+        /// original multimodal parts array; takes priority over `content` when present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub parts: Option<Value>,
         /// tool_calls carried by an assistant message (OpenAI wire shape).
@@ -143,8 +129,6 @@ pub mod domain {
     }
 
     /// An upstream account/credential slot.
-    /// A named slot with provider tag, priority, tier (ptu/paygo), the model types
-    /// it serves, and — for live endpoints — endpoint + credential env vars.
     #[derive(Debug, Default, Clone)]
     pub struct Account {
         pub name: String,
@@ -152,21 +136,15 @@ pub mod domain {
         pub priority: i32,
         /// consts::account_tier::{PTU, PAYGO}; empty = paygo.
         pub tier: String,
-        /// upstream base URL. Empty → engines use their `mock://…` sentinel (default,
-        /// routed by MockTransport). A real URL → engines route there over
-        /// HttpTransport — going live is a pure config change.
+        /// upstream base URL; empty = the engine's `mock://…` sentinel. A real
+        /// URL routes over HttpTransport — going live is a pure config change.
         pub endpoint: String,
-        /// name of the env var holding this account's API key (empty → mock creds).
-        /// The real secret is read from the environment at request time — it never
-        /// lives in config files.
-        /// For AWS accounts this holds the *access key* env var; the paired secret
-        /// key env var is `secret_key_env`.
+        /// env var holding this account's API key (empty = mock creds), read at
+        /// request time; for AWS it holds the access key id (see `secret_key_env`).
         pub api_key_env: String,
-        /// AWS SigV4 accounts only: env var holding the secret access key (paired
-        /// with `api_key_env` = the access key id). Empty for non-AWS vendors.
+        /// AWS SigV4 only: env var holding the secret access key.
         pub secret_key_env: String,
-        /// What this account's vendor charges us per 1k tokens (micros);
-        /// zero = untracked. Feeds the ledger's vendor-cost column.
+        /// vendor cost per 1k tokens (micros); zero = untracked.
         pub cost_input_price_per_1k_micros: i64,
         pub cost_output_price_per_1k_micros: i64,
         pub protocols: Vec<gw_consts::Protocol>,
@@ -187,9 +165,8 @@ pub mod domain {
             }
         }
 
-        /// The account's API key, read from its configured env var at call time.
-        /// `None` → callers use the `"mock"` placeholder credential. The secret is
-        /// never stored on the struct, never logged, never handled by the agent.
+        /// The account's API key, read from its env var at call time; `None` =
+        /// use the mock placeholder. Never stored on the struct, never logged.
         pub fn api_key(&self) -> Option<String> {
             if self.api_key_env.is_empty() {
                 return None;
@@ -197,9 +174,8 @@ pub mod domain {
             std::env::var(&self.api_key_env).ok()
         }
 
-        /// AWS SigV4 credentials: `(access_key_id, secret_access_key)` read from the
-        /// account's two env vars at call time. `None` unless BOTH resolve — callers
-        /// then fall back to the inert mock credentials. Never stored or logged.
+        /// AWS SigV4 credentials read from the two env vars at call time; `None`
+        /// unless both resolve. Never stored or logged.
         pub fn aws_credentials(&self) -> Option<(String, String)> {
             if self.api_key_env.is_empty() || self.secret_key_env.is_empty() {
                 return None;
@@ -210,8 +186,7 @@ pub mod domain {
         }
     }
 
-    /// User configuration. Core field subset; unmodeled fields pass through
-    /// via `extra`.
+    /// User configuration; unmodeled fields pass through via `extra`.
     #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
     pub struct UserConf {
         #[serde(default)]
@@ -235,13 +210,11 @@ pub mod domain {
         pub key_type: String,
         #[serde(default)]
         pub allow_region_downgrade: bool,
-        /// unmodeled fields pass through.
         #[serde(default)]
         pub extra: Value,
     }
 
-    /// Product configuration. Core field subset; long-tail fields ride in
-    /// `extra`.
+    /// Product configuration; long-tail fields ride in `extra`.
     #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
     pub struct ProductConf {
         #[serde(default)]
@@ -267,8 +240,7 @@ pub mod domain {
         pub extra: Value,
     }
 
-    /// Side-channel params for vendor-specific extras (e.g. a vendor-specific
-    /// account); core field subset, rest via `extra`.
+    /// Side-channel params for vendor-specific extras; rest via `extra`.
     #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
     pub struct ReqExtraParam {
         #[serde(default)]

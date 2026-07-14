@@ -133,10 +133,8 @@ impl AkAuth {
     }
 
     /// Insert or replace a key. Config ownership is sticky: an admin write to a
-    /// config-declared key updates its values but keeps it `Config`, so removing
-    /// it from the config file and reloading still revokes it. Config can claim
-    /// an admin key (when the file starts declaring it). Atomic via the entry
-    /// lock so the source can't flip under a concurrent write.
+    /// config-declared key keeps it `Config` (so a reload can still revoke it),
+    /// while a config write claims an admin key. Atomic via the entry lock.
     pub fn put(&self, info: AkInfo, source: KeySource) {
         use dashmap::mapref::entry::Entry;
         match self.keys.entry(info.ak.clone()) {
@@ -191,9 +189,8 @@ impl AkAuth {
     }
 
     /// Re-apply the config file's key set, leaving admin-created keys untouched.
-    /// Surviving config keys are upserted in place (never briefly absent, so a
-    /// concurrent `authenticate` can't spuriously 401 during a reload); only
-    /// config keys dropped from the new config are removed.
+    /// Surviving keys are upserted in place (never briefly absent) so a
+    /// concurrent `authenticate` can't spuriously 401 mid-reload.
     pub fn reload_config_keys(&self, keys: &[gw_config::AkConf]) {
         let wanted: std::collections::HashSet<&str> = keys.iter().map(|k| k.ak.as_str()).collect();
         self.keys
@@ -251,10 +248,9 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Take one permit. qps >= 1: replenish/burst = round(qps); 0 < qps < 1:
-    /// one permit per 1/qps seconds (burst 1); qps <= 0: always denied.
-    /// A bucket whose stored qps differs is rebuilt, so an admin PATCH or a
-    /// config reload takes effect immediately (a rebuilt bucket starts full).
+    /// Take one permit. qps >= 1: replenish/burst = round(qps); 0 < qps < 1: one
+    /// permit per 1/qps seconds (burst 1); qps <= 0: always denied. A bucket whose
+    /// stored qps differs is rebuilt (starts full) so limit changes apply at once.
     pub fn allow(&self, key: &str, qps: f64) -> bool {
         if qps <= 0.0 {
             return false;
@@ -291,8 +287,7 @@ fn new_bucket(qps: f64) -> Arc<governor::DefaultDirectRateLimiter> {
     Arc::new(governor::RateLimiter::direct(quota))
 }
 
-/// Daily token quota accounting per AK; the daily reset is driven by
-/// gw-task's periodic job calling `reset_all`.
+/// Daily token quota accounting per AK; reset daily by the gw-task job.
 #[derive(Debug, Default)]
 pub struct QuotaStore {
     used: DashMap<String, i64>,
@@ -308,8 +303,7 @@ impl QuotaStore {
         self.used(ak) < limit
     }
 
-    /// Post-consume the actual token usage. Saturating: a hostile upstream can
-    /// drive `tokens` to i64::MAX (usage is floored, not capped).
+    /// Post-consume actual usage; saturating against a hostile i64::MAX count.
     pub fn consume(&self, ak: &str, tokens: i64) {
         let mut e = self.used.entry(ak.to_owned()).or_insert(0);
         *e = e.saturating_add(tokens);
@@ -332,8 +326,7 @@ impl QuotaStore {
         *e = e.saturating_add(delta).max(0);
     }
 
-    /// Daily reset. Driven by the gw-task background job as an in-process
-    /// periodic task.
+    /// Daily reset.
     pub fn reset_all(&self) {
         self.used.clear();
     }
@@ -348,8 +341,7 @@ pub struct AccountPool {
 }
 
 impl AccountPool {
-    /// Build the pool from config accounts (protocols validated at config load,
-    /// so the unwrap-free filter drops nothing).
+    /// Build the pool from config accounts (protocols validated at config load).
     pub fn from_config(cfg: &GatewayConfig) -> Self {
         let accounts = cfg
             .accounts
@@ -381,8 +373,7 @@ impl AccountPool {
         self.select_excluding(p, provider, &[])
     }
 
-    /// Same as `select_excluding`, plus a health filter: accounts in cooldown are
-    /// excluded.
+    /// [`Self::select_excluding`] plus a health filter: cooldown accounts are excluded.
     pub async fn select_healthy(
         &self,
         p: Protocol,
@@ -408,11 +399,9 @@ impl AccountPool {
         self.select_excluding(p, provider, &all_excluded)
     }
 
-    /// PTU decision + failover exclusion: PTU (provisioned throughput)
-    /// accounts are preferred over paygo; accounts in `excluded` (failed accounts
-    /// from a failover) are skipped. Within a tier, pick by priority then round-robin.
-    /// A model bound to a `provider` only uses that provider's accounts;
-    /// unbound models draw from every account serving the protocol.
+    /// PTU accounts are preferred over paygo; `excluded` (failed-over) accounts
+    /// are skipped; within a tier, pick by priority then round-robin. A model
+    /// bound to a `provider` only uses that provider's accounts.
     pub fn select_excluding(
         &self,
         p: Protocol,
@@ -510,9 +499,8 @@ impl TokenWindow {
         e.1 = e.1.saturating_add(tokens);
     }
 
-    /// The current window's entry, rotated if elapsed. Rotation and the
-    /// caller's mutation happen under one entry guard so a concurrent rollover
-    /// cannot land tokens in the wrong window.
+    /// The current window's entry, rotated if elapsed — under one entry guard so
+    /// a concurrent rollover can't land tokens in the wrong window.
     fn slot(
         &self,
         key: &str,
@@ -589,9 +577,8 @@ impl AccountHealth {
     }
 }
 
-/// Request-level response cache: per-entry TTL, keyed by the request hash.
-/// In-process by default; Redis when `storage.shared_cache` is set, so a hit
-/// on one instance serves the whole fleet.
+/// Request-level response cache: per-entry TTL, keyed by the request hash;
+/// in-process by default, Redis when `storage.shared_cache` is set.
 #[async_trait::async_trait]
 pub trait ResponseCache: Send + Sync + std::fmt::Debug {
     async fn get(&self, key: &str) -> Option<gw_models::GatewayResponse>;
@@ -711,16 +698,13 @@ impl moka::Expiry<String, (gw_models::GatewayResponse, Duration)> for PerEntryTt
 /// live reload; the other four are runtime seams preserved across reloads.
 #[derive(Debug)]
 pub struct GatewayState {
-    /// Live key table — a preserved seam (admin key edits survive a reload).
-    /// In-memory by default; Postgres for a fleet-shared key set.
+    /// Live key table (admin edits survive a reload); Postgres for fleet-shared.
     pub auth: Arc<dyn KeyStore>,
     pub pool: AccountPool,
     pub governance: Arc<dyn Governance>,
-    /// Durable records (ledger/files/batches): memory by default, sqlite when
-    /// `storage.sqlite_path` is configured (swapped in by the server at boot).
+    /// Durable records (ledger/files/batches); sqlite/postgres when configured.
     pub store: Arc<dyn Store>,
-    /// Account health (cooldown/recovery): in-process by default, Redis for
-    /// fleet-wide cooldown.
+    /// Account health (cooldown/recovery); Redis for fleet-wide cooldown.
     pub health: Arc<dyn HealthStore>,
     /// Request-level response cache: in-process by default, Redis when shared.
     pub cache: Arc<dyn ResponseCache>,
@@ -752,10 +736,9 @@ impl GatewayState {
         }
     }
 
-    /// Build state with the backends the config selects: Postgres becomes the
-    /// key table + durable store (and aborts on failure — it is the source of
-    /// truth when configured); Redis backs governance + account health
-    /// (fail-soft: a connect error logs and stays in-process).
+    /// Build state with the backends the config selects: Postgres (key table +
+    /// durable store) aborts on failure — it is the source of truth; Redis
+    /// (governance/health/cache) fails soft and stays in-process.
     pub async fn build(cfg: &GatewayConfig) -> gw_models::GResult<Self> {
         let mut state = GatewayState {
             pool: AccountPool::from_config(cfg),
@@ -818,11 +801,8 @@ impl GatewayState {
         Ok(state)
     }
 
-    /// Rebuild the config-derived account pool from `cfg` while preserving the
-    /// runtime seams — key table, governance, store, account health, and the
-    /// response cache — from `prev`. The key table's config-sourced entries are
-    /// re-applied from the new config; admin-created keys are kept. In-flight
-    /// requests keep running on their own snapshot; new requests see this one.
+    /// Rebuild the config-derived pool and re-apply config keys while preserving
+    /// the runtime seams from `prev`; in-flight requests keep their own snapshot.
     /// Fails (leaving `prev` live) when a networked key table can't be updated.
     pub async fn reload_from(cfg: &GatewayConfig, prev: &GatewayState) -> gw_models::GResult<Self> {
         prev.auth.reload_config_keys(&cfg.access_keys).await?;
@@ -846,14 +826,12 @@ pub struct Snapshot {
 }
 
 /// Lock-free live configuration: `load()` on the hot path is a pointer read;
-/// `reload()` atomically swaps in a fresh snapshot (config-derived state
-/// rebuilt, seams preserved).
+/// `reload()` atomically swaps in a fresh snapshot.
 #[derive(Clone)]
 pub struct SharedConfig {
     inner: Arc<arc_swap::ArcSwap<Snapshot>>,
-    /// Serializes reloads: two divergent concurrent reloads (SIGHUP racing the
-    /// config feed) would otherwise interleave key-table writes and could pair
-    /// one reload's cfg pointer with the other's key set.
+    /// Serializes reloads: two concurrent reloads could otherwise pair one
+    /// reload's cfg pointer with the other's key set.
     reload_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -875,9 +853,8 @@ impl SharedConfig {
     pub async fn reload(&self, cfg: GatewayConfig) -> gw_models::GResult<()> {
         let _serialized = self.reload_lock.lock().await;
         let prev = self.inner.load();
-        // cfg.generation is a stable hash of the new document (set at parse), so
-        // the preserved response cache can't serve a pre-reload entry for a model
-        // this reload may have remapped, and every replica agrees on it.
+        // cfg.generation (a stable hash set at parse) keys the preserved cache so
+        // it can't serve a pre-reload entry across a model remap
         let state = GatewayState::reload_from(&cfg, &prev.state).await?;
         self.inner.store(Arc::new(Snapshot {
             cfg: Arc::new(cfg),
@@ -1066,7 +1043,6 @@ mod tests {
         );
     }
 
-    /// Set GW_TEST_REDIS_URL to run this.
     #[tokio::test]
     async fn redis_response_cache_roundtrip() {
         let Ok(url) = std::env::var("GW_TEST_REDIS_URL") else {

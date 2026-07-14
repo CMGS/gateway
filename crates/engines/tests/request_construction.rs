@@ -20,7 +20,6 @@ use gw_models::{
 };
 use serde_json::Value;
 
-/// Captures the request the engine built, replies with a minimal valid body.
 #[derive(Debug, Default)]
 struct RecordingTransport {
     seen: Mutex<Option<UpstreamRequest>>,

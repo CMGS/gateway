@@ -1,9 +1,6 @@
-//! Rate/quota governance behind a trait so a single-node deployment uses
-//! in-process counters and a multi-replica deployment shares state in Redis.
-//!
-//! [`MemoryGovernance`] is the default; [`RedisGovernance`] keeps the same
-//! semantics using atomic server-side operations (INCR + EXPIRE windows,
-//! token-bucket via a Lua script).
+//! Rate/quota governance behind a trait: [`MemoryGovernance`] (default,
+//! in-process counters) and [`RedisGovernance`] (multi-replica, same semantics
+//! via atomic server-side ops — INCR + EXPIRE windows, token-bucket Lua).
 
 use std::time::Duration;
 
@@ -14,17 +11,14 @@ use crate::{QuotaStore, RateLimiter, TokenWindow, WindowCounter};
 /// Day-keyed quota buckets linger at most this long before self-expiring.
 const QUOTA_TTL_MS: i64 = 2 * 24 * 60 * 60 * 1000;
 
-/// The Redis daily-quota key for `key` on the UTC day of `at_epoch_secs` (unix
-/// epoch is UTC-midnight aligned, so `/ 86400` increments exactly at midnight).
-/// Rollover is implicit and identical across replicas — no reset job, no shared-
-/// keyspace wipe. Callers pass the admission time so a reserve and its settle
-/// hit the same day even across a midnight boundary.
+/// The Redis daily-quota key for `key` on the UTC day of `at_epoch_secs`;
+/// rollover is implicit and identical across replicas. Callers pass the
+/// admission time so a reserve and its settle hit the same day.
 fn quota_key_at(key: &str, at_epoch_secs: i64) -> String {
     format!("gw:quota:{}:{key}", at_epoch_secs / 86_400)
 }
 
-/// The day bucket for "now" — used by the single-shot reads/writes that aren't
-/// part of a reserve/settle pair.
+/// The day bucket for "now" — for single-shot ops outside a reserve/settle pair.
 fn quota_key(key: &str) -> String {
     quota_key_at(key, crate::epoch_secs())
 }
@@ -37,11 +31,10 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
 
     /// Daily quota: is `ak` under `limit`?
     async fn quota_check(&self, ak: &str, limit: i64) -> bool;
-    /// Admission with reservation: admit while spent-before < `limit`, and
-    /// atomically add `amount` so concurrent in-flight requests count against
-    /// the budget. False = rejected (nothing reserved). `at_epoch_secs` pins the
-    /// day bucket so a settle lands on the same day this reserve did, even if the
-    /// request straddles UTC midnight.
+    /// Admission with reservation: admit while spent-before < `limit`, atomically
+    /// adding `amount` so in-flight requests count; false = nothing reserved.
+    /// `at_epoch_secs` pins the day bucket so the paired settle lands on the
+    /// same day across midnight.
     async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, at_epoch_secs: i64) -> bool;
     /// Apply the settle delta (actual - reserved; negative refunds) to the day
     /// bucket the paired reserve used (`at_epoch_secs`).
@@ -166,8 +159,7 @@ impl RedisGovernance {
         {
             Ok(v) => v,
             Err(e) => {
-                // fail open, but loudly — a persistent outage otherwise silently
-                // disables limits with no signal.
+                // fail open, but loudly — a persistent outage would otherwise silently disable limits
                 tracing::warn!(error = %e, key, "redis governance unavailable; limit skipped");
                 0
             }
@@ -181,8 +173,7 @@ impl Governance for RedisGovernance {
         if qps <= 0.0 {
             return false;
         }
-        // qps >= 1: N permits per 1s. qps < 1: 1 permit per 1/qps seconds,
-        // matching the in-memory backend.
+        // qps >= 1: N permits per 1s; qps < 1: 1 permit per 1/qps s (matches in-memory)
         let (limit, window) = if qps < 1.0 {
             (1, Duration::from_secs_f64(1.0 / qps))
         } else {
@@ -209,9 +200,8 @@ impl Governance for RedisGovernance {
     }
     async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, at: i64) -> bool {
         let mut conn = self.conn.clone();
-        // admit while spent-before < limit; the reservation itself may cross
-        // the limit (same one-request overshoot the settle corrects). The
-        // date-stamped key self-expires, so arm a TTL on first use.
+        // admit while spent-before < limit (the reservation may overshoot once;
+        // the settle corrects); the date-stamped key self-expires via its TTL
         let script = redis::Script::new(
             "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
              if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
@@ -240,9 +230,8 @@ impl Governance for RedisGovernance {
         if delta == 0 {
             return;
         }
-        // floor at 0 atomically, on the SAME day bucket the reserve used (`at`),
-        // so a request that straddles midnight doesn't apply its negative delta
-        // to the next day's counter.
+        // floor at 0 atomically on the SAME day bucket the reserve used, so a
+        // request straddling midnight doesn't hit the next day's counter
         settle_floored(
             &self.conn,
             &quota_key_at(key, at),
@@ -260,10 +249,8 @@ impl Governance for RedisGovernance {
         .await;
     }
     async fn quota_reset_all(&self) {
-        // No-op: quota keys are date-stamped by UTC day (see `quota_key`), so the
-        // daily counter rolls over automatically at midnight for every replica.
-        // The old per-instance sweep wiped the whole shared keyspace, so staggered
-        // instances reset each other's counters multiple times a day.
+        // no-op: quota keys are date-stamped by UTC day, so rollover is automatic;
+        // a per-instance sweep would wipe the shared keyspace repeatedly
     }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.incr_window(&format!("gw:qpm:{key}"), 1, window).await <= limit
@@ -323,10 +310,9 @@ impl Governance for RedisGovernance {
     }
 }
 
-/// Apply a settle delta and floor the counter at 0 in one atomic step, so a
-/// key reset or window rollover between reserve and settle can't plant a
-/// negative value that over-admits. Preserves an existing TTL, or arms one
-/// when `window` is given and the key was absent.
+/// Apply a settle delta and floor at 0 in one atomic step, so a reset or window
+/// rollover between reserve and settle can't plant a negative value that
+/// over-admits. Preserves an existing TTL, arming one when `window` is given.
 async fn settle_floored(
     conn: &redis::aio::ConnectionManager,
     key: &str,
@@ -358,7 +344,6 @@ async fn settle_floored(
 mod tests {
     use super::*;
 
-    /// Set GW_TEST_REDIS_URL (e.g. redis://127.0.0.1:16379) to run this.
     #[tokio::test]
     async fn redis_governance_enforces_limits() {
         let Ok(url) = std::env::var("GW_TEST_REDIS_URL") else {
@@ -457,11 +442,7 @@ mod tests {
 
     #[test]
     fn quota_key_pins_the_admission_day() {
-        // the last second of a UTC day and the first of the next map to distinct
-        // buckets — so a settle replaying the reserve's timestamp lands on the
-        // reserve's day even after "now" has rolled past midnight
         assert_ne!(quota_key_at("k", 86_400 - 1), quota_key_at("k", 86_400));
-        // any two timestamps within one UTC day share a bucket
         assert_eq!(quota_key_at("k", 60), quota_key_at("k", 86_400 - 1));
     }
 }

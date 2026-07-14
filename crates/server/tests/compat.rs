@@ -1,10 +1,6 @@
-//! Protocol-compatibility diff: checks wire-format compatibility with the
-//! upstream OpenAI and Anthropic APIs.
-//!
-//! Canonical wire samples (OpenAI chat.completion / chunk / embeddings,
-//! Anthropic message) are (a) deserialized into our protocol structs to prove
-//! field compatibility on the way in, and (b) our gateway's live responses are
-//! diffed against the canonical key sets on the way out. Runs fully offline.
+//! Protocol-compatibility diff against the upstream OpenAI/Anthropic wire:
+//! canonical samples deserialize into our structs (inbound) and our live
+//! responses diff against the canonical key sets (outbound). Fully offline.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -36,7 +32,6 @@ fn keys(v: &Value) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// Canonical OpenAI chat.completion body (matches the unified surface's output field set).
 const OPENAI_CHAT_CANONICAL: &str = r#"{
   "id": "chatcmpl-abc123",
   "object": "chat.completion",
@@ -50,7 +45,6 @@ const OPENAI_CHAT_CANONICAL: &str = r#"{
   "usage": {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 21}
 }"#;
 
-/// Canonical Anthropic message body (matches the unified Anthropic-compatible surface's output field set).
 const ANTHROPIC_MSG_CANONICAL: &str = r#"{
   "id": "msg_01XFDUDYJgAACzvnptvVoYEL",
   "type": "message",

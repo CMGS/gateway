@@ -1,8 +1,5 @@
-//! The core engine abstraction.
-//!
-//! An engine call conceptually returns a `(response, http_code, block, error)`
-//! tuple. Rust folds the `(response, http_code, block)` triple into
-//! `EngineOutcome` and the trailing `error` into the `Result`.
+//! The core engine abstraction: an engine call returns `EngineOutcome`
+//! (response, http_code, block) with the error folded into the `Result`.
 
 use gw_consts::ErrCode;
 use gw_models::{Block, GResult, GatewayError, GatewayResponse, Recorder};
@@ -17,10 +14,9 @@ pub fn tok(v: &Value) -> i64 {
     v.as_i64().unwrap_or(0).max(0)
 }
 
-/// Detect a vendor error envelope and turn it into a `GatewayError`.
-/// Covers OpenAI-style `{"error":{message,type,code}}` and MiniMax-style
-/// `{"type":"error","error":{http_code,message}}`, normalized from each engine's
-/// error branch. The HTTP status is the real upstream status if it's already an error, else the
+/// Detect a vendor error envelope and turn it into a `GatewayError`. Covers
+/// OpenAI-style `{"error":{…}}` and MiniMax-style `{"type":"error",…}`. The
+/// HTTP status is the real upstream status if already an error, else the
 /// vendor's `http_code`/`code` if it looks like one, else 502.
 pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
     let err = v.get("error").filter(|e| e.is_object())?;
@@ -50,9 +46,7 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
 #[derive(Debug, Default)]
 pub struct EngineOutcome {
     pub response: GatewayResponse,
-    /// upstream HTTP status.
     pub http_code: u16,
-    /// content-safety verdict.
     pub block: Block,
     /// decoded stream chunks when the request was streaming and no live
     /// channel was attached (chunks were already forwarded otherwise).
@@ -79,12 +73,9 @@ impl EngineOutcome {
     }
 }
 
-/// One engine per upstream model method.
-///
-/// An engine's job is strictly request → upstream → parse:
-/// build the vendor request, send it, parse the raw response into `GatewayResponse`.
-/// Cross-cutting work (usage normalization, error-code mapping, quota, billing,
-/// retries) belongs to DAG nodes, not here.
+/// One engine per upstream model method. An engine's job is strictly
+/// request → upstream → parse; cross-cutting work (usage normalization,
+/// error mapping, quota, billing, retries) belongs to DAG nodes.
 #[async_trait::async_trait]
 pub trait ModelEngine: Send + Sync {
     /// Perform the upstream call.

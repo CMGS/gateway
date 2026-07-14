@@ -1,10 +1,8 @@
-//! Transport isolation — the egress seam.
-//!
-//! Engines never hold an HTTP client. They build an [`UpstreamRequest`] and hand
-//! it to a [`Transport`]. [`MockTransport`] fabricates deterministic vendor
-//! responses per protocol family (the test default); the real `HttpTransport`
-//! and the scheme-routing `DispatchTransport` (the server default) live in
-//! `http_transport`.
+//! Transport isolation — the egress seam. Engines never hold an HTTP client:
+//! they build an [`UpstreamRequest`] and hand it to a [`Transport`].
+//! [`MockTransport`] fabricates deterministic vendor responses (the test
+//! default); `HttpTransport` and the scheme-routing `DispatchTransport` (the
+//! server default) live in `http_transport`.
 
 use std::sync::Arc;
 
@@ -88,12 +86,10 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
 
 pub type SharedTransport = Arc<dyn Transport>;
 
-/// Deterministic fake vendor. Parses the engine-built request body (so request
-/// construction is exercised too) and answers in the vendor's wire shape.
-/// Routing is by the URL path segment each family engine uses.
-///
-/// Failure simulation: an account whose name contains `"down"` gets a 503
-/// upstream error — the DAG failover node's trigger.
+/// Deterministic fake vendor: parses the engine-built request body (so request
+/// construction is exercised too) and answers in the vendor's wire shape,
+/// routed by URL path segment. An account whose name contains "down" gets a
+/// 503 — the DAG failover trigger.
 #[derive(Debug, Default)]
 pub struct MockTransport;
 
@@ -519,9 +515,8 @@ impl MockTransport {
         }))
     }
 
-    /// OpenAI Responses API reply:
-    /// `output` contains a message item whose content is output_text; usage uses
-    /// input_tokens/output_tokens (Responses dialect).
+    /// OpenAI Responses API reply: `output` holds a message item with
+    /// output_text content; usage uses the Responses input/output dialect.
     fn responses_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "responses")?;
         // `input` may be a plain string or an array of input items.
@@ -591,8 +586,7 @@ impl Transport for MockTransport {
                 format!("mock upstream unavailable for account {}", req.account),
             ));
         }
-        // vendor business-error simulation: account name containing "erroring" → 200 body with
-        // an error envelope (tests that error-envelope detection propagates end-to-end to the client).
+        // name containing "erroring" → 200 body with an error envelope (propagation test)
         if req.account.contains("erroring") {
             return Self::ok_json(json!({
                 "error": {"code": "400", "type": "invalid_request_error",
@@ -628,8 +622,7 @@ impl Transport for MockTransport {
         } else if u.contains("/responses") {
             self.responses_reply(&req)
         } else if u.contains("/v1/completions") {
-            // note: `/v1/chat/completions` does NOT contain `/v1/completions`,
-            // so this matches only the legacy text-completions endpoint.
+            // `/v1/chat/completions` does NOT contain `/v1/completions` — legacy endpoint only
             self.completions_reply(&req)
         } else if u.contains("/passthrough") {
             self.passthrough_reply(&req)

@@ -99,8 +99,6 @@ pub async fn subscribe(url: &str) -> GResult<tokio::sync::mpsc::Receiver<i64>> {
 mod tests {
     use super::*;
 
-    /// Set GW_TEST_PG_URL (e.g. postgres://postgres:gwtest@127.0.0.1:15432/gw)
-    /// to run this.
     #[tokio::test]
     async fn publish_notifies_and_load_returns_latest() {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {

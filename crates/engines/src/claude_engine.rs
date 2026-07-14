@@ -1,9 +1,6 @@
-//! Anthropic-messages-protocol engine.
-//!
-//! Full messages surface: system, tools/tool_use, multimodal text blocks, and
-//! streaming (parses the standard anthropic SSE event sequence message_start →
-//! content_block_delta → message_delta → message_stop). Marks `is_messages_protocol`
-//! so the usage extractor applies the Anthropic field map.
+//! Anthropic-messages-protocol engine: system, tools/tool_use, multimodal text
+//! blocks, and streaming (the standard anthropic SSE event sequence). Marks
+//! `is_messages_protocol` so the usage extractor applies the Anthropic map.
 
 use gw_models::{GResult, GatewayError, GatewayResponse, Recorder, TypedParams};
 use serde_json::{Map, Value, json};
@@ -30,8 +27,7 @@ impl ClaudeEngine {
             } else {
                 "user"
             };
-            // preserve multimodal content blocks (image/text) when present; the
-            // OpenAI path already does this via `parts` — mirror it for anthropic.
+            // preserve multimodal content blocks, mirroring the OpenAI path's `parts`
             let content = match &m.parts {
                 Some(parts) => parts.clone(),
                 None => Value::String(m.content.clone()),
@@ -60,8 +56,7 @@ impl ClaudeEngine {
             if let Some(tc) = &p.tool_choice {
                 body.insert("tool_choice".into(), tc.clone());
             }
-            // Anthropic's field is `stop_sequences` (array), not OpenAI's `stop`.
-            // views puts the request's stop_sequences into p.stop → forward it here.
+            // Anthropic's field is `stop_sequences` (array), not OpenAI's `stop`
             if let Some(stop) = &p.stop {
                 body.insert("stop_sequences".into(), stop.clone());
             }
@@ -228,7 +223,6 @@ impl SseState {
         status: u16,
         resp: &mut GatewayResponse,
     ) -> GResult<Vec<StreamChunk>> {
-        // mid-stream error frame → surface it
         if let Some(err) = crate::engine::vendor_error(status, v) {
             return Err(err);
         }

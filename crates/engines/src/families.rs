@@ -1,11 +1,7 @@
-//! The non-chat protocol engines.
-//! One engine per Protocol variant (AudioEngine covers tts/stt/audio via AudioKind):
-//!   Vertex generateContent / Embeddings / Image / Audio(TTS·STT·other) /
-//!   Video(async task) / Search / Passthrough(register+misc).
-//! Each engine only does "build request → Transport → parse response" — nothing else
-//! crosses that boundary.
-//! The mock protocol flags byte-level vendor differences as deferred to a later
-//! fidelity pass.
+//! The non-chat protocol engines, one per Protocol variant. Each engine only
+//! does "build request → Transport → parse response" — nothing else crosses
+//! that boundary. The mock protocol flags byte-level vendor differences as
+//! deferred to a later fidelity pass.
 
 use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse, Recorder, TypedParams};
 use serde_json::{Value, json};
@@ -15,16 +11,10 @@ use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::sse::SseDecoder;
 use crate::transport::{SharedTransport, UpstreamBody};
 
-/// Build Gemini `parts` from a unified message. Text → `{"text":…}`; data-URI
-/// images → `{"inlineData":{"mimeType","data"}}` (Gemini's inline-image shape).
-/// camelCase keys match this engine's existing `generationConfig`/`topP`
-/// choice; exact casing is pinned against a real fixture during live
-/// integration. Non-data image URLs can't be inlined offline (no fetch), so
-/// they're skipped rather than forwarded as an unusable OpenAI block.
-///
-/// Without this, multimodal requests to Gemini silently drop every image and
-/// only the flattened text reaches the vendor — the same class of bug as
-/// dropping images in the OpenAI/Claude engines.
+/// Build Gemini `parts` from a unified message: text → `{"text":…}`, data-URI
+/// images → `{"inlineData":…}`. Non-data image URLs can't be inlined offline
+/// (no fetch), so they're skipped rather than forwarded as an unusable OpenAI
+/// block; without this, multimodal requests silently drop every image.
 fn gemini_parts(m: &gw_models::ChatMsg) -> Vec<Value> {
     if let Some(Value::Array(parts)) = &m.parts {
         let mut out = Vec::new();
@@ -91,8 +81,7 @@ impl VertexEngine {
             })
             .collect();
         let mut body = json!({"contents": contents});
-        // sampling params → generationConfig (Gemini's shape); without this the
-        // params are silently dropped and Gemini uses defaults.
+        // sampling params → generationConfig — else Gemini silently uses defaults
         if let Some(TypedParams::Chat(p)) = self.base.param()?.typed.as_ref() {
             let mut gen_cfg = json!({});
             if let Some(t) = p.temperature {
@@ -111,9 +100,8 @@ impl VertexEngine {
         Ok(body)
     }
 
-    /// Native Gemini streaming: `:streamGenerateContent?alt=sse` frames are
-    /// decoded as they arrive and forwarded through `stream_tx` when the
-    /// request carries one (the shared live-pump contract).
+    /// Native Gemini streaming: `:streamGenerateContent?alt=sse` frames decoded
+    /// as they arrive and forwarded through `stream_tx` (the live-pump contract).
     async fn run_stream(&self) -> GResult<EngineOutcome> {
         let body = self.build_body()?;
         let url = format!(
@@ -207,8 +195,7 @@ impl ModelEngine for VertexEngine {
 }
 
 /// Apply one `streamGenerateContent` frame to the accumulating response;
-/// returns the chunks the frame yields. usageMetadata is cumulative — the
-/// last frame's counts win.
+/// returns the chunks it yields. usageMetadata is cumulative — last frame wins.
 fn vertex_apply_frame(
     v: &Value,
     status: u16,
@@ -241,12 +228,10 @@ fn vertex_apply_frame(
     Ok(chunks)
 }
 
-/// Fold a `usageMetadata` object into the response. Cumulative — the last
-/// frame's counts win. thinking models report `thoughtsTokenCount` outside
-/// `candidatesTokenCount` (live-verified on generativelanguage.googleapis.com:
-/// totalTokenCount == prompt + candidates + thoughts); OpenAI semantics fold
-/// reasoning into completion, so map thoughts → reasoning ⊆ completion or
-/// billing loses them.
+/// Fold a cumulative `usageMetadata` object into the response (last frame wins).
+/// Thinking models report `thoughtsTokenCount` outside `candidatesTokenCount`;
+/// OpenAI semantics fold reasoning into completion, so map thoughts → reasoning
+/// ⊆ completion or billing loses them.
 fn vertex_apply_usage(um: &Value, resp: &mut GatewayResponse) {
     if um.is_null() {
         return;
@@ -300,7 +285,6 @@ impl ModelEngine for EmbeddingsEngine {
             ));
         }
         let mut body = json!({"model": param.model_name, "input": input});
-        // send dimensions if the caller set it (else silently dropped).
         if let Some(TypedParams::Embeddings(p)) = &param.typed
             && let Some(d) = p.dimensions
         {
@@ -376,7 +360,6 @@ impl ModelEngine for ImageEngine {
             return Err(GatewayError::bad_request("image prompt must not be empty"));
         }
         let mut body = json!({"model": param.model_name, "prompt": prompt, "n": n, "size": size});
-        // `image` present → edit endpoint (source image + optional mask); else generate.
         let (path, is_edit) = if let Some(img) = image {
             body["image"] = json!(img);
             if let Some(m) = mask {
@@ -453,7 +436,6 @@ impl ModelEngine for AudioEngine {
                     return Err(GatewayError::bad_request("tts input must not be empty"));
                 }
                 let mut b = json!({"model": param.model_name, "input": input, "voice": voice});
-                // send response_format if set (mp3/wav/pcm) — else dropped.
                 if let Some(f) = format {
                     b["response_format"] = json!(f);
                 }
@@ -505,9 +487,8 @@ base_engine!(VideoEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for VideoEngine {
-    /// Merges the sora/veo/kling/runway/vidu/minimax_video engines
-    /// (async-task type; mock completes immediately — a real submit/poll flow
-    /// would be split per vendor).
+    /// Merges the sora/veo/kling/runway/vidu/minimax_video engines (async-task
+    /// type; mock completes immediately).
     async fn run(&self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let prompt = match &param.typed {
@@ -524,7 +505,6 @@ impl ModelEngine for VideoEngine {
             return Err(GatewayError::bad_request("video prompt must not be empty"));
         }
         let mut body = json!({"model": param.model_name, "prompt": prompt});
-        // send duration/resolution if set (else dropped).
         if let Some(TypedParams::Video(p)) = &param.typed {
             if let Some(d) = p.duration_seconds {
                 body["duration_seconds"] = json!(d);
@@ -654,10 +634,8 @@ base_engine!(CompletionsEngine);
 
 #[async_trait::async_trait]
 impl ModelEngine for CompletionsEngine {
-    /// The legacy openai text-completions endpoint.
-    /// Request `{model, prompt, ...}` (not chat's messages), response `{choices:[{text}]}`.
-    /// prompt = concatenation of message contents (the view puts prompt into a single
-    /// user message).
+    /// The legacy openai text-completions endpoint: `{model, prompt}` request
+    /// (not chat messages), `{choices:[{text}]}` response.
     async fn run(&self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let prompt: String = self
@@ -755,9 +733,8 @@ fn responses_output(v: &Value) -> (String, Vec<Value>) {
     (text, tool_calls)
 }
 
-/// Normalize a Responses `usage` object (input_tokens/output_tokens + details) to
-/// the openai usage shape so downstream billing reads it unchanged. Returns
-/// (input, output, raw_usage_json). Empty json when usage is absent.
+/// Normalize a Responses `usage` object to the openai shape so downstream
+/// billing reads it unchanged; returns (input, output, raw_usage_json).
 fn responses_usage(usage: &Value) -> (i64, i64, Vec<u8>) {
     if usage.is_null() {
         return (0, 0, vec![]);
@@ -863,9 +840,8 @@ impl ResponsesEngine {
         )
     }
 
-    /// Streaming Responses reply pumped live: `response.output_text.delta` frames
-    /// are forwarded through `stream_tx` as they arrive (real vendors), and
-    /// `response.completed` carries the final usage/status.
+    /// Streaming Responses pumped live: delta frames forwarded through
+    /// `stream_tx` as they arrive; `response.completed` carries final usage.
     async fn run_stream(&self) -> GResult<EngineOutcome> {
         let reply = self
             .base
@@ -1005,12 +981,8 @@ impl ResponsesEngine {
 
 #[async_trait::async_trait]
 impl ModelEngine for ResponsesEngine {
-    /// OpenAI Responses API (POST /v1/responses).
-    /// Native body passthrough (param.raw holds the client's Responses-shaped request)
-    /// + ensures the model field. Non-streaming parses output items + usage; streaming
-    /// parses output_text.delta + response.completed. usage dialect
-    /// (input_tokens/output_tokens) is normalized to the openai shape at the engine
-    /// boundary.
+    /// OpenAI Responses API (POST /v1/responses): native body passthrough with
+    /// the `model` field ensured; usage normalized to the openai shape.
     async fn run(&self) -> GResult<EngineOutcome> {
         if self.base.request.stream {
             return self.run_stream().await;

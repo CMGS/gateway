@@ -1,11 +1,7 @@
-//! OpenAI-protocol engine.
-//!
-//! Builds the vendor chat/completions request (full param passthrough: sampling
-//! params, tools, response_format, logprobs, multimodal content, tool result
-//! messages), sends it via [`Transport`], parses the JSON (or SSE) reply into
-//! `GatewayResponse` (including tool_calls) + stream chunks, and slices the raw
-//! usage subtree into `raw_usage_json` for the CommonUsage DAG node — the
-//! request→upstream→parse boundary this crate follows.
+//! OpenAI-protocol engine: builds the vendor chat request (full param
+//! passthrough), sends it via [`Transport`], parses the JSON or SSE reply into
+//! `GatewayResponse` + stream chunks, and slices the raw usage subtree into
+//! `raw_usage_json` for the CommonUsage DAG node.
 
 use gw_models::{GResult, GatewayError, GatewayResponse, Recorder, TypedParams};
 use serde_json::{Map, Value, json};
@@ -62,7 +58,6 @@ impl OpenAiEngine {
             body.insert("stream_options".into(), json!({"include_usage": true}));
         }
 
-        // typed family params → wire fields
         if let Some(TypedParams::Chat(p)) = &param.typed {
             macro_rules! put {
                 ($k:literal, $v:expr) => {
@@ -100,7 +95,6 @@ impl OpenAiEngine {
                 body.insert("messages".into(), Value::Array(msgs));
             }
         }
-        // untyped vendor extras ride along verbatim
         if let Value::Object(extra) = &param.raw {
             for (k, v) in extra {
                 body.entry(k.clone()).or_insert(v.clone());
@@ -187,7 +181,6 @@ fn apply_sse_event(
     resp: &mut GatewayResponse,
     full: &mut String,
 ) -> GResult<Vec<StreamChunk>> {
-    // mid-stream error frame → surface it
     if let Some(err) = crate::engine::vendor_error(status, v) {
         return Err(err);
     }

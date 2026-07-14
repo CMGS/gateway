@@ -1,9 +1,7 @@
-//! Bespoke vendor wire shapes — first batch of per-vendor fidelity.
-//!
-//! These four vendors do NOT speak the OpenAI protocol; each engine builds the
-//! vendor's real request shape and parses its real response shape (the mock
-//! answers in the same shapes). AWS engines compute a real SigV4 Authorization
-//! header (pure computation; inert against the mock, live over real HTTP).
+//! Bespoke vendor wire shapes: these vendors do NOT speak the OpenAI protocol;
+//! each engine builds the vendor's real request shape and parses its real
+//! response shape (the mock answers in the same shapes). AWS engines compute a
+//! real SigV4 Authorization header.
 
 use gw_models::{GResult, GatewayError, GatewayResponse, Recorder};
 use serde_json::{Value, json};
@@ -73,8 +71,7 @@ impl ModelEngine for ErnieEngine {
                 body["system"] = json!(s);
             }
         }
-        // Baidu auth is an access_token query param; real token from the account
-        // env var at go-live, else the inert "mock" sentinel.
+        // Baidu auth is an access_token query param; real token from the env var at go-live
         let url = format!(
             "{}/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/{model}?access_token={}",
             self.base.base_url("mock://aip.baidubce.com"),
@@ -191,8 +188,7 @@ impl ModelEngine for CohereEngine {
         }
         let uri = "/model/cohere.command-r/invoke".to_owned();
         // host + scheme from the account endpoint at go-live (else mock sentinel);
-        // SigV4 signs this same host so URL and signature agree. Real AWS keys need
-        // an Account access_key/secret_key pair (the remaining go-live item).
+        // SigV4 signs this same host so URL and signature agree
         let base = self
             .base
             .base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
@@ -264,8 +260,7 @@ impl ModelEngine for LlamaEngine {
             }
         }
         let uri = "/model/meta.llama3-70b-instruct-v1/invoke".to_owned();
-        // host/scheme from the account endpoint at go-live; SigV4 signs the same
-        // host. Real AWS keys need an Account key-pair (the remaining go-live item).
+        // host/scheme from the account endpoint; SigV4 signs the same host
         let base = self
             .base
             .base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
@@ -367,8 +362,7 @@ impl DashScopeEngine {
     }
 
     /// Native DashScope streaming: SSE frames decoded as they arrive and
-    /// forwarded through `stream_tx` when the request carries one (the shared
-    /// live-pump contract).
+    /// forwarded through `stream_tx` (the live-pump contract).
     async fn run_stream(&self) -> GResult<EngineOutcome> {
         let body = self.build_body(true)?;
         let reply = self

@@ -1,8 +1,5 @@
-//! `GatewayResponse` — the unified engine response.
-//!
-//! 64-bit integer fields use `i64`. `ModelResponseInterface` (ResponseV2) is
-//! held as `serde_json::Value`. The `EngineRecorder` and `RawUsageJSON`
-//! fields are runtime-only and excluded from (de)serialization.
+//! `GatewayResponse` — the unified engine response. Runtime-only fields
+//! (recorder, raw usage bytes) are excluded from (de)serialization.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,8 +14,7 @@ use crate::usage::CommonUsage;
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewayResponse {
     pub message: String,
-    /// model-requested tool calls (shape varies by protocol: openai tool_calls array /
-    /// anthropic tool_use blocks).
+    /// model-requested tool calls (openai tool_calls array / anthropic tool_use blocks).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<serde_json::Value>,
     pub embeddings: Vec<f32>,

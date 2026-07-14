@@ -1,11 +1,6 @@
-//! Real-socket wire verification for `HttpTransport` — a record/replay style test.
-//!
-//! Stands up a REAL axum HTTP server on a loopback port and drives `HttpTransport` (the
-//! reqwest client) against it — proving the transport works over a real TCP
-//! socket with real HTTP framing (JSON + SSE), not just that it compiles.
-//!
-//! Boundary (honest): this is a LOCAL server, not a real vendor. It verifies the
-//! live transport machinery; byte-level alignment with real vendors
+//! Real-socket wire verification for `HttpTransport`: a REAL axum server on a
+//! loopback port, driven over real TCP with real HTTP framing (JSON + SSE).
+//! Boundary: a local server, not a real vendor — byte-level vendor alignment
 //! still needs real endpoints + credentials.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -22,7 +17,6 @@ use gw_engines::{ModelEngine, OpenAiEngine};
 use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
 use serde_json::{Value, json};
 
-/// Loopback server that answers OpenAI-shaped chat completions (JSON + SSE).
 async fn spawn_vendor() -> String {
     let app = Router::new().route(
         "/v1/chat/completions",
@@ -205,7 +199,6 @@ async fn per_account_policy_and_connect_retry() {
     assert_eq!(transport.policy_for("tight").connect_retries, 2);
     assert_eq!(transport.policy_for("other").connect_retries, 1);
 
-    // a reload swaps the live per-account policy without rebuilding the transport
     let mut reloaded = HashMap::new();
     reloaded.insert(
         "tight".to_owned(),
@@ -251,8 +244,6 @@ async fn per_account_policy_and_connect_retry() {
     );
 }
 
-/// A client that disconnects mid-stream must surface as 499 (below the 5xx
-/// failover threshold) so the DAG never re-bills or faults the account.
 #[tokio::test]
 async fn client_disconnect_midstream_is_499_not_500() {
     use futures::StreamExt;
@@ -295,8 +286,6 @@ async fn client_disconnect_midstream_is_499_not_500() {
     assert_eq!(err.http_status, 499, "disconnect must not look like a 5xx");
 }
 
-/// A transport error AFTER the first chunk reached the client aborts (committed,
-/// billed from delivered content) so failover never splices a second generation.
 #[tokio::test]
 async fn midstream_upstream_error_after_send_aborts_without_failover() {
     use futures::StreamExt;
@@ -339,9 +328,6 @@ async fn midstream_upstream_error_after_send_aborts_without_failover() {
     assert_eq!(out.response.message, "partial");
 }
 
-/// A well-formed vendor error frame (Ok bytes, not a transport error) AFTER a
-/// chunk reached the client must also abort without failover — otherwise a
-/// retry splices a second generation onto the committed stream.
 #[tokio::test]
 async fn vendor_error_frame_after_send_aborts_without_failover() {
     use futures::StreamExt;

@@ -1,12 +1,8 @@
-//! Request/response plugins: rule-based, no cloud security service; rules
-//! come from config.security.
-//!
-//! The pre-stage runs before the DAG: a blocklist hit -> Block (the request skips
-//! the engine and billing); DLP redacts inbound messages, the Responses native
-//! body, and the family typed params. The post-stage redacts the outbound
-//! message. Outbound DLP needs the whole message, so when it is enabled the
-//! streaming surfaces buffer the response and replay the redacted text (see
-//! `spawn_stream_pipeline`) instead of forwarding raw deltas.
+//! Request/response plugins, rule-based from config.security. The pre-stage
+//! runs before the DAG: a blocklist hit → Block (skipping engine and billing);
+//! DLP redacts inbound messages, the Responses native body, and the family
+//! typed params. The post-stage redacts the outbound message; streaming
+//! surfaces buffer and replay the redacted text when outbound DLP is on.
 
 use gw_config::SecurityConf;
 use gw_models::{Block, GatewayRequest, GatewayResponse};
@@ -55,9 +51,8 @@ fn visit_text(v: &serde_json::Value, f: &mut impl FnMut(&str)) {
     }
 }
 
-/// Visit the free-text fields of the family typed params. Chat `tools` and
-/// `tool_choice` are client-supplied JSON forwarded to the vendor, so their
-/// strings (function names/descriptions) must be visited too.
+/// Visit the free-text fields of the family typed params; chat `tools`/
+/// `tool_choice` are client JSON forwarded to the vendor, so visited too.
 fn visit_typed_text(typed: &gw_models::TypedParams, f: &mut impl FnMut(&str)) {
     use gw_models::TypedParams as T;
     match typed {
@@ -93,17 +88,14 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
             msg.content = redacted;
             hits += n;
         }
-        // Multimodal: the engines forward `parts` (not `content`) when present,
-        // so PII must be scrubbed inside the parts' text blocks too — otherwise a
-        // multimodal request leaks the original PII to the vendor unredacted.
+        // engines forward `parts` (not `content`) when present, so PII must be
+        // scrubbed inside the parts' text blocks too
         if let Some(parts) = &mut msg.parts {
             hits += redact_parts_text(parts);
         }
     }
-    // Non-chat surfaces carry user text outside `message`: the Responses native
-    // body (`raw.input`, instructions, …) and the family typed params
-    // (embeddings/tts/image/video/search). Scrub those too or they reach the
-    // vendor unredacted.
+    // non-chat surfaces carry user text outside `message` (Responses raw body,
+    // family typed params) — scrub those too or they reach the vendor unredacted
     if let Some(param) = request.model_param_v2.as_mut() {
         hits += redact_value(&mut param.raw);
         if let Some(typed) = param.typed.as_mut() {
@@ -182,10 +174,9 @@ fn redact_parts_text(parts: &mut serde_json::Value) -> usize {
     hits
 }
 
-/// DLP outbound redaction: the flat `message`, plus the structured payloads the
-/// non-chat surfaces actually return — `response_v2` (the Responses/embeddings/
-/// image native body) and `tool_calls` — so vendor-introduced PII can't leak
-/// through a field the surface serializes verbatim.
+/// DLP outbound redaction: the flat `message` plus the structured payloads the
+/// non-chat surfaces return (`response_v2`, `tool_calls`), so vendor-introduced
+/// PII can't leak through a field the surface serializes verbatim.
 pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -> usize {
     if !sec.dlp_redact {
         return 0;

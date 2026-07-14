@@ -125,8 +125,7 @@ impl KeyStore for PostgresKeyStore {
                 info
             }
             Err(e) => {
-                // fail closed: a store outage must not admit unknown keys, and
-                // valid keys come back as soon as the store does.
+                // fail closed: a store outage must not admit unknown keys
                 tracing::warn!(error = %e, "key store unreachable; auth fails closed");
                 None
             }
@@ -321,8 +320,6 @@ mod tests {
         }
     }
 
-    /// Set GW_TEST_PG_URL (e.g. postgres://postgres:gwtest@127.0.0.1:15432/gw)
-    /// to run this.
     #[tokio::test]
     async fn postgres_keystore_semantics_mirror_memory() {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {

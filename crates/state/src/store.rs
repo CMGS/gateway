@@ -18,11 +18,9 @@ const PG_INSERT_BATCH: &str = "INSERT INTO batches (n, id, ak, tenant, model, st
      FROM nextval(pg_get_serial_sequence('batches', 'n')) AS v
      RETURNING id";
 
-/// Per-call token ceiling. Usage is floored at 0 upstream but not capped, so a
-/// hostile/buggy upstream can report i64::MAX; clamping each metered count keeps
-/// every downstream accumulator (Redis INCRBY reservations, SQL `SUM` rollups,
-/// in-memory counters) far from overflow. Far above any real response (largest
-/// model context is ~2M tokens), so real traffic is never clamped.
+/// Per-call token ceiling: usage is floored at 0 upstream but not capped, so
+/// clamping keeps a hostile count from overflowing downstream accumulators.
+/// Far above any real response, so real traffic is never clamped.
 pub const MAX_METERED_TOKENS: i64 = 1_000_000_000;
 
 /// One billing entry (recorded locally only; no reporting upstream).
@@ -41,8 +39,7 @@ pub struct BillingRecord {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cost_micros: i64,
-    /// What the serving account's vendor charged us (zero = untracked);
-    /// margin = cost_micros - vendor_cost_micros.
+    /// What the serving account's vendor charged us (zero = untracked).
     #[serde(default)]
     pub vendor_cost_micros: i64,
     /// PTU spilled over to a paygo account (a failover occurred).
@@ -110,7 +107,7 @@ pub struct BatchJob {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StoredFile {
     pub id: String,
-    /// Owning tenant; reads are gated on it so one tenant can't read another's files.
+    /// Owning tenant; reads are gated on it.
     pub tenant: String,
     pub bytes: usize,
     pub purpose: String,
@@ -141,11 +138,9 @@ pub fn clamp_tokens(n: i64) -> i64 {
     n.clamp(0, MAX_METERED_TOKENS)
 }
 
-/// Price one call into a [`BillingRecord`]: charged at the tenant's price for the
-/// served model, vendor cost from the serving account. Shared by the request
-/// pipeline and the realtime surface so the two pricing paths can't drift. Token
-/// counts are clamped (see [`MAX_METERED_TOKENS`]) so a hostile usage report
-/// can't overflow the ledger rollup.
+/// Price one call into a [`BillingRecord`]: the tenant's price for the served
+/// model, vendor cost from the serving account. Shared by the request pipeline
+/// and the realtime surface so the two can't drift; token counts are clamped.
 pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
     let (prompt, completion, total) = (
         clamp_tokens(b.prompt),
@@ -197,13 +192,10 @@ pub struct UsageRow {
 #[async_trait::async_trait]
 pub trait Store: Send + Sync + std::fmt::Debug {
     async fn ledger_add(&self, r: BillingRecord) -> GResult<()>;
-    /// Total record count plus the most recent `limit` records in
-    /// chronological order. Count and page may be read without a shared
-    /// transaction; the ledger is append-only, so the skew is at most a
-    /// just-appended record and self-heals on the next read.
+    /// Total count plus the most recent `limit` records in chronological order;
+    /// the ledger is append-only, so count/page skew is at most one fresh record.
     async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)>;
-    /// Usage rolled up by (tenant, requested model), sorted; the SQL backends
-    /// aggregate server-side instead of paging the whole ledger out.
+    /// Usage rolled up by (tenant, requested model), sorted.
     async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>>;
 
     /// Store `content` under a fresh id owned by `tenant`; returns the metadata.
@@ -223,9 +215,8 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// is terminal (so a stale executor can neither overwrite nor append late).
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()>;
     /// Set status only if `claim` still matches the batch's fence token (see
-    /// [`Store::batch_claim_pending`]); returns whether the write applied. So a
-    /// reclaimed stale executor can't clobber the new owner's status. Unfenced
-    /// backends apply unconditionally and return `true`.
+    /// [`Store::batch_claim_pending`]); returns whether the write applied.
+    /// Unfenced backends apply unconditionally and return `true`.
     async fn batch_set_status_owned(
         &self,
         id: &str,
@@ -234,11 +225,9 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> GResult<bool> {
         self.batch_set_status(id, status).await.map(|()| true)
     }
-    /// Set a running batch's terminal status derived from the persisted result
-    /// set (Completed iff every item has a result and all succeeded), if `claim`
-    /// still owns it; `None` if not. The fenced backend serializes this with
-    /// result writes via the batch row lock; the default is the single-executor
-    /// read-derive-set.
+    /// Set a running batch's terminal status derived from the persisted results
+    /// (Completed iff all items succeeded), if `claim` still owns it; `None` if
+    /// not. The fenced backend serializes with result writes via the row lock.
     async fn batch_finalize(&self, id: &str, claim: i64) -> GResult<Option<BatchStatus>> {
         let Some(job) = self.batch_get(id).await? else {
             return Ok(None);
@@ -254,14 +243,13 @@ pub trait Store: Send + Sync + std::fmt::Debug {
             .then_some(done))
     }
 
-    /// Whether this backend runs a fleet work queue (any instance drains
-    /// submitted batches). Local backends execute on the submitting instance.
+    /// Whether this backend runs a fleet work queue; local backends execute on
+    /// the submitting instance.
     fn distributed_batches(&self) -> bool {
         false
     }
-    /// Atomically enqueue a batch and its items for the fleet drain loop, so a
-    /// partial save never leaves a claimable job with missing items. Local
-    /// stores fall back to a plain create (items execute in-process).
+    /// Atomically enqueue a batch and its items so a partial save never leaves
+    /// a claimable job with missing items; local stores fall back to a create.
     async fn batch_enqueue(
         &self,
         ak: &str,
@@ -275,20 +263,15 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn batch_load_items(&self, _id: &str) -> GResult<Vec<Vec<gw_models::ChatMsg>>> {
         Ok(Vec::new())
     }
-    /// Claim one pending batch (requeuing any running batch whose executor went
-    /// stale first). `None` = nothing to run. Only the distributed backend claims.
-    /// The returned `i64` is a fence token, always `>= 1` (it is bumped from 0 on
-    /// each claim); the executor passes it to [`Store::batch_touch`] /
-    /// [`Store::batch_set_status_owned`] so a stalled instance whose batch was
-    /// reclaimed detects it lost ownership. The executor uses `0` as the sentinel
-    /// for the in-process path, which has no fence and no reclaim.
+    /// Claim one pending batch (requeuing stale running ones first); `None` =
+    /// nothing to run. The returned fence token (>= 1, bumped per claim) rides
+    /// [`Store::batch_touch`] / [`Store::batch_set_status_owned`] so a reclaimed
+    /// executor detects it lost ownership; the in-process path passes 0.
     async fn batch_claim_pending(&self, _stale_secs: i64) -> GResult<Option<(BatchJob, i64)>> {
         Ok(None)
     }
-    /// Heartbeat a running batch so its executor isn't judged stale. Returns
-    /// `false` if the fence token no longer matches — another instance reclaimed
-    /// the batch, so this executor must stop. Unfenced backends always return
-    /// `true`.
+    /// Heartbeat a running batch; `false` = the fence no longer matches (the
+    /// batch was reclaimed) and this executor must stop.
     async fn batch_touch(&self, _id: &str, _claim: i64) -> GResult<bool> {
         Ok(true)
     }
@@ -435,15 +418,13 @@ impl Store for MemoryStore {
             && !matches!(j.status, BatchStatus::Completed | BatchStatus::Failed)
             && !j.results.iter().any(|r| r.index == result.index)
         {
-            // first-writer-wins, and never into a terminal batch
             j.results.push(result);
         }
         Ok(())
     }
 }
 
-/// Positional row → record mapping shared by the SQL backends (their SELECT
-/// column order is identical).
+/// Positional row → record shared by the SQL backends (identical SELECT order).
 fn row_to_billing<'r, R>(row: &'r R) -> BillingRecord
 where
     R: sqlx::Row,
@@ -504,9 +485,8 @@ where
     }
 }
 
-/// SQLite-backed store (sqlx, WAL). One database file holds the billing
-/// ledger, uploaded files, and batch jobs; ids are derived from rowids so they
-/// stay unique across restarts.
+/// SQLite-backed store (WAL): ledger, files, and batch jobs in one database
+/// file; ids derive from rowids so they stay unique across restarts.
 #[derive(Debug)]
 pub struct SqliteStore {
     pool: sqlx::SqlitePool,
@@ -557,15 +537,12 @@ impl SqliteStore {
                 .await
                 .map_err(|e| crate::sqlx_err("create schema", e))?;
         }
-        // Pre-existing databases lack these columns; the ALTER fails with
-        // "duplicate column name" on every later boot, so that error is ignored.
+        // migrations: "duplicate column name" from an already-migrated db is ignored
         for ddl in [
             "ALTER TABLE billing ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'",
             "ALTER TABLE billing ADD COLUMN served_model TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN vendor_cost_micros INTEGER NOT NULL DEFAULT 0",
-            // pre-tenant rows had no owner (they were readable by any key); back-
-            // fill them to an unmatchable '' tenant so they fail closed rather
-            // than land in a live tenant. New rows always bind their tenant.
+            // back-fill pre-tenant rows to an unmatchable '' tenant (fail closed)
             "ALTER TABLE files ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batches ADD COLUMN tenant TEXT NOT NULL DEFAULT ''",
         ] {
@@ -575,8 +552,7 @@ impl SqliteStore {
                 return Err(crate::sqlx_err("migrate billing schema", e));
             }
         }
-        // a dead process's pending/running jobs can never progress on a
-        // single-instance store — fail them instead of letting clients poll forever
+        // a dead process's jobs can never progress single-instance — fail them, don't let clients poll forever
         sqlx::query("UPDATE batches SET status = 'failed' WHERE status IN ('pending', 'running')")
             .execute(&pool)
             .await
@@ -797,11 +773,9 @@ impl Store for SqliteStore {
     }
 }
 
-/// Postgres-backed store for a multi-instance fleet: ledger, files, and
-/// batches are shared, so any instance can serve reads for work submitted on
-/// another. Unlike [`SqliteStore`] there is no orphan sweep on open — a
-/// starting instance must not fail batches another live instance is still
-/// executing (a distributed executor is the M9 follow-up).
+/// Postgres-backed store shared across a fleet. Unlike [`SqliteStore`] there
+/// is no orphan sweep on open — a starting instance must not fail batches
+/// another live instance is still executing.
 #[derive(Debug)]
 pub struct PostgresStore {
     pool: sqlx::PgPool,
@@ -846,14 +820,12 @@ impl PostgresStore {
                 batch_id TEXT NOT NULL, idx BIGINT NOT NULL, messages TEXT NOT NULL,
                 PRIMARY KEY (batch_id, idx))",
             "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ",
-            // fence token: bumped on every claim, so a reclaimed batch's prior
-            // executor sees its conditional heartbeat/writes affect no rows
+            // fence token: bumped on every claim so a reclaimed executor's fenced writes no-op
             "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_seq BIGINT NOT NULL DEFAULT 0",
             // back-fill pre-tenant rows to an unmatchable '' tenant (fail closed)
             "ALTER TABLE files ADD COLUMN IF NOT EXISTS tenant TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batches ADD COLUMN IF NOT EXISTS tenant TEXT NOT NULL DEFAULT ''",
-            // dedup any (batch_id, idx) rows the pre-fix plain-INSERT could have
-            // left, so the unique index below builds on an already-upgraded fleet
+            // dedup rows the pre-fix plain-INSERT could have left, so the unique index builds
             "DELETE FROM batch_results a USING batch_results b
              WHERE a.ctid < b.ctid AND a.batch_id = b.batch_id AND a.idx = b.idx",
             "CREATE UNIQUE INDEX IF NOT EXISTS batch_results_uidx
@@ -967,8 +939,7 @@ impl Store for PostgresStore {
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
         let bytes = content.len();
-        // concurrent PG writers race a MAX(n)+1 subselect; consume the
-        // sequence explicitly so id and n share one atomic value
+        // consume the sequence explicitly — concurrent writers race a MAX(n)+1 subselect
         let id: String = sqlx::query_scalar(
             "INSERT INTO files (n, id, tenant, purpose, bytes, content)
              SELECT v, 'file-' || v, $1, $2, $3, $4
@@ -1110,10 +1081,9 @@ impl Store for PostgresStore {
     }
 
     async fn batch_finalize(&self, id: &str, claim: i64) -> GResult<Option<BatchStatus>> {
-        // Lock the row, THEN aggregate in a separate statement: a single UPDATE
-        // reads its result-set subquery on the statement-start snapshot, so a
-        // result that commits while it waits for the lock is missed (READ
-        // COMMITTED re-checks only the locked row) and it wrongly reports Failed.
+        // Lock the row, THEN aggregate separately: a single UPDATE reads its
+        // subquery on the statement-start snapshot and would miss a result that
+        // commits while it waits for the lock, wrongly reporting Failed.
         let mut tx = self
             .pool
             .begin()
@@ -1169,8 +1139,7 @@ impl Store for PostgresStore {
         model: &str,
         items: &[Vec<gw_models::ChatMsg>],
     ) -> GResult<BatchJob> {
-        // one transaction: the batch becomes claimable (pending) only once all
-        // its items are committed, so a partial save can't orphan a job.
+        // the batch becomes claimable only once all its items are committed
         let mut tx = self
             .pool
             .begin()
@@ -1222,8 +1191,7 @@ impl Store for PostgresStore {
     }
 
     async fn batch_claim_pending(&self, stale_secs: i64) -> GResult<Option<(BatchJob, i64)>> {
-        // requeue batches whose executor stopped heartbeating, then claim one
-        // pending batch — SKIP LOCKED so concurrent instances never collide.
+        // requeue batches whose executor stopped heartbeating before claiming
         sqlx::query(
             "UPDATE batches SET status = 'pending', claimed_at = NULL
              WHERE status = 'running'
@@ -1528,8 +1496,6 @@ mod tests {
         assert_eq!(job.status, BatchStatus::Completed);
     }
 
-    /// Set GW_TEST_PG_URL (e.g. postgres://postgres:gwtest@127.0.0.1:15432/gw)
-    /// to run this.
     #[tokio::test]
     async fn postgres_store_roundtrip() {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
@@ -1593,8 +1559,6 @@ mod tests {
             got.results[0].ok && got.results[0].message == "ok",
             "first write wins"
         );
-        // finalize (item 1 missing) → Failed, then a late insert of the missing
-        // item into the terminal batch is rejected by the atomic status gate
         assert_eq!(
             store.batch_finalize(&b.id, 0).await.unwrap(),
             Some(BatchStatus::Failed)
@@ -1651,8 +1615,6 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[1][0].content, "two");
 
-        // fence token: a reclaim bumps claim_seq so a stalled prior executor's
-        // fenced heartbeat/writes no-op instead of double-running the batch
         let fjob = store
             .batch_enqueue("ak-f", "default", "gpt-4o", &qmsgs)
             .await
@@ -1725,9 +1687,6 @@ mod tests {
         }
     }
 
-    /// Set GW_TEST_PG_URL to run. Two live connections: an insert holds the batch
-    /// row lock while finalize blocks; once the insert commits, finalize must see
-    /// the result (Completed), not a stale pre-lock snapshot (Failed).
     #[tokio::test]
     async fn postgres_finalize_sees_result_committed_during_lock_wait() {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
@@ -1743,7 +1702,6 @@ mod tests {
             .await
             .unwrap();
 
-        // hold the row lock + insert the sole result, uncommitted
         let mut txa = store.pool.begin().await.unwrap();
         sqlx::query(
             "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens)

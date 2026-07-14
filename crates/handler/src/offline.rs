@@ -1,9 +1,6 @@
-//! Offline batch orchestration.
-//!
-//! Local backends execute a submitted batch on the receiving instance's
-//! background task. With a distributed store (Postgres) submission only
-//! persists the items; a fleet drain loop on any instance claims and runs
-//! them, so execution survives the submitter restarting.
+//! Offline batch orchestration: local backends execute a batch on the receiving
+//! instance's background task; a distributed store (Postgres) only persists the
+//! items and a fleet drain loop on any instance claims and runs them.
 
 use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
 use gw_state::{AkInfo, BatchItemResult, BatchJob, BatchStatus};
@@ -28,9 +25,8 @@ impl OfflineHandler {
     }
 
     /// Submit a batch. Local stores execute it now on a background task;
-    /// distributed stores persist the items and leave it pending for the
-    /// fleet drain loop. Items run through the SAME online DAG (billing/quota/
-    /// limits apply per item; the request cache is bypassed).
+    /// distributed stores leave it pending for the fleet drain loop. Items run
+    /// through the SAME online DAG (billed per item; the request cache is bypassed).
     pub async fn submit(
         &self,
         ak: AkInfo,
@@ -48,19 +44,16 @@ impl OfflineHandler {
                 .await?;
             let this = self.clone();
             let (id, model) = (job.id.clone(), model.clone());
-            // claim 0: in-process runs on a non-distributed store, so there is
-            // no fence token and the heartbeat is a no-op
+            // claim 0: non-distributed store — no fence, the heartbeat is a no-op
             tokio::spawn(async move { this.execute(&id, &ak, &model, msgs, 0).await });
             Ok(job)
         }
     }
 
-    /// Run every item of a claimed/submitted batch through the online DAG,
-    /// writing results and the terminal status. Heartbeats between items so a
-    /// distributed claim isn't judged stale mid-run. `claim` is the fence token
-    /// from [`gw_state::Store::batch_claim_pending`] (0 for the in-process path);
-    /// if a heartbeat reports the batch was reclaimed, this executor stops rather
-    /// than double-running items or clobbering the new owner's status.
+    /// Run every item of a batch through the online DAG, writing results and
+    /// the terminal status, heartbeating between items. `claim` is the fence
+    /// token (0 for the in-process path); once a heartbeat reports the batch
+    /// reclaimed, this executor stops rather than double-running items.
     async fn execute(
         &self,
         id: &str,
@@ -70,25 +63,22 @@ impl OfflineHandler {
         claim: i64,
     ) {
         let store = self.online.state().store.clone();
-        // the distributed claim already set status=running atomically with the
-        // fence bump; only the in-process path (claim 0, created 'pending') needs
-        // this write. Writing it unfenced on the distributed path could resurrect
-        // a batch a stale worker no longer owns back to Running.
+        // the distributed claim already set status=running with the fence bump;
+        // only the in-process path needs this write — unfenced on the distributed
+        // path it could resurrect a batch a stale worker no longer owns
         if claim == 0
             && let Err(e) = store.batch_set_status(id, BatchStatus::Running).await
         {
             tracing::error!(error = %e, batch = %id, "batch status write failed");
         }
-        // skip items a prior (crashed) executor already recorded, so a reclaim
-        // re-runs at most the one in-flight item. A read failure hides what's
-        // done — re-running all would re-bill, so fail the job instead.
+        // skip items a prior executor already recorded (a reclaim re-runs at most
+        // the in-flight one); a read failure fails the job — re-running re-bills
         let prior = match store.batch_get(id).await {
             Ok(Some(job)) => job.results,
             Ok(None) => return, // the batch row vanished; nothing to run
             Err(e) => {
                 tracing::error!(error = %e, batch = %id, "batch resume read failed; failing to avoid re-billing");
-                // fenced: a reclaimed stale worker that trips this must not clobber
-                // the new owner's status
+                // fenced: a reclaimed stale worker must not clobber the new owner's status
                 let _ = store
                     .batch_set_status_owned(id, BatchStatus::Failed, claim)
                     .await;
@@ -98,10 +88,9 @@ impl OfflineHandler {
         let done_indices: std::collections::HashSet<usize> =
             prior.iter().map(|r| r.index).collect();
         use std::sync::atomic::Ordering::Relaxed;
-        // A background heartbeat refreshes claimed_at so a single slow item isn't
-        // judged stale mid-run; it also flips `lost` if the fence token stops
-        // matching (another instance reclaimed us). Long-item liveness is its job
-        // — the per-item synchronous touch below is what bounds a double-run.
+        // background heartbeat: refreshes claimed_at so a slow item isn't judged
+        // stale, and flips `lost` when the fence stops matching; the per-item
+        // synchronous touch below is what bounds a double-run
         let lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hb = {
             let store = store.clone();
@@ -126,14 +115,10 @@ impl OfflineHandler {
             if done_indices.contains(&index) {
                 continue; // already executed and billed before the reclaim
             }
-            // synchronous fence before starting each item: if we were reclaimed
-            // while stalled, learn it here and stop before running/billing the
-            // next item — so at most the one item already in flight double-runs
-            // (the resume/dedup path tolerates exactly that). Fail CLOSED: a
-            // touch that can't confirm ownership (reclaimed OR the store is
-            // unreachable) stops us, so a partitioned worker can't keep charging
-            // items it may no longer own. claim 0 = in-process, unfenced (the
-            // local store's touch is a no-op that returns Ok(true)).
+            // synchronous fence before each item: if reclaimed while stalled, stop
+            // before billing the next item — at most the in-flight one double-runs
+            // (the resume/dedup path tolerates that). Fail CLOSED: a touch that
+            // can't confirm ownership stops us. claim 0 = in-process, unfenced.
             if claim != 0 && !matches!(store.batch_touch(id, claim).await, Ok(true)) {
                 lost.store(true, Relaxed);
                 break;
@@ -223,8 +208,7 @@ impl OfflineHandler {
                             continue;
                         }
                     };
-                    // a load failure must fail the job, not silently complete it
-                    // with zero results (unwrap_or_default would).
+                    // a load failure must fail the job, not silently complete with zero results
                     let items = match store.batch_load_items(&job.id).await {
                         Ok(items) => items,
                         Err(e) => {

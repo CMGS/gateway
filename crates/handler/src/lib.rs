@@ -1,9 +1,7 @@
-//! Request orchestration (online/offline; plugin chain inlined).
-//!
-//! Layer L4: the seam between HTTP views and the DAG. `OnlineHandler` runs the
-//! plugin pre-stage (security block / DLP), the four DAG layers, then the plugin
-//! post-stage. `OfflineHandler` (offline.rs) reuses the same chain for batches.
-//! realtime orchestration (websocket upstream) is not implemented yet.
+//! Request orchestration (L4): the seam between HTTP views and the DAG.
+//! `OnlineHandler` runs the plugin pre-stage (security block / DLP), the four
+//! DAG layers, then the plugin post-stage; `OfflineHandler` reuses the same
+//! chain for batches.
 
 pub mod offline;
 pub mod plugins;
@@ -55,10 +53,9 @@ impl OnlineHandler {
     pub async fn run(&self, mut request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
         // one consistent snapshot for the whole request
         let snap = self.config.load();
-        // Outbound DLP is a response-buffering boundary: no engine may stream raw
-        // deltas, since a masked span can straddle deltas and a live delta leaves
-        // before the post-stage scrubs it. Enforce it here at the security
-        // boundary so no caller (any view or future surface) can opt out.
+        // outbound DLP is a response-buffering boundary: a masked span can
+        // straddle deltas, so no engine may stream raw ones — enforced here so
+        // no caller can opt out
         let dlp = snap.cfg.security.dlp_redact;
         if dlp {
             request.stream_tx = None;
@@ -104,8 +101,7 @@ impl OnlineHandler {
         }
 
         if let Err(e) = gw_dag::run(&self.plan, &mut ctx).await {
-            // a failed pipeline refunds its admission reservations whole, on the
-            // day bucket the reserve used
+            // a failed pipeline refunds its reservations whole, on the reserve's day bucket
             if let Some(est) = ctx.quota_reserved.take() {
                 ctx.state
                     .governance
@@ -121,8 +117,7 @@ impl OnlineHandler {
             return Err(e);
         }
 
-        // a quota fallback served a different model; every surface echoes the
-        // requested name (the ledger keeps both)
+        // a fallback served a different model; surfaces echo the requested name
         if let Some(requested) = ctx
             .request
             .model_param_v2
@@ -302,8 +297,6 @@ mod tests {
 
     #[tokio::test]
     async fn aborted_stream_bills_estimated_delivered_tokens() {
-        // salvage-partial is a live-streaming behavior; DLP forces buffering, so
-        // disable it to exercise the abort path
         let mut cfg = GatewayConfig::embedded_default().unwrap();
         cfg.security.dlp_redact = false;
         let cfg = Arc::new(cfg);
@@ -423,8 +416,6 @@ mod tests {
         let mut req = chat_req("gpt-4o", "hello");
         req.stream = true;
         req.stream_tx = Some(tx);
-        // under DLP, run() clears stream_tx before the engine runs, so the sender
-        // drops and the live channel stays empty
         let ctx = h.run(req, ak(&h).await).await.unwrap();
         let mut live: Vec<String> = Vec::new();
         while let Ok(chunk) = rx.try_recv() {
@@ -458,7 +449,6 @@ mod tests {
             gw_state::SharedConfig::new(cfg, state),
             Arc::new(gw_engines::MockTransport),
         );
-        // the blocklisted domain sits inside an email DLP would otherwise mask
         let ctx = h
             .run(
                 chat_req("gpt-4o", "reach me at ops@example.com"),
@@ -524,8 +514,6 @@ mod tests {
         );
     }
 
-    /// Set GW_TEST_PG_URL to run: a batch submitted on one handler is claimed,
-    /// executed, and billed by a separate drain loop (the distributed path).
     #[tokio::test]
     async fn distributed_batch_drained_by_a_separate_handler() {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {

@@ -1,28 +1,11 @@
-//! Prompt-token estimation.
+//! Prompt-token estimation — the up-front estimate only; the authoritative
+//! count always comes back in the vendor's usage payload.
 //!
-//! Computes an *estimated* prompt-token count from a chat request. The
-//! authoritative count always comes back from the vendor's usage payload after
-//! the call; this is only the up-front estimate.
-//!
-//! ## Intended use
-//! This estimate feeds **PTU account selection** — sizing a request (prompt
-//! tokens + estimated output) to decide whether it fits a dedicated-PTU
-//! account, gated behind an `accurate_token_enabled` switch and skipped for
-//! multimodal requests. It is NOT the TPM rate limiter, which uses a
-//! Redis-backed statistical average and carries a cloud dependency this
-//! estimate does not need. This crate provides the calculation as a faithful,
-//! tested capability; wiring it into a token-aware PTU selector is deferred
-//! until that capacity-scheduling subsystem is built.
-//!
-//! ## Fidelity
-//! The **structural accounting** follows the standard OpenAI chat-token
-//! accounting formula exactly: per-message overhead, encoded role, encoded
-//! content, tool-call name/arguments, and the trailing reply priming.
-//!
-//! The **text→token encoding** sits behind the [`TokenEncoder`] trait — exactly
-//! like the `Transport` seam. The default ([`default_encoder`]) is real tiktoken
-//! `cl100k_base` BPE ([`TiktokenEncoder`]); [`HeuristicEncoder`] is the
-//! zero-dependency fallback approximation.
+//! Intended to feed PTU account selection (NOT the TPM limiter); wiring it into
+//! a token-aware selector is deferred. The structural accounting follows the
+//! standard OpenAI chat-token formula exactly; the text→token encoding sits
+//! behind the [`TokenEncoder`] seam — real tiktoken `cl100k_base` by default,
+//! [`HeuristicEncoder`] as the zero-dependency fallback.
 
 use std::sync::LazyLock;
 
@@ -64,19 +47,14 @@ pub fn default_encoder() -> &'static dyn TokenEncoder {
     &**ENC
 }
 
-/// Documented approximation of cl100k_base token counting. NOT real tiktoken.
-///
-/// Classifies character runs the way cl100k's pre-tokenizer roughly splits
-/// them, which captures the dominant error sources of a naive `bytes/4`
-/// estimate (CJK, digit grouping, punctuation):
-///
+/// Documented approximation of cl100k_base token counting — NOT real tiktoken.
+/// Captures the dominant error sources of a naive bytes/4 estimate:
 /// - runs of ASCII letters → ~1 token per 4 chars (subword merges)
 /// - runs of digits → cl100k emits ≤3-digit groups → 1 tok / 3
 /// - ASCII punctuation/symbols → ~1 token each
 /// - non-ASCII (CJK etc.) → ~1 token per char (rarely merged)
 ///
-/// Whitespace folds into the following word (cl100k's leading-space merge), so
-/// it contributes no standalone tokens.
+/// Whitespace folds into the following word, contributing no standalone tokens.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HeuristicEncoder;
 
@@ -150,9 +128,8 @@ fn tokens_per_message(model_name: &str) -> usize {
     }
 }
 
-/// Extract the text a message contributes. Multimodal `parts` → concatenated
-/// text parts only (image parts add vision tokens the vendor accounts for, not
-/// counted here); otherwise `content`.
+/// Extract the text a message contributes: multimodal `parts` → concatenated
+/// text parts only (vision tokens are the vendor's to count); else `content`.
 fn message_text(msg: &ChatMsg) -> String {
     if let Some(Value::Array(parts)) = &msg.parts {
         let mut out = String::new();
@@ -170,12 +147,9 @@ fn message_text(msg: &ChatMsg) -> String {
     msg.content.clone()
 }
 
-/// Estimate the prompt tokens a chat request will cost upstream.
-///
-/// `tools` is the request's tool/function definitions (OpenAI wire shape), if
-/// any; their serialized schema is encoded as text. Follows the standard
-/// accounting exactly; the raw text encoding is [`TokenEncoder`]-approximate
-/// (see module docs).
+/// Estimate the prompt tokens a chat request will cost upstream. `tools` is the
+/// request's tool definitions (OpenAI wire shape); their serialized schema is
+/// encoded as text.
 pub fn estimate_prompt_tokens(
     messages: &[ChatMsg],
     tools: Option<&Value>,

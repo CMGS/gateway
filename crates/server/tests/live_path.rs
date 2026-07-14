@@ -1,14 +1,7 @@
-//! Capstone: the ENTIRE gateway pipeline over real HTTP — the go-live proof.
-//!
-//! Composes the full app with the REAL `HttpTransport` (reqwest) and an account whose `endpoint` points at a
-//! loopback "vendor" server, then drives a request through the whole stack:
-//!   views(auth) → handler(plugins) → DAG(resolve/quota/account/limit) →
-//!   OpenAiEngine → HttpTransport → real TCP socket → vendor → parse →
-//!   CommonUsage → billing ledger.
-//!
-//! Boundary (honest): the vendor is local, so no egress and no credentials. But
-//! everything EXCEPT the vendor's identity is the real go-live path — swap the
-//! account endpoint/api_key_env for a real vendor and it is live, no code change.
+//! Capstone: the ENTIRE gateway pipeline over real HTTP, with the REAL
+//! `HttpTransport` against a loopback "vendor" server. Boundary: the vendor is
+//! local — swap the account endpoint/api_key_env for a real one and it is
+//! live, no code change.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -26,8 +19,6 @@ use gw_views::AppState;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-/// Loopback OpenAI-shaped vendor: echoes the user's text. Returns JSON, or a real
-/// `text/event-stream` SSE body when the request asked for `stream:true`.
 async fn spawn_vendor() -> String {
     let app = Router::new()
         .route(
@@ -94,8 +85,6 @@ async fn spawn_vendor() -> String {
     format!("http://{addr}")
 }
 
-/// Build the gateway app wired with the REAL HttpTransport + an account whose
-/// endpoint is the loopback vendor.
 fn gateway(vendor_url: &str) -> Router {
     let yaml = format!(
         r#"

@@ -1,13 +1,7 @@
-//! Local benchmark (in-process performance/load test).
-//!
-//! In-process load against the composed router (no sockets, no network): serial
-//! latency distribution + concurrent throughput. `#[ignore]`d so normal test
-//! runs stay fast — run explicitly with:
+//! In-process benchmark against the composed router: serial latency
+//! distribution + concurrent throughput. `#[ignore]`d — run with:
 //!   cargo test --release -p gw-server --test bench -- --ignored --nocapture
-//!
-//! Note: no external baseline is included here — a comparable baseline would
-//! hard-require networked state/config backends and RPC to the internal network
-//! at startup, so numbers here reflect this implementation only, in-process.
+//! Numbers reflect this implementation only (no external baseline).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -44,8 +38,6 @@ fn chat_req() -> Request<Body> {
         .expect("request")
 }
 
-/// A large request: 24-turn history, each turn ~2KB — the shape where the
-/// per-request GatewayRequest clone in CallEngine actually costs something.
 fn big_chat_req() -> Request<Body> {
     let turn = "x".repeat(2000);
     let msgs: Vec<String> = (0..24)
@@ -66,9 +58,6 @@ fn big_chat_req() -> Request<Body> {
         .expect("request")
 }
 
-/// Isolates the per-request `GatewayRequest` clone in CallEngine at the same
-/// payload shape as `bench_big_payload`, plus a fat `raw` passthrough body —
-/// the evidence gate for an Arc/borrow change (issue #2 M8 carry-over).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark; run with --ignored --nocapture"]
 async fn bench_request_clone() {
