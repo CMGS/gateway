@@ -11,27 +11,21 @@ pub fn is_response_create(frame: &Value) -> bool {
     frame["type"] == "response.create"
 }
 
-/// The keys that carry human text in realtime frames (both directions):
-/// message content, transcripts, instructions, tool descriptions, the
-/// function-call output/arguments strings, approval reasons, and error
-/// messages. Audio and other base64 payloads never ride under these names,
-/// so a rewrite here cannot corrupt them.
-const TEXT_KEYS: [&str; 9] = [
-    "text",
-    "transcript",
-    "instructions",
-    "output",
-    "arguments",
-    "description",
-    "server_description",
-    "reason",
-    "message",
-];
-
-/// Subtrees that are pure JSON-Schema (tool definitions): every string leaf in
-/// them is text (titles, enums, descriptions) — the REST surfaces scan all of
-/// it, so realtime must too.
-const SCHEMA_KEYS: [&str; 2] = ["parameters", "input_schema"];
+/// String values that never carry human text: base64 media payloads (which a
+/// rewrite would corrupt) and protocol identifiers (whose rewrite would break
+/// frame correlation). Everything else is scanned — fail closed, matching the
+/// REST surfaces' walk-every-string-leaf posture, so a new protocol text
+/// field is covered by default instead of silently bypassing blocklist/DLP.
+/// Only scalars are skipped: an `audio`/`format` CONFIG object still recurses
+/// (the transcription prompt rides inside it).
+fn skip_scalar(k: &str, text_delta: bool) -> bool {
+    matches!(
+        k,
+        "audio" | "data" | "type" | "object" | "status" | "role" | "voice" | "model" | "format"
+    ) || (k == "delta" && !text_delta)
+        || k == "id"
+        || k.ends_with("_id")
+}
 
 /// Whether a frame's top-level `delta` carries text. Audio deltas reuse the
 /// same key for base64 payloads (`response.output_audio.delta`), which a
@@ -42,43 +36,27 @@ fn delta_is_text(frame_type: &str) -> bool {
         || frame_type.contains("arguments")
 }
 
-/// Visit the text-bearing fields of a realtime frame with a visitor that may
-/// rewrite them; returns summed hits. The content-security seam for the
-/// WebSocket surface — which fields are text is dialect knowledge owned here.
+/// Visit the text-bearing string leaves of a realtime frame with a visitor
+/// that may rewrite them; returns summed hits. The content-security seam for
+/// the WebSocket surface — which fields are NOT text is dialect knowledge
+/// owned here (see [`skip_key`]).
 pub fn visit_frame_text(v: &mut Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
     let text_delta = v["type"].as_str().map(delta_is_text).unwrap_or(false);
-    walk(v, text_delta, false, f)
+    walk(v, text_delta, f)
 }
 
-fn walk(
-    v: &mut Value,
-    text_delta: bool,
-    in_schema: bool,
-    f: &mut impl FnMut(&mut String) -> usize,
-) -> usize {
+fn walk(v: &mut Value, text_delta: bool, f: &mut impl FnMut(&mut String) -> usize) -> usize {
     match v {
-        // bare strings inside a schema array (enum values, required names)
-        Value::String(s) if in_schema => f(s),
-        Value::Array(a) => a
-            .iter_mut()
-            .map(|x| walk(x, text_delta, in_schema, f))
-            .sum(),
+        // bare strings inside arrays (schema enum values, prompt variables)
+        Value::String(s) => f(s),
+        Value::Array(a) => a.iter_mut().map(|x| walk(x, text_delta, f)).sum(),
         Value::Object(o) => o
             .iter_mut()
             .map(|(k, x)| match x {
-                Value::String(s)
-                    if in_schema
-                        || TEXT_KEYS.contains(&k.as_str())
-                        || (k == "delta" && text_delta) =>
-                {
-                    f(s)
-                }
-                _ => walk(
-                    x,
-                    text_delta,
-                    in_schema || SCHEMA_KEYS.contains(&k.as_str()),
-                    f,
-                ),
+                Value::String(_) if skip_scalar(k, text_delta) => 0,
+                // identifier list, never prose
+                _ if k == "modalities" => 0,
+                _ => walk(x, text_delta, f),
             })
             .sum(),
         _ => 0,
@@ -162,14 +140,16 @@ mod tests {
     fn visit_frame_text_covers_tool_output_and_arguments() {
         let mut frame = json!({
             "type": "conversation.item.create",
-            "item": {"type": "function_call_output", "output": "call me at 13812345678"}
+            "item": {"type": "function_call_output", "call_id": "call_138123456789",
+                     "output": "call me at 13812345678"}
         });
         let hits = visit_frame_text(&mut frame, &mut |s| {
             *s = "X".into();
             1
         });
-        assert_eq!(hits, 1, "function output is scanned");
+        assert_eq!(hits, 1, "function output is scanned, ids are not");
         assert_eq!(frame["item"]["output"], "X");
+        assert_eq!(frame["item"]["call_id"], "call_138123456789");
 
         let mut tools = json!({
             "type": "session.update",
@@ -191,10 +171,9 @@ mod tests {
                 "City name".to_owned(),
                 "ForbiddenWord town".to_owned(),
                 "desc".to_owned(),
-                "object".to_owned(),
-                "string".to_owned(),
+                "t".to_owned(),
             ],
-            "every string leaf of a tool schema is scanned"
+            "every text leaf of a tool schema is scanned; `type` identifiers are not"
         );
 
         let mut err = json!({"type": "error", "error": {"message": "boom jane@corp.com"}});
@@ -202,6 +181,44 @@ mod tests {
             visit_frame_text(&mut err, &mut |_| 1),
             1,
             "error messages are scanned"
+        );
+    }
+
+    #[test]
+    fn transcription_prompt_variables_and_tool_names_are_scanned() {
+        let mut session = json!({
+            "type": "session.update",
+            "session": {
+                "audio": {"input": {"format": "pcm16",
+                                     "transcription": {"prompt": "expect ForbiddenWord"}}},
+                "instructions": "be brief",
+                "voice": "alloy",
+                "model": "gpt-realtime"
+            }
+        });
+        assert_eq!(
+            visit_frame_text(&mut session, &mut |_| 1),
+            2,
+            "instructions AND the transcription prompt inside audio config are scanned"
+        );
+        let mut prompt = json!({
+            "type": "session.update",
+            "session": {"prompt": {"variables": {"customer": "jane@corp.com"}}}
+        });
+        assert_eq!(
+            visit_frame_text(&mut prompt, &mut |_| 1),
+            1,
+            "prompt variables are scanned"
+        );
+        let mut tools = json!({
+            "type": "session.update",
+            "session": {"tools": [{"name": "ForbiddenWord_tool"}],
+                         "tool_choice": {"name": "ForbiddenWord_tool"}}
+        });
+        assert_eq!(
+            visit_frame_text(&mut tools, &mut |_| 1),
+            2,
+            "tool identifiers are scanned like REST"
         );
     }
 
