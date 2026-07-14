@@ -23,6 +23,8 @@ fn skip_scalar(k: &str, text_delta: bool) -> bool {
         k,
         "audio"
             | "data"
+            | "file_data"
+            | "file_url"
             | "image_url"
             | "type"
             | "object"
@@ -204,6 +206,17 @@ mod tests {
             visit_frame_text(&mut img, &mut |_| 1),
             0,
             "image data URIs are never rewritten"
+        );
+
+        let mut file = json!({
+            "type": "session.update",
+            "session": {"prompt": {"variables": {"doc": {"type": "input_file",
+                "filename": "a.pdf", "file_data": "data:application/pdf;base64,AAAA13812345678A"}}}}
+        });
+        assert_eq!(
+            visit_frame_text(&mut file, &mut |_| 1),
+            1,
+            "only the filename is scanned; file payloads are never rewritten"
         );
 
         let mut err = json!({"type": "error", "error": {"message": "boom jane@corp.com"}});
