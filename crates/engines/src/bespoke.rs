@@ -43,15 +43,19 @@ fn aws_headers(
 
 /// One Bedrock invoke: host + scheme from the account endpoint at go-live
 /// (else the mock sentinel); SigV4 signs this same host so URL and signature
-/// agree.
-async fn bedrock_invoke(base: &Base, uri: &str, body: Value) -> GResult<(u16, Value)> {
+/// agree. Raw extras merge before signing so the signature covers the exact
+/// bytes sent — and the body serializes once, not per layer.
+async fn bedrock_invoke(base: &Base, uri: &str, mut body: Value) -> GResult<(u16, Value)> {
     let root = base.base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
     let host = root
         .split_once("://")
         .map(|(_, h)| h)
         .unwrap_or(&root)
         .to_owned();
-    let payload = body.to_string().into_bytes();
+    if let Some(obj) = body.as_object_mut() {
+        crate::base::merge_raw_extras(obj, &base.param()?.raw);
+    }
+    let payload = crate::base::body_bytes(&body)?;
     let creds = base.aws_credentials();
     let headers = aws_headers(
         &host,
@@ -61,7 +65,8 @@ async fn bedrock_invoke(base: &Base, uri: &str, body: Value) -> GResult<(u16, Va
             .as_ref()
             .map(|(a, s): &(String, String)| (a.as_str(), s.as_str())),
     );
-    base.post_json(&format!("{root}{uri}"), headers, body).await
+    base.post_json_bytes(&format!("{root}{uri}"), headers, payload)
+        .await
 }
 
 base_engine!(ErnieEngine);
@@ -83,7 +88,9 @@ impl ModelEngine for ErnieEngine {
                              "content": m.content})
             })
             .collect();
-        let mut body = json!({"messages": messages});
+        // move owned values into the body — json! interpolation would deep-copy them
+        let mut body = json!({});
+        body["messages"] = Value::Array(messages);
         if let Some(p) = self.base.chat_params() {
             if let Some(t) = p.temperature {
                 body["temperature"] = json!(t);
@@ -112,7 +119,7 @@ impl ModelEngine for ErnieEngine {
             prompt_tokens: crate::engine::tok(&usage["prompt_tokens"]),
             completion_tokens: crate::engine::tok(&usage["completion_tokens"]),
             total_tokens: crate::engine::tok(&usage["total_tokens"]),
-            raw_usage_json: usage.to_string().into_bytes(),
+            raw_usage_json: serde_json::to_vec(usage).unwrap_or_default(),
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
@@ -138,16 +145,16 @@ impl ModelEngine for MinimaxV1Engine {
                        "text": m.content})
             })
             .collect();
-        let body = json!({"model": model, "messages": messages});
+        let mut body = json!({"model": model});
+        body["messages"] = Value::Array(messages);
         let url = format!(
             "{}/v1/text/chatcompletion",
             self.base.base_url("mock://api.minimax.chat")
         );
-        let auth = vec![(
-            "authorization".into(),
-            format!("Bearer {}", self.base.api_key()),
-        )];
-        let (status, v) = self.base.post_json(&url, auth, body).await?;
+        let (status, v) = self
+            .base
+            .post_json(&url, self.base.bearer_headers(), body)
+            .await?;
         // base_resp non-zero is an error (minimax's business error-code convention)
         let code = v["base_resp"]["status_code"].as_i64().unwrap_or(0);
         if code != 0 {
@@ -163,7 +170,7 @@ impl ModelEngine for MinimaxV1Engine {
             model,
             finish_reason: "stop".into(),
             total_tokens: total,
-            raw_usage_json: v["usage"].to_string().into_bytes(),
+            raw_usage_json: serde_json::to_vec(&v["usage"]).unwrap_or_default(),
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
@@ -179,7 +186,6 @@ impl ModelEngine for CohereEngine {
     async fn run(&self) -> GResult<EngineOutcome> {
         let model = self.base.model_name()?.to_owned();
         let mut history: Vec<Value> = Vec::new();
-        let mut message = String::new();
         for m in &self.base.request.message {
             if m.role == gw_consts::role::SYSTEM {
                 continue;
@@ -191,10 +197,14 @@ impl ModelEngine for CohereEngine {
             };
             history.push(json!({"role": role, "message": m.content}));
         }
-        if let Some(last) = history.pop() {
-            message = last["message"].as_str().unwrap_or_default().to_owned();
-        }
-        let mut body = json!({"message": message, "chat_history": history});
+        // move owned values into the body — json! interpolation would deep-copy them
+        let message = history
+            .pop()
+            .map(|mut last| last["message"].take())
+            .unwrap_or(Value::String(String::new()));
+        let mut body = json!({});
+        body["message"] = message;
+        body["chat_history"] = Value::Array(history);
         if let Some(p) = self.base.chat_params()
             && let Some(mt) = p.max_tokens
         {
@@ -214,9 +224,10 @@ impl ModelEngine for CohereEngine {
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
-            raw_usage_json: json!({"input_tokens": input, "output_tokens": output})
-                .to_string()
-                .into_bytes(),
+            raw_usage_json: serde_json::to_vec(
+                &json!({"input_tokens": input, "output_tokens": output}),
+            )
+            .unwrap_or_default(),
             is_messages_protocol: true, // anthropic's usage fields align with cohere's input/output
             ..Default::default()
         };
@@ -241,7 +252,9 @@ impl ModelEngine for LlamaEngine {
             .map(|m| format!("{}: {}\n", m.role, m.content))
             .collect::<String>()
             + "assistant: ";
-        let mut body = json!({"prompt": prompt});
+        // move the prompt into the body — json! interpolation would copy it
+        let mut body = json!({});
+        body["prompt"] = prompt.into();
         if let Some(p) = self.base.chat_params() {
             if let Some(mt) = p.max_tokens {
                 body["max_gen_len"] = json!(mt);
@@ -268,10 +281,10 @@ impl ModelEngine for LlamaEngine {
             prompt_tokens: pt,
             completion_tokens: ct,
             total_tokens: total,
-            raw_usage_json:
-                json!({"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": total})
-                    .to_string()
-                    .into_bytes(),
+            raw_usage_json: serde_json::to_vec(
+                &json!({"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": total}),
+            )
+            .unwrap_or_default(),
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
@@ -311,8 +324,11 @@ impl DashScopeEngine {
                 parameters["max_tokens"] = json!(mt);
             }
         }
-        Ok(json!({"model": model, "input": {"messages": messages},
-                  "parameters": parameters}))
+        // move owned values into the body — json! interpolation would deep-copy them
+        let mut body = json!({"model": model, "input": {}});
+        body["input"]["messages"] = Value::Array(messages);
+        body["parameters"] = parameters;
+        Ok(body)
     }
 
     fn url(&self) -> String {
@@ -323,10 +339,7 @@ impl DashScopeEngine {
     }
 
     fn headers(&self, stream: bool) -> Vec<(String, String)> {
-        let mut h = vec![(
-            "authorization".into(),
-            format!("Bearer {}", self.base.api_key()),
-        )];
+        let mut h = self.base.bearer_headers();
         if stream {
             // DashScope streams only when this header is present
             h.push(("X-DashScope-SSE".into(), "enable".into()));
@@ -357,16 +370,9 @@ impl DashScopeEngine {
         )
         .await?;
         resp.message = full;
-        resp.aborted = r.aborted;
         crate::engine::fill_total_if_zero(&mut resp);
         resp.raw_usage_json = dashscope_raw_usage(&resp);
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            chunks: r.chunks,
-            streamed_live: r.streamed_live,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::from_pump(resp, status, r))
     }
 }
 
@@ -462,14 +468,13 @@ fn dashscope_apply_usage(usage: &Value, resp: &mut GatewayResponse) {
 
 /// usage dialect normalized to the openai shape at the engine boundary.
 fn dashscope_raw_usage(resp: &GatewayResponse) -> Vec<u8> {
-    json!({
+    serde_json::to_vec(&json!({
         "prompt_tokens": resp.prompt_tokens,
         "completion_tokens": resp.completion_tokens,
         "total_tokens": resp.total_tokens,
         "prompt_tokens_details": {"cached_tokens": resp.read_cached_prompt_tokens},
-    })
-    .to_string()
-    .into_bytes()
+    }))
+    .unwrap_or_default()
 }
 
 #[cfg(test)]

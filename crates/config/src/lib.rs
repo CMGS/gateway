@@ -221,12 +221,7 @@ impl AdminConf {
     /// The configured admin token, read from its env var at call time. `None`
     /// (unset var or no `token_env`) means the admin surface is disabled.
     pub fn token(&self) -> Option<String> {
-        if self.token_env.is_empty() {
-            return None;
-        }
-        std::env::var(&self.token_env)
-            .ok()
-            .filter(|t| !t.is_empty())
+        token_from_env(&self.token_env)
     }
 }
 
@@ -277,12 +272,7 @@ pub struct TenantConf {
 impl TenantConf {
     /// The tenant admin token, read from its env var at call time.
     pub fn admin_token(&self) -> Option<String> {
-        if self.admin_token_env.is_empty() {
-            return None;
-        }
-        std::env::var(&self.admin_token_env)
-            .ok()
-            .filter(|t| !t.is_empty())
+        token_from_env(&self.admin_token_env)
     }
 }
 
@@ -644,6 +634,15 @@ impl GatewayConfig {
         }
         self.prices_for(model)
     }
+}
+
+/// A token read from the named env var at call time; `None` when the name is
+/// empty or the var is unset/empty.
+fn token_from_env(var: &str) -> Option<String> {
+    if var.is_empty() {
+        return None;
+    }
+    std::env::var(var).ok().filter(|t| !t.is_empty())
 }
 
 /// Deterministic hash of the config document, stable across processes.

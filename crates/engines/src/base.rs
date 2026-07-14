@@ -69,11 +69,11 @@ impl Base {
 
     /// The last message's content — the free-text fallback the non-chat
     /// families use when typed params are absent.
-    pub fn last_message_text(&self) -> String {
+    pub fn last_message_text(&self) -> &str {
         self.request
             .message
             .last()
-            .map(|m| m.content.clone())
+            .map(|m| m.content.as_str())
             .unwrap_or_default()
     }
 
@@ -110,13 +110,26 @@ impl Base {
         body: Value,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
+        let bytes = body_bytes(&body)?;
+        self.send_bytes(url, headers, bytes, stream).await
+    }
+
+    /// Build and send an upstream POST from pre-serialized bytes — the SigV4
+    /// engines sign the exact payload they send.
+    pub async fn send_bytes(
+        &self,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        stream: bool,
+    ) -> GResult<UpstreamResponse> {
         let param = self.param()?;
         let up = UpstreamRequest {
             protocol: param.protocol,
             method: "POST".to_owned(),
             url: url.to_owned(),
             headers,
-            body: body.to_string().into_bytes(),
+            body,
             stream,
             account: self.account(),
         };
@@ -141,8 +154,7 @@ impl Base {
 
     /// Bespoke-engine POST (no buffering): merges `param.raw` passthrough into
     /// the body (typed fields stay authoritative) and ensures a JSON
-    /// content-type, so every field the caller set reaches the vendor. For the
-    /// AWS engines content-type is currently an unsigned header.
+    /// content-type, so every field the caller set reaches the vendor.
     pub async fn post_raw(
         &self,
         url: &str,
@@ -153,12 +165,7 @@ impl Base {
         if let Some(obj) = body.as_object_mut() {
             merge_raw_extras(obj, &self.param()?.raw);
         }
-        if !headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        {
-            headers.insert(0, ("content-type".into(), "application/json".into()));
-        }
+        ensure_json_content_type(&mut headers);
         self.send_upstream_raw(url, headers, body, stream).await
     }
 
@@ -175,6 +182,39 @@ impl Base {
             .buffered()
             .await?;
         parse_json_reply(reply)
+    }
+
+    /// [`Self::send_bytes`] + buffer + parse for a pre-serialized body (no raw
+    /// merge — the caller already folded extras in before signing/sending).
+    /// The ensured content-type is an unsigned header on the AWS engines.
+    pub async fn post_json_bytes(
+        &self,
+        url: &str,
+        mut headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> GResult<(u16, Value)> {
+        ensure_json_content_type(&mut headers);
+        let reply = self
+            .send_bytes(url, headers, body, false)
+            .await?
+            .buffered()
+            .await?;
+        parse_json_reply(reply)
+    }
+}
+
+/// Serialize a request body straight to bytes (no intermediate String pass).
+pub(crate) fn body_bytes(body: &Value) -> GResult<Vec<u8>> {
+    serde_json::to_vec(body)
+        .map_err(|e| GatewayError::internal("serialize request body").with_source(e))
+}
+
+fn ensure_json_content_type(headers: &mut Vec<(String, String)>) {
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    {
+        headers.insert(0, ("content-type".into(), "application/json".into()));
     }
 }
 

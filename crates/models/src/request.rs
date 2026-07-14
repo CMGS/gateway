@@ -66,11 +66,6 @@ pub mod domain {
                 ..Default::default()
             }
         }
-
-        pub fn with_typed(mut self, typed: TypedParams) -> Self {
-            self.typed = Some(typed);
-            self
-        }
     }
 
     // `Protocol` has no Default, so the struct's Default is manual.

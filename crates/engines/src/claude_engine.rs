@@ -2,7 +2,7 @@
 //! blocks, and streaming (the standard anthropic SSE event sequence). Marks
 //! `is_messages_protocol` so the usage extractor applies the Anthropic map.
 
-use gw_models::{GResult, GatewayError, GatewayResponse, TypedParams};
+use gw_models::{GResult, GatewayError, GatewayResponse};
 use serde_json::{Map, Value, json};
 
 use crate::base::base_engine;
@@ -40,7 +40,7 @@ impl ClaudeEngine {
         body.insert("messages".into(), Value::Array(messages));
         body.insert("stream".into(), self.base.request.stream.into());
         let mut max_tokens = 1024;
-        if let Some(TypedParams::Chat(p)) = &param.typed {
+        if let Some(p) = self.base.chat_params() {
             if let Some(mt) = p.max_tokens {
                 max_tokens = mt;
             }
@@ -83,7 +83,7 @@ impl ClaudeEngine {
                 // Anthropic API mandates this header; a real call 400s without it.
                 ("anthropic-version".into(), "2023-06-01".into()),
             ],
-            body: Value::Object(body).to_string().into_bytes(),
+            body: crate::base::body_bytes(&Value::Object(body))?,
             stream: self.base.request.stream,
             account: self.base.account(),
         })
@@ -125,7 +125,7 @@ impl ClaudeEngine {
             raw_usage_json: if usage.is_null() {
                 vec![]
             } else {
-                usage.to_string().into_bytes()
+                serde_json::to_vec(usage).unwrap_or_default()
             },
             ..Default::default()
         };
@@ -147,14 +147,7 @@ impl ClaudeEngine {
         )
         .await?;
         st.finish(&mut resp);
-        resp.aborted = r.aborted;
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            chunks: r.chunks,
-            streamed_live: r.streamed_live,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::from_pump(resp, status, r))
     }
 }
 
@@ -289,9 +282,9 @@ impl SseState {
         resp.prompt_tokens = input;
         resp.completion_tokens = output;
         resp.total_tokens = input.saturating_add(output);
-        resp.raw_usage_json = json!({"input_tokens": input, "output_tokens": output})
-            .to_string()
-            .into_bytes();
+        resp.raw_usage_json =
+            serde_json::to_vec(&json!({"input_tokens": input, "output_tokens": output}))
+                .unwrap_or_default();
     }
 }
 
@@ -300,7 +293,7 @@ mod tests {
     use super::*;
     use crate::transport::MockTransport;
     use gw_consts::Protocol;
-    use gw_models::{ChatMsg, ChatParams, GatewayRequest, ModelParamV2};
+    use gw_models::{ChatMsg, ChatParams, GatewayRequest, ModelParamV2, TypedParams};
     use std::sync::Arc;
 
     fn base_req() -> GatewayRequest {

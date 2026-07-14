@@ -1437,8 +1437,6 @@ mod tests {
         let store = SqliteStore::open_with_cap(dir.path().join("r.db").to_str().unwrap(), 2)
             .await
             .unwrap();
-        // the SQL stores prune every LEDGER_PRUNE_EVERY inserts, so the cap is
-        // approximate: drive past one full prune cycle and check the bound
         for i in 0..=LEDGER_PRUNE_EVERY {
             store.ledger_add(&record(&format!("m{i}"))).await.unwrap();
         }
@@ -1740,7 +1738,7 @@ mod tests {
         let fin = tokio::spawn(async move { s2.batch_finalize(&jid, 0).await });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        txa.commit().await.unwrap(); // result now visible; lock released
+        txa.commit().await.unwrap();
         assert_eq!(
             fin.await.unwrap().unwrap(),
             Some(BatchStatus::Completed),

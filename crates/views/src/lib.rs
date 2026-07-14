@@ -84,50 +84,14 @@ impl AppState {
         self
     }
 
-    /// Reload config from source and swap it in atomically; storage-backend
-    /// (redis/sqlite URL) changes need a restart and are ignored here.
+    /// Reload config from source and swap it in atomically (transport policy
+    /// rides along in the handler); storage-backend (redis/sqlite URL) changes
+    /// need a restart and are ignored here.
     pub async fn reload(&self) -> Result<(), String> {
         let loader = self.loader.as_ref().ok_or("reload not configured")?;
         let cfg = loader().await?;
-        // upstream policy is baked in at boot, not config-derived — push reloaded values explicitly
-        let (default, per_account) = upstream_policies(&cfg);
-        self.handler
-            .config
-            .reload(cfg)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.handler.transport.reload_policies(default, per_account);
-        Ok(())
+        self.handler.reload(cfg).await.map_err(|e| e.to_string())
     }
-}
-
-/// The default + per-account [`UpstreamPolicy`] map derived from a config.
-pub fn upstream_policies(
-    cfg: &GatewayConfig,
-) -> (
-    gw_engines::http_transport::UpstreamPolicy,
-    std::collections::HashMap<String, gw_engines::http_transport::UpstreamPolicy>,
-) {
-    use gw_engines::http_transport::UpstreamPolicy;
-    let default = UpstreamPolicy::default();
-    let per_account = cfg
-        .accounts
-        .iter()
-        .filter(|a| a.timeout_seconds.is_some() || a.connect_retries.is_some())
-        .map(|a| {
-            (
-                a.name.clone(),
-                UpstreamPolicy {
-                    timeout: a
-                        .timeout_seconds
-                        .map(std::time::Duration::from_secs)
-                        .unwrap_or(default.timeout),
-                    connect_retries: a.connect_retries.unwrap_or(default.connect_retries),
-                },
-            )
-        })
-        .collect();
-    (default, per_account)
 }
 
 /// Build the application router.
@@ -737,7 +701,6 @@ async fn realtime_bridge(
             },
         }
     }
-    // refund reserves for turns that never reached a boundary frame
     if !pending.is_empty() {
         let state = s.handler.state();
         for a in pending {
@@ -822,7 +785,9 @@ async fn list_models(State(s): State<AppState>, headers: HeaderMap) -> Response 
             })
         })
         .collect();
-    Json(json!({ "object": "list", "data": data })).into_response()
+    let mut resp = json!({ "object": "list" });
+    resp["data"] = Value::Array(data);
+    Json(resp).into_response()
 }
 
 /// Local billing ledger snapshot.
@@ -855,7 +820,9 @@ async fn accounts(State(s): State<AppState>) -> Json<Value> {
             "protocols": a.protocols,
         }));
     }
-    Json(json!({ "count": data.len(), "accounts": data }))
+    let mut resp = json!({ "count": data.len() });
+    resp["accounts"] = Value::Array(data);
+    Json(resp)
 }
 
 /// AK auth: `Authorization: Bearer <ak>` or `x-api-key: <ak>`. The error is
@@ -1054,7 +1021,6 @@ async fn admin_key_create(
     let (Some(ak), Some(product)) = (body["ak"].as_str(), body["product"].as_str()) else {
         return error_response(400, "ak and product are required");
     };
-    // a tenant admin defaults into, and may only write, its own tenant
     let default_tenant = match &scope {
         AdminScope::Global => gw_config::DEFAULT_TENANT,
         AdminScope::Tenant(t) => t.as_str(),
@@ -1215,7 +1181,9 @@ async fn admin_key_list(State(s): State<AppState>, headers: HeaderMap) -> Respon
         .filter(|k| scope.covers(&k.tenant))
         .map(|k| ak_public_json(&k))
         .collect();
-    Json(json!({ "count": keys.len(), "keys": keys })).into_response()
+    let mut resp = json!({ "count": keys.len() });
+    resp["keys"] = Value::Array(keys);
+    Json(resp).into_response()
 }
 
 /// GET /admin/usage — ledger rollup by (tenant, requested model). A tenant
@@ -1342,7 +1310,6 @@ async fn chat_completions(
         return error_response(400, "messages must not be empty");
     }
 
-    // move the caller's payloads (multimodal parts can be large) instead of cloning
     let messages: Vec<ChatMsg> = body
         .messages
         .into_iter()
@@ -1400,7 +1367,7 @@ async fn chat_completions(
         Err(e) => return gateway_error(e),
     };
     log_access("chat_completions", &ctx, started);
-    let Some(outcome) = ctx.outcome else {
+    let Some(mut outcome) = ctx.outcome else {
         return error_response(500, "pipeline produced no outcome");
     };
 
@@ -1411,12 +1378,12 @@ async fn chat_completions(
         completion_tokens: outcome.response.completion_tokens,
         total_tokens: outcome.response.total_tokens,
     };
-    let model_out = outcome.response.model.clone();
+    // the outcome is owned and served exactly once — move fields, don't clone
+    let model_out = outcome.response.model;
 
-    // tool_calls response: content=null + finish_reason=tool_calls (OpenAI semantics)
-    if let Some(tc) = &outcome.response.tool_calls {
+    if let Some(tc) = outcome.response.tool_calls.take() {
         let calls: Vec<gw_protocol::openai::ToolCall> =
-            serde_json::from_value(tc.clone()).unwrap_or_default();
+            serde_json::from_value(tc).unwrap_or_default();
         let resp = ChatCompletionResponse::tool_calls(id, created, model_out, calls, usage);
         return (StatusCode::OK, Json(resp)).into_response();
     }
@@ -1425,7 +1392,7 @@ async fn chat_completions(
         id,
         created,
         model_out,
-        outcome.response.message.clone(),
+        outcome.response.message,
         finish_openai(&outcome.response.finish_reason),
         usage,
     );
@@ -1454,7 +1421,13 @@ fn spawn_stream_pipeline(
         match handler.run(request, ak).await {
             Ok(ctx) => {
                 log_access(surface, &ctx, started);
-                if let Some(outcome) = &ctx.outcome {
+                // the context is served exactly once — move the outcome, don't clone
+                if let Some(outcome) = ctx.outcome {
+                    let usage_totals = (
+                        outcome.response.prompt_tokens,
+                        outcome.response.completion_tokens,
+                        outcome.response.total_tokens,
+                    );
                     let mut tail = if dlp {
                         redacted_stream_tail(outcome)
                     } else if outcome.streamed_live {
@@ -1463,11 +1436,7 @@ fn spawn_stream_pipeline(
                         synth_chunks(outcome)
                     };
                     tail.push(gw_engines::StreamChunk {
-                        usage_totals: Some((
-                            outcome.response.prompt_tokens,
-                            outcome.response.completion_tokens,
-                            outcome.response.total_tokens,
-                        )),
+                        usage_totals: Some(usage_totals),
                         ..Default::default()
                     });
                     for c in tail {
@@ -1607,7 +1576,6 @@ fn chat_stream_response(
                     true
                 }
                 None => {
-                    // producer gone without a usage chunk — close the stream cleanly
                     self.queue.push_back(Event::default().data("[DONE]"));
                     true
                 }
@@ -1627,26 +1595,27 @@ fn chat_stream_response(
 }
 
 /// Chunks for an engine that returned a buffered response.
-fn synth_chunks(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
-    let mut chunks = if outcome.chunks.is_empty() && !outcome.response.message.is_empty() {
+fn synth_chunks(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
+    let mut resp = outcome.response;
+    let mut chunks = if outcome.chunks.is_empty() && !resp.message.is_empty() {
         vec![gw_engines::StreamChunk {
-            delta: outcome.response.message.clone(),
+            delta: resp.message,
             ..Default::default()
         }]
     } else {
-        outcome.chunks.clone()
+        outcome.chunks
     };
-    if let Some(tc) = &outcome.response.tool_calls
+    if let Some(tc) = resp.tool_calls.take()
         && !chunks.iter().any(|c| c.tool_calls.is_some())
     {
         chunks.push(gw_engines::StreamChunk {
-            tool_calls: Some(tc.clone()),
+            tool_calls: Some(tc),
             ..Default::default()
         });
     }
     if !chunks.iter().any(|c| c.finish_reason.is_some()) {
         chunks.push(gw_engines::StreamChunk {
-            finish_reason: Some(finish_or_stop(&outcome.response.finish_reason).to_owned()),
+            finish_reason: Some(finish_or_stop(&resp.finish_reason).to_owned()),
             ..Default::default()
         });
     }
@@ -1655,22 +1624,23 @@ fn synth_chunks(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamCh
 
 /// The stream tail under outbound DLP: unlike [`synth_chunks`] it never replays
 /// the raw pre-redaction deltas, so no unmasked text ever leaves.
-fn redacted_stream_tail(outcome: &gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
+fn redacted_stream_tail(outcome: gw_engines::EngineOutcome) -> Vec<gw_engines::StreamChunk> {
+    let mut resp = outcome.response;
     let mut chunks = Vec::new();
-    if !outcome.response.message.is_empty() {
+    if !resp.message.is_empty() {
         chunks.push(gw_engines::StreamChunk {
-            delta: outcome.response.message.clone(),
+            delta: resp.message,
             ..Default::default()
         });
     }
-    if let Some(tc) = &outcome.response.tool_calls {
+    if let Some(tc) = resp.tool_calls.take() {
         chunks.push(gw_engines::StreamChunk {
-            tool_calls: Some(tc.clone()),
+            tool_calls: Some(tc),
             ..Default::default()
         });
     }
     chunks.push(gw_engines::StreamChunk {
-        finish_reason: Some(finish_or_stop(&outcome.response.finish_reason).to_owned()),
+        finish_reason: Some(finish_or_stop(&resp.finish_reason).to_owned()),
         ..Default::default()
     });
     chunks
@@ -1713,7 +1683,6 @@ async fn messages(
         is_online: true,
         stream: body.stream,
         ak: ak.ak.clone(),
-        // move the caller's payloads (multimodal blocks can be large) instead of cloning
         message: body
             .messages
             .into_iter()
@@ -1745,9 +1714,10 @@ async fn messages(
 
     let tool_use = anthropic_tool_blocks(outcome.response.tool_calls.as_ref());
     let mut content: Vec<gw_protocol::anthropic::ContentBlock> = Vec::new();
+    // the outcome is owned and served exactly once — move fields, don't clone
     if !outcome.response.message.is_empty() {
         content.push(gw_protocol::anthropic::ContentBlock::Text {
-            text: outcome.response.message.clone(),
+            text: outcome.response.message,
         });
     }
     for b in &tool_use {
@@ -1759,7 +1729,7 @@ async fn messages(
     }
     let resp = MessagesResponse::new(
         next_id("msg"),
-        outcome.response.model.clone(),
+        outcome.response.model,
         content,
         finish_anthropic(&outcome.response.finish_reason),
         AnthUsage {
@@ -1959,7 +1929,6 @@ fn messages_stream_response(
                     false
                 }
                 None => {
-                    // producer gone without a usage chunk — close out cleanly
                     self.finish(0, 0);
                     true
                 }
@@ -2468,7 +2437,6 @@ async fn batches_submit(
     let mut batch_items = Vec::new();
 
     if let Some(file_id) = body["input_file_id"].as_str() {
-        // another tenant's file answers 404, not 403 — don't leak its existence
         let found = s.handler.state().store.file_get(file_id).await;
         let file = match tenant_owned(found, |f| &f.tenant, &ak.tenant, "input file", file_id) {
             Ok(f) => f,

@@ -3,7 +3,7 @@
 //! `GatewayResponse` + stream chunks, and slices the raw usage subtree into
 //! `raw_usage_json` for the CommonUsage DAG node.
 
-use gw_models::{GResult, GatewayError, GatewayResponse, TypedParams};
+use gw_models::{GResult, GatewayError, GatewayResponse};
 use serde_json::{Map, Value, json};
 
 use crate::base::base_engine;
@@ -58,7 +58,7 @@ impl OpenAiEngine {
             body.insert("stream_options".into(), json!({"include_usage": true}));
         }
 
-        if let Some(TypedParams::Chat(p)) = &param.typed {
+        if let Some(p) = self.base.chat_params() {
             macro_rules! put {
                 ($k:literal, $v:expr) => {
                     if let Some(v) = $v {
@@ -89,8 +89,8 @@ impl OpenAiEngine {
                 // openai surface's system goes through messages; injected here for
                 // cross-protocol (anthropic→openai family) requests
                 let mut msgs = vec![json!({"role": "system", "content": s})];
-                if let Some(Value::Array(existing)) = body.get("messages") {
-                    msgs.extend(existing.clone());
+                if let Some(Value::Array(existing)) = body.remove("messages") {
+                    msgs.extend(existing);
                 }
                 body.insert("messages".into(), Value::Array(msgs));
             }
@@ -105,7 +105,7 @@ impl OpenAiEngine {
                 self.base.base_url("mock://api.openai.com")
             ),
             headers: self.base.bearer_headers(),
-            body: Value::Object(body).to_string().into_bytes(),
+            body: crate::base::body_bytes(&Value::Object(body))?,
             stream: self.base.request.stream,
             account: self.base.account(),
         })
@@ -142,14 +142,7 @@ impl OpenAiEngine {
         })
         .await?;
         resp.message = full;
-        resp.aborted = r.aborted;
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            chunks: r.chunks,
-            streamed_live: r.streamed_live,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::from_pump(resp, status, r))
     }
 }
 
@@ -288,7 +281,7 @@ fn apply_openai_usage(resp: &mut GatewayResponse, usage: &Value) {
     resp.prompt_tokens = crate::engine::tok(&usage["prompt_tokens"]);
     resp.completion_tokens = crate::engine::tok(&usage["completion_tokens"]);
     resp.total_tokens = crate::engine::tok(&usage["total_tokens"]);
-    resp.raw_usage_json = usage.to_string().into_bytes();
+    resp.raw_usage_json = serde_json::to_vec(usage).unwrap_or_default();
 }
 
 #[cfg(test)]
@@ -296,7 +289,7 @@ mod tests {
     use super::*;
     use crate::transport::MockTransport;
     use gw_consts::Protocol;
-    use gw_models::{ChatMsg, ChatParams, GatewayRequest, ModelParamV2};
+    use gw_models::{ChatMsg, ChatParams, GatewayRequest, ModelParamV2, TypedParams};
     use std::sync::Arc;
 
     fn req(stream: bool) -> GatewayRequest {

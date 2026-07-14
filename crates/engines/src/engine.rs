@@ -78,6 +78,22 @@ impl EngineOutcome {
             streamed_live: false,
         }
     }
+
+    /// A streaming outcome: chunks, liveness, and the abort flag from the pump.
+    pub fn from_pump(
+        mut response: GatewayResponse,
+        http_code: u16,
+        pump: crate::pump::PumpResult,
+    ) -> Self {
+        response.aborted = pump.aborted;
+        Self {
+            response,
+            http_code,
+            block: Block::allow(),
+            chunks: pump.chunks,
+            streamed_live: pump.streamed_live,
+        }
+    }
 }
 
 /// One engine per upstream model method. An engine's job is strictly

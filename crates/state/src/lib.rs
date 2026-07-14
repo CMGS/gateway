@@ -228,17 +228,12 @@ impl RateLimiter {
         if qps <= 0.0 {
             return false;
         }
-        let limiter = loop {
-            if let Some(mut e) = self.buckets.get_mut(key) {
-                if e.0 != qps {
-                    *e = (qps, new_bucket(qps));
-                }
-                break e.1.clone();
-            }
-            self.buckets
-                .entry(key.to_owned())
-                .or_insert_with(|| (qps, new_bucket(qps)));
-        };
+        let mut e = slot_mut(&self.buckets, key, || (qps, new_bucket(qps)));
+        if e.0 != qps {
+            *e = (qps, new_bucket(qps));
+        }
+        let limiter = e.1.clone();
+        drop(e);
         limiter.check().is_ok()
     }
 }
@@ -280,18 +275,18 @@ impl QuotaStore {
 
     /// Post-consume actual usage; saturating against a hostile i64::MAX count.
     pub fn consume(&self, ak: &str, tokens: i64) {
-        let mut e = counter(&self.used, ak);
+        let mut e = slot_mut(&self.used, ak, || 0);
         *e = e.saturating_add(tokens);
     }
 
     /// Admission with reservation, atomic under the entry guard.
     pub fn reserve(&self, key: &str, amount: i64, limit: i64) -> bool {
-        reserve_on(&mut counter(&self.used, key), amount, limit)
+        reserve_on(&mut slot_mut(&self.used, key, || 0), amount, limit)
     }
 
     /// Apply the settle delta (actual - reserved); never below zero.
     pub fn settle(&self, key: &str, delta: i64) {
-        settle_on(&mut counter(&self.used, key), delta);
+        settle_on(&mut slot_mut(&self.used, key, || 0), delta);
     }
 
     /// Daily reset.
@@ -300,16 +295,18 @@ impl QuotaStore {
     }
 }
 
-/// The counter entry for `key`, allocating the key String only on first use.
-fn counter<'a>(
-    map: &'a DashMap<String, i64>,
+/// The entry for `key`, inserting `init()` on first use — the key String is
+/// allocated only on the miss path.
+fn slot_mut<'a, V>(
+    map: &'a DashMap<String, V>,
     key: &str,
-) -> dashmap::mapref::one::RefMut<'a, String, i64> {
+    init: impl Fn() -> V,
+) -> dashmap::mapref::one::RefMut<'a, String, V> {
     loop {
         if let Some(e) = map.get_mut(key) {
             return e;
         }
-        map.entry(key.to_owned()).or_insert(0);
+        map.entry(key.to_owned()).or_insert_with(&init);
     }
 }
 
@@ -444,11 +441,6 @@ pub struct TokenWindow {
 }
 
 impl TokenWindow {
-    /// Pre-check: tokens already spent in this window are under the limit.
-    pub fn check(&self, key: &str, limit: i64, window: std::time::Duration) -> bool {
-        self.slot(key, window).1 < limit
-    }
-
     /// Windowed admission with reservation, atomic under the entry guard.
     pub fn reserve(&self, key: &str, amount: i64, limit: i64, window: std::time::Duration) -> bool {
         reserve_on(&mut self.slot(key, window).1, amount, limit)
@@ -472,17 +464,11 @@ impl TokenWindow {
         key: &str,
         window: std::time::Duration,
     ) -> dashmap::mapref::one::RefMut<'_, String, (Instant, i64)> {
-        loop {
-            if let Some(mut e) = self.entries.get_mut(key) {
-                if e.0.elapsed() >= window {
-                    *e = (Instant::now(), 0);
-                }
-                return e;
-            }
-            self.entries
-                .entry(key.to_owned())
-                .or_insert_with(|| (Instant::now(), 0));
+        let mut e = slot_mut(&self.entries, key, || (Instant::now(), 0));
+        if e.0.elapsed() >= window {
+            *e = (Instant::now(), 0);
         }
+        e
     }
 }
 

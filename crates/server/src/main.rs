@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
     let quota_task = gw_task::spawn_quota_reset(state.clone(), gw_task::DAILY);
     let distributed_batches = state.store.distributed_batches();
 
-    let transport = select_transport(&cfg)?;
+    let transport = select_transport()?;
     let postgres_url = cfg.storage.postgres_url.clone();
     let shared = gw_state::SharedConfig::new(cfg, state);
     let loader: gw_views::ConfigLoader = match &config_store {
@@ -196,9 +196,10 @@ async fn main() -> anyhow::Result<()> {
 
 /// Choose the upstream transport from `GW_TRANSPORT`: `mock` forces zero egress,
 /// `http` forces real HTTP (accounts without an endpoint fail loudly), anything
-/// else routes `mock://` sentinels in-process and real URLs over HTTP.
-fn select_transport(cfg: &GatewayConfig) -> anyhow::Result<gw_engines::SharedTransport> {
-    let (default_policy, per_account) = gw_views::upstream_policies(cfg);
+/// else routes `mock://` sentinels in-process and real URLs over HTTP. Built
+/// with default policies — the handler pushes the config-derived ones at
+/// construction and on every reload.
+fn select_transport() -> anyhow::Result<gw_engines::SharedTransport> {
     Ok(match env::var("GW_TRANSPORT").as_deref() {
         Ok("mock") => {
             tracing::info!("transport = mock (zero egress)");
@@ -207,16 +208,16 @@ fn select_transport(cfg: &GatewayConfig) -> anyhow::Result<gw_engines::SharedTra
         Ok("http") => {
             tracing::info!("transport = http (accounts without an endpoint fail)");
             std::sync::Arc::new(gw_engines::http_transport::HttpTransport::with_policies(
-                default_policy,
-                per_account,
+                Default::default(),
+                Default::default(),
             )?)
         }
         _ => {
             tracing::info!("transport = auto (mock:// in-process, real URLs over HTTP)");
             std::sync::Arc::new(
                 gw_engines::http_transport::DispatchTransport::with_policies(
-                    default_policy,
-                    per_account,
+                    Default::default(),
+                    Default::default(),
                 )?,
             )
         }

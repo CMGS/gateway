@@ -1,9 +1,10 @@
 //! Model engines.
 //!
-//! Layer L3. Defines the `ModelEngine` trait, the `Transport` seam (the default
-//! build ships only `MockTransport`; no real upstream calls are made), the SSE
-//! decoder, usage normalization, the dispatch factory,
-//! and engine implementations.
+//! Layer L3. Defines the `ModelEngine` trait, the `Transport` seam
+//! (`MockTransport` for endpoint-less accounts, `HttpTransport` and the
+//! scheme-routing `DispatchTransport` — the server default — for live ones),
+//! the SSE decoder, usage normalization, the dispatch factory, and the engine
+//! implementations.
 
 mod base;
 

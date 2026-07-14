@@ -8,17 +8,17 @@ use gw_state::admission;
 use crate::context::DagContext;
 use crate::executor::{DagNode, Layer};
 
-/// A shared admission denial as the wire error every limit answers with.
-fn limit_denied(msg: String) -> GatewayError {
-    GatewayError::new(ErrCode::STOP_LIMIT_MSG, 429, msg)
-}
-
 /// Completion tokens reserved when the caller sets no max_tokens; settle
 /// corrects to actuals, so the estimate only needs to be monotone.
 const DEFAULT_COMPLETION_RESERVE: i64 = 256;
 /// Cap on the reservation regardless of a caller's `max_tokens`, so a hostile
 /// `max_tokens: i64::MAX` can't overflow the estimate or corrupt the counter.
 const MAX_RESERVE: i64 = 1_000_000;
+
+/// A shared admission denial as the wire error every limit answers with.
+fn limit_denied(msg: String) -> GatewayError {
+    GatewayError::new(ErrCode::STOP_LIMIT_MSG, 429, msg)
+}
 
 /// preprocess/model_quota: per-(AK, model) daily token cap — AK override, else
 /// tenant default, else unmetered (the per-AK daily cap backstops). Over-quota
@@ -32,20 +32,19 @@ impl DagNode for ModelQuotaGate {
         "model_quota"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let limit = match ctx.request.model_param_v2.as_ref() {
-            Some(p) if !p.model_name.is_empty() => {
-                admission::model_quota_limit(&ctx.cfg, &ctx.ak, &p.model_name)
-            }
-            _ => return Ok(()),
+        let Some(p) = ctx
+            .request
+            .model_param_v2
+            .as_ref()
+            .filter(|p| !p.model_name.is_empty())
+        else {
+            return Ok(());
         };
-        let Some(limit) = limit else {
+        let Some(limit) = admission::model_quota_limit(&ctx.cfg, &ctx.ak, &p.model_name) else {
             return Ok(());
         };
         // clone only on the metered path — the common unmetered case stays allocation-free
-        let requested = match ctx.request.model_param_v2.as_ref() {
-            Some(p) => p.model_name.clone(),
-            None => return Ok(()),
-        };
+        let requested = p.model_name.clone();
         let key = admission::model_quota_key(&ctx.ak.ak, &requested);
         let under = ctx.state.governance.quota_check(&key, limit).await;
         // usage accrues to the requested name either way: a fallback period ends at the daily reset
@@ -452,7 +451,7 @@ impl DagNode for CallEngine {
                     )
                     .await;
                 let Some(next) = next else {
-                    return Err(first_err); // no backup account available, propagate the original error
+                    return Err(first_err);
                 };
                 let spillover = failed.is_ptu() && !next.is_ptu();
                 ctx.decide(
@@ -516,7 +515,7 @@ impl DagNode for CostCalc {
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let Some(outcome) = ctx.outcome.as_ref() else {
-            return Ok(()); // nothing to bill
+            return Ok(());
         };
         let resp = &outcome.response;
         // An aborted stream delivered text but never the final usage frame — bill it.
@@ -526,19 +525,14 @@ impl DagNode for CostCalc {
             let enc = gw_models::token_estimate::default_encoder();
             let param = ctx.request.model_param_v2.as_ref();
             let tools = param.and_then(|p| p.typed.as_ref()).and_then(|t| match t {
-                gw_models::TypedParams::Chat(c) => c.tools.clone(),
+                gw_models::TypedParams::Chat(c) => c.tools.as_ref(),
                 _ => None,
             });
             let model_name = param.map(|p| p.model_name.as_str()).unwrap_or_default();
             let pt = if resp.prompt_tokens > 0 {
                 resp.prompt_tokens
             } else {
-                gw_models::estimate_prompt_tokens(
-                    &ctx.request.message,
-                    tools.as_ref(),
-                    model_name,
-                    enc,
-                )
+                gw_models::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
             };
             let ct = enc.encode_len(&resp.message) as i64;
             ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
@@ -639,7 +633,7 @@ impl DagNode for CacheStore {
         if ctx.request.stream || !ctx.request.is_online {
             return Ok(());
         }
-        let (Some(key), Some(outcome)) = (ctx.cache_key.as_ref(), ctx.outcome.as_ref()) else {
+        let Some(outcome) = ctx.outcome.as_ref() else {
             return Ok(());
         };
         let Some(param) = ctx.request.model_param_v2.as_ref() else {
@@ -652,11 +646,15 @@ impl DagNode for CacheStore {
         else {
             return Ok(());
         };
-        if outcome.http_code == 200 && !outcome.block.block && !outcome.response.aborted {
+        if outcome.http_code == 200
+            && !outcome.block.block
+            && !outcome.response.aborted
+            && let Some(key) = ctx.cache_key.take()
+        {
             ctx.state
                 .cache
                 .put(
-                    key.clone(),
+                    key,
                     outcome.response.clone(),
                     std::time::Duration::from_secs(ttl),
                 )
@@ -713,7 +711,7 @@ fn model_provider(ctx: &DagContext) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod nodes_tests {
+mod tests {
     #[test]
     fn reserve_estimate_saturates_on_hostile_max_tokens() {
         use gw_models::params::ChatParams;

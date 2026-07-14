@@ -30,7 +30,6 @@ fn gemini_parts(m: &gw_models::ChatMsg) -> Vec<Value> {
                     if let Some((mime, data)) = parse_data_uri(url) {
                         out.push(json!({"inlineData": {"mimeType": mime, "data": data}}));
                     }
-                    // remote (non-data) URL: cannot inline without a fetch → skip
                 }
                 _ => {}
             }
@@ -80,9 +79,11 @@ impl VertexEngine {
                 json!({"role": role, "parts": gemini_parts(m)})
             })
             .collect();
-        let mut body = json!({"contents": contents});
+        // moved in — json! interpolation would deep-copy the conversation
+        let mut body = json!({});
+        body["contents"] = Value::Array(contents);
         // sampling params → generationConfig — else Gemini silently uses defaults
-        if let Some(TypedParams::Chat(p)) = self.base.param()?.typed.as_ref() {
+        if let Some(p) = self.base.chat_params() {
             let mut gen_cfg = json!({});
             if let Some(t) = p.temperature {
                 gen_cfg["temperature"] = json!(t);
@@ -128,16 +129,9 @@ impl VertexEngine {
         )
         .await?;
         resp.message = full;
-        resp.aborted = r.aborted;
         crate::engine::fill_total_if_zero(&mut resp);
         resp.raw_usage_json = vertex_raw_usage(&resp);
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            chunks: r.chunks,
-            streamed_live: r.streamed_live,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::from_pump(resp, status, r))
     }
 }
 
@@ -237,14 +231,13 @@ fn vertex_apply_usage(um: &Value, resp: &mut GatewayResponse) {
 /// usage dialect normalized to the openai shape at the engine boundary
 /// (CommonUsage extraction follows the openai field table).
 fn vertex_raw_usage(resp: &GatewayResponse) -> Vec<u8> {
-    json!({
+    serde_json::to_vec(&json!({
         "prompt_tokens": resp.prompt_tokens,
         "completion_tokens": resp.completion_tokens,
         "total_tokens": resp.total_tokens,
         "completion_tokens_details": {"reasoning_tokens": resp.reasoning_tokens},
-    })
-    .to_string()
-    .into_bytes()
+    }))
+    .unwrap_or_default()
 }
 
 base_engine!(EmbeddingsEngine);
@@ -254,22 +247,25 @@ impl ModelEngine for EmbeddingsEngine {
     /// Merges the openai/ali/vertex embedding engines to the openai shape.
     async fn run(&self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
-        let input: Vec<String> = match &param.typed {
-            Some(TypedParams::Embeddings(p)) => p.input.clone(),
-            _ => self
-                .base
-                .request
-                .message
-                .iter()
-                .map(|m| m.content.clone())
-                .collect(),
+        // borrow the inputs into the body — one copy (the body), not two
+        let input = match &param.typed {
+            Some(TypedParams::Embeddings(p)) => json!(p.input),
+            _ => Value::Array(
+                self.base
+                    .request
+                    .message
+                    .iter()
+                    .map(|m| json!(m.content))
+                    .collect(),
+            ),
         };
-        if input.is_empty() {
+        if input.as_array().is_none_or(|a| a.is_empty()) {
             return Err(GatewayError::bad_request(
                 "embeddings input must not be empty",
             ));
         }
-        let mut body = json!({"model": param.model_name, "input": input});
+        let mut body = json!({"model": param.model_name});
+        body["input"] = input;
         if let Some(TypedParams::Embeddings(p)) = &param.typed
             && let Some(d) = p.dimensions
         {
@@ -290,7 +286,7 @@ impl ModelEngine for EmbeddingsEngine {
             model: param.model_name.clone(),
             prompt_tokens: pt,
             total_tokens: pt,
-            raw_usage_json: v["usage"].to_string().into_bytes(),
+            raw_usage_json: serde_json::to_vec(&v["usage"]).unwrap_or_default(),
             response_v2: Some(v),
             finish_reason: "stop".to_owned(),
             ..Default::default()
@@ -306,13 +302,14 @@ impl ModelEngine for ImageEngine {
     /// Merges the dalle/wanx/flux/stability/... engines to the images/generations shape.
     async fn run(&self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
+        // borrow the params into the body — one copy (the body), not two
         let (prompt, n, size, image, mask) = match &param.typed {
             Some(TypedParams::Image(p)) => (
-                p.prompt.clone(),
+                p.prompt.as_str(),
                 p.n,
-                p.size.clone(),
-                p.image.clone(),
-                p.mask.clone(),
+                p.size.as_deref(),
+                p.image.as_deref(),
+                p.mask.as_deref(),
             ),
             _ => (self.base.last_message_text(), 1, None, None, None),
         };
@@ -373,10 +370,13 @@ impl ModelEngine for AudioEngine {
         let param = self.base.param()?;
         let (path, body) = match self.kind {
             AudioKind::Tts => {
+                // borrow the params into the body — one copy (the body), not two
                 let (input, voice, format) = match &param.typed {
-                    Some(TypedParams::AudioTts(p)) => {
-                        (p.input.clone(), p.voice.clone(), p.response_format.clone())
-                    }
+                    Some(TypedParams::AudioTts(p)) => (
+                        p.input.as_str(),
+                        p.voice.as_deref(),
+                        p.response_format.as_deref(),
+                    ),
                     _ => (self.base.last_message_text(), None, None),
                 };
                 if input.is_empty() {
@@ -390,8 +390,8 @@ impl ModelEngine for AudioEngine {
             }
             AudioKind::Stt => {
                 let (audio, language) = match &param.typed {
-                    Some(TypedParams::AudioStt(p)) => (p.audio_b64.clone(), p.language.clone()),
-                    _ => (String::new(), None),
+                    Some(TypedParams::AudioStt(p)) => (p.audio_b64.as_str(), p.language.as_deref()),
+                    _ => ("", None),
                 };
                 if audio.is_empty() {
                     return Err(GatewayError::bad_request("stt audio_b64 must not be empty"));
@@ -435,7 +435,7 @@ impl ModelEngine for VideoEngine {
     async fn run(&self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let prompt = match &param.typed {
-            Some(TypedParams::Video(p)) => p.prompt.clone(),
+            Some(TypedParams::Video(p)) => p.prompt.as_str(),
             _ => self.base.last_message_text(),
         };
         if prompt.is_empty() {
@@ -480,7 +480,7 @@ impl ModelEngine for SearchEngine {
     async fn run(&self) -> GResult<EngineOutcome> {
         let param = self.base.param()?;
         let (query, count) = match &param.typed {
-            Some(TypedParams::Search(p)) => (p.query.clone(), p.count),
+            Some(TypedParams::Search(p)) => (p.query.as_str(), p.count),
             _ => (self.base.last_message_text(), 3),
         };
         if query.is_empty() {
@@ -561,10 +561,11 @@ impl ModelEngine for CompletionsEngine {
             .message
             .iter()
             .map(|m| m.content.as_str())
-            .collect::<Vec<_>>()
-            .join("");
-        let mut body = json!({"model": param.model_name, "prompt": prompt});
-        if let Some(TypedParams::Chat(p)) = param.typed.as_ref() {
+            .collect();
+        // move the prompt into the body — json! interpolation would copy it
+        let mut body = json!({"model": param.model_name});
+        body["prompt"] = prompt.into();
+        if let Some(p) = self.base.chat_params() {
             if let Some(mt) = p.max_tokens {
                 body["max_tokens"] = json!(mt);
             }
@@ -582,7 +583,6 @@ impl ModelEngine for CompletionsEngine {
                 body,
             )
             .await?;
-        // response: choices[0].text (legacy shape), not choices[].message.content
         let text = v["choices"][0]["text"]
             .as_str()
             .unwrap_or_default()
@@ -609,7 +609,7 @@ impl ModelEngine for CompletionsEngine {
             raw_usage_json: if usage.is_null() {
                 vec![]
             } else {
-                usage.to_string().into_bytes()
+                serde_json::to_vec(usage).unwrap_or_default()
             },
             ..Default::default()
         };
@@ -657,15 +657,14 @@ fn responses_usage(usage: &Value) -> (i64, i64, Vec<u8>) {
     let output = crate::engine::tok(&usage["output_tokens"]);
     let cached = crate::engine::tok(&usage["input_tokens_details"]["cached_tokens"]);
     let reasoning = crate::engine::tok(&usage["output_tokens_details"]["reasoning_tokens"]);
-    let raw = json!({
+    let raw = serde_json::to_vec(&json!({
         "prompt_tokens": input,
         "completion_tokens": output,
         "total_tokens": input.saturating_add(output),
         "prompt_tokens_details": {"cached_tokens": cached},
         "completion_tokens_details": {"reasoning_tokens": reasoning},
-    })
-    .to_string()
-    .into_bytes();
+    }))
+    .unwrap_or_default();
     (input, output, raw)
 }
 
@@ -775,14 +774,7 @@ impl ResponsesEngine {
         )
         .await?;
         resp.message = full;
-        resp.aborted = r.aborted;
-        Ok(EngineOutcome {
-            response: resp,
-            http_code: status,
-            chunks: r.chunks,
-            streamed_live: r.streamed_live,
-            ..Default::default()
-        })
+        Ok(EngineOutcome::from_pump(resp, status, r))
     }
 
     /// Non-streaming Responses reply: full `output` array + `usage`.

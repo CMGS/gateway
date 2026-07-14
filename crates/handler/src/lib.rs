@@ -6,10 +6,12 @@
 pub mod offline;
 pub mod plugins;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gw_config::GatewayConfig;
 use gw_dag::DagContext;
+use gw_engines::http_transport::UpstreamPolicy;
 use gw_engines::{EngineOutcome, SharedTransport};
 use gw_models::{GResult, GatewayRequest, GatewayResponse};
 use gw_state::{AkInfo, GatewayState, SharedConfig};
@@ -31,11 +33,13 @@ impl OnlineHandler {
         #[allow(clippy::expect_used)]
         let plan =
             Arc::new(gw_dag::Plan::build(gw_dag::default_layers()).expect("static dag topology"));
-        Self {
+        let handler = Self {
             config,
             transport,
             plan,
-        }
+        };
+        handler.push_policies(&handler.cfg());
+        handler
     }
 
     /// The live config snapshot (cheap atomic load). Introspection surfaces read
@@ -46,6 +50,17 @@ impl OnlineHandler {
 
     pub fn state(&self) -> Arc<GatewayState> {
         self.config.load().state.clone()
+    }
+
+    /// Swap in a new config and push the transport policies derived from it as
+    /// one step, so config and upstream policy can never desync. On error the
+    /// old snapshot (and its policies) stay live.
+    pub async fn reload(&self, cfg: GatewayConfig) -> GResult<()> {
+        let handoff = self.config.reload(cfg).await;
+        if handoff.is_ok() {
+            self.push_policies(&self.cfg());
+        }
+        handoff
     }
 
     /// Run one request: plugin pre → DAG (4 layers) → plugin post.
@@ -118,8 +133,8 @@ impl OnlineHandler {
         if let Some(requested) = ctx
             .request
             .model_param_v2
-            .as_ref()
-            .and_then(|p| p.fallback_from.clone())
+            .as_mut()
+            .and_then(|p| p.fallback_from.take())
             && let Some(outcome) = ctx.outcome.as_mut()
         {
             outcome.response.model = requested;
@@ -140,6 +155,30 @@ impl OnlineHandler {
             ctx.decide("dlp", format!("redacted {redacted_out} span(s) outbound"));
         }
         Ok(ctx)
+    }
+
+    /// Derive the upstream policies (timeouts/connect-retries) from `cfg` and
+    /// apply them to the transport live.
+    fn push_policies(&self, cfg: &GatewayConfig) {
+        let default = UpstreamPolicy::default();
+        let per_account: HashMap<String, UpstreamPolicy> = cfg
+            .accounts
+            .iter()
+            .filter(|a| a.timeout_seconds.is_some() || a.connect_retries.is_some())
+            .map(|a| {
+                (
+                    a.name.clone(),
+                    UpstreamPolicy {
+                        timeout: a
+                            .timeout_seconds
+                            .map(std::time::Duration::from_secs)
+                            .unwrap_or(default.timeout),
+                        connect_retries: a.connect_retries.unwrap_or(default.connect_retries),
+                    },
+                )
+            })
+            .collect();
+        self.transport.reload_policies(default, per_account);
     }
 }
 

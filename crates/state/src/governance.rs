@@ -49,8 +49,6 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     /// Fixed-window request limit (QPM): take one permit.
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool;
 
-    /// Fixed-window token limit (TPM): are spent tokens under `limit`?
-    async fn token_window_check(&self, key: &str, limit: i64, window: Duration) -> bool;
     /// Windowed admission with reservation (see [`Governance::quota_reserve`]).
     async fn token_window_reserve(
         &self,
@@ -116,9 +114,6 @@ impl Governance for MemoryGovernance {
     }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.qpm.reserve(key, 1, limit, window)
-    }
-    async fn token_window_check(&self, key: &str, limit: i64, window: Duration) -> bool {
-        self.tpm.check(key, limit, window)
     }
     async fn token_window_reserve(
         &self,
@@ -279,17 +274,6 @@ impl Governance for RedisGovernance {
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.incr_window(&format!("gw:qpm:{key}"), 1, window).await <= limit
     }
-    async fn token_window_check(&self, key: &str, limit: i64, _window: Duration) -> bool {
-        let mut conn = self.conn.clone();
-        let used = redis::cmd("GET")
-            .arg(format!("gw:tpm:{key}"))
-            .query_async::<Option<i64>>(&mut conn)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0);
-        used < limit
-    }
     async fn token_window_reserve(
         &self,
         key: &str,
@@ -389,9 +373,12 @@ mod tests {
         assert!(g.window_allow(&mkey, 1, Duration::from_secs(60)).await);
         assert!(!g.window_allow(&mkey, 1, Duration::from_secs(60)).await);
 
-        assert!(g.token_window_check(&ak, 10, Duration::from_secs(60)).await);
         g.token_window_add(&ak, 10, Duration::from_secs(60)).await;
-        assert!(!g.token_window_check(&ak, 10, Duration::from_secs(60)).await);
+        assert!(
+            !g.token_window_reserve(&ak, 1, 10, Duration::from_secs(60))
+                .await,
+            "window full after add"
+        );
         g.quota_reset_all().await;
     }
 
@@ -436,14 +423,11 @@ mod tests {
         assert!(g.window_allow("m", 1, Duration::from_secs(60)).await);
         assert!(!g.window_allow("m", 1, Duration::from_secs(60)).await);
 
-        assert!(
-            g.token_window_check("ak", 10, Duration::from_secs(60))
-                .await
-        );
         g.token_window_add("ak", 10, Duration::from_secs(60)).await;
         assert!(
-            !g.token_window_check("ak", 10, Duration::from_secs(60))
-                .await
+            !g.token_window_reserve("ak", 1, 10, Duration::from_secs(60))
+                .await,
+            "window full after add"
         );
     }
 
