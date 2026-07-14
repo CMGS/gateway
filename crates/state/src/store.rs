@@ -1116,24 +1116,55 @@ impl Store for PostgresStore {
     }
 
     async fn batch_finalize(&self, id: &str, claim: i64) -> GResult<Option<BatchStatus>> {
-        // Derive the terminal status from the result set IN the same UPDATE that
-        // sets it (atomic snapshot), gated on ownership + still-running. The
-        // batch row lock this takes serializes with batch_push_result's FOR
-        // UPDATE, so no result can be inserted between the derive and the write.
-        let row = sqlx::query(
-            "UPDATE batches SET status = CASE
-                 WHEN (SELECT count(*) FROM batch_results WHERE batch_id = $1) = total
-                      AND NOT EXISTS (SELECT 1 FROM batch_results WHERE batch_id = $1 AND ok = false)
-                 THEN 'completed' ELSE 'failed' END
-             WHERE id = $1 AND claim_seq = $2 AND status = 'running'
-             RETURNING status",
+        // A transaction so the aggregate reads a snapshot taken AFTER the row lock
+        // is held: a single UPDATE would evaluate its result-set subquery on the
+        // statement-start snapshot, missing a result that committed while it waited
+        // for the lock (READ COMMITTED re-checks only the locked row, not
+        // subqueries) — and wrongly report Failed. Here stmt 1 takes the batch row
+        // lock (serializing with batch_push_result's FOR UPDATE), stmt 2 reads the
+        // now-current result set, stmt 3 writes the derived terminal status.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("finalize begin", e))?;
+        let locked = sqlx::query(
+            "SELECT total FROM batches
+             WHERE id = $1 AND claim_seq = $2 AND status = 'running' FOR UPDATE",
         )
         .bind(id)
         .bind(claim)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| crate::sqlx_err("finalize batch", e))?;
-        Ok(row.and_then(|r| BatchStatus::parse(r.get::<String, _>(0).as_str())))
+        .map_err(|e| crate::sqlx_err("finalize lock", e))?;
+        let Some(row) = locked else {
+            return Ok(None); // not owned or already terminal; tx rolls back on drop
+        };
+        let total: i64 = row.get(0);
+        let agg = sqlx::query(
+            "SELECT count(*), count(*) FILTER (WHERE NOT ok) FROM batch_results
+             WHERE batch_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| crate::sqlx_err("finalize count", e))?;
+        let (n, failed): (i64, i64) = (agg.get(0), agg.get(1));
+        let done = if n == total && failed == 0 {
+            BatchStatus::Completed
+        } else {
+            BatchStatus::Failed
+        };
+        sqlx::query("UPDATE batches SET status = $1 WHERE id = $2")
+            .bind(done.as_str())
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| crate::sqlx_err("finalize write", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::sqlx_err("finalize commit", e))?;
+        Ok(Some(done))
     }
 
     fn distributed_batches(&self) -> bool {
@@ -1706,5 +1737,67 @@ mod tests {
         for h in handles {
             assert!(ids.insert(h.await.unwrap().unwrap().id));
         }
+    }
+
+    /// Set GW_TEST_PG_URL to run. Reproduces the finalize-vs-insert snapshot race
+    /// with two live connections: a result insert holds the batch row lock while
+    /// finalize starts and blocks; once the insert commits, finalize must SEE the
+    /// result (Completed), not derive from a stale pre-lock snapshot (Failed).
+    #[tokio::test]
+    async fn postgres_finalize_sees_result_committed_during_lock_wait() {
+        let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
+            return;
+        };
+        let store = std::sync::Arc::new(PostgresStore::connect(&url).await.expect("pg connect"));
+        let job = store
+            .batch_create("ak-race", "default", "m", 1)
+            .await
+            .unwrap();
+        store
+            .batch_set_status(&job.id, BatchStatus::Running)
+            .await
+            .unwrap();
+
+        // hold the batch row lock + insert the sole result, uncommitted
+        let mut txa = store.pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens)
+             SELECT $1, 0, true, '', 1
+             WHERE EXISTS (SELECT 1 FROM batches
+                           WHERE id = $1 AND status NOT IN ('completed', 'failed') FOR UPDATE)
+             ON CONFLICT (batch_id, idx) DO NOTHING",
+        )
+        .bind(&job.id)
+        .execute(&mut *txa)
+        .await
+        .unwrap();
+
+        // finalize starts and blocks on the row lock txa holds
+        let s2 = store.clone();
+        let jid = job.id.clone();
+        let fin = tokio::spawn(async move { s2.batch_finalize(&jid, 0).await });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        txa.commit().await.unwrap(); // result now visible; lock released
+        assert_eq!(
+            fin.await.unwrap().unwrap(),
+            Some(BatchStatus::Completed),
+            "finalize must see the result committed during its lock wait"
+        );
+        assert_eq!(
+            store.batch_get(&job.id).await.unwrap().unwrap().status,
+            BatchStatus::Completed
+        );
+
+        sqlx::query("DELETE FROM batch_results WHERE batch_id = $1")
+            .bind(&job.id)
+            .execute(&store.pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM batches WHERE id = $1")
+            .bind(&job.id)
+            .execute(&store.pool)
+            .await
+            .ok();
     }
 }
