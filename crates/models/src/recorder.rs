@@ -33,65 +33,6 @@ impl Recorder for SimpleRecorder {
     }
 }
 
-/// Full timing recorder: start time, first-message cost, last-message cost,
-/// cost-since-get-req, and a report map. Interior mutability so engines can
-/// stamp times through `&self`.
-#[derive(Debug, Default)]
-pub struct TimingRecorder {
-    start: std::sync::OnceLock<DateTime<Utc>>,
-    first_msg_ms: std::sync::atomic::AtomicI64,
-    last_msg_ms: std::sync::atomic::AtomicI64,
-    since_get_req_ms: std::sync::atomic::AtomicI64,
-}
-
-impl TimingRecorder {
-    pub fn started_now() -> Self {
-        let r = Self::default();
-        let _ = r.start.set(Utc::now());
-        r
-    }
-
-    pub fn set_first_msg_cost_ms(&self, ms: i64) {
-        self.first_msg_ms
-            .store(ms, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn set_last_msg_cost_ms(&self, ms: i64) {
-        self.last_msg_ms
-            .store(ms, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn set_cost_since_get_req_ms(&self, ms: i64) {
-        self.since_get_req_ms
-            .store(ms, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Returns (time to first chunk, time to last chunk, time since request received).
-    pub fn result_ms(&self) -> (i64, i64, i64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        (
-            self.first_msg_ms.load(Relaxed),
-            self.last_msg_ms.load(Relaxed),
-            self.since_get_req_ms.load(Relaxed),
-        )
-    }
-}
-
-impl Recorder for TimingRecorder {
-    fn start_time(&self) -> DateTime<Utc> {
-        *self.start.get_or_init(Utc::now)
-    }
-
-    fn report_to_map(&self) -> HashMap<String, serde_json::Value> {
-        let (first, last, since) = self.result_ms();
-        HashMap::from([
-            ("first_msg_cost_ms".to_owned(), first.into()),
-            ("last_msg_cost_ms".to_owned(), last.into()),
-            ("cost_since_get_req_ms".to_owned(), since.into()),
-        ])
-    }
-}
-
 /// Content-safety verdict. Invariant: a blocked verdict is always a hit; a hit
 /// is not necessarily a block.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

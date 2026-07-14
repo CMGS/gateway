@@ -23,6 +23,10 @@ const PG_INSERT_BATCH: &str = "INSERT INTO batches (n, id, ak, tenant, model, st
 /// Far above any real response, so real traffic is never clamped.
 pub const MAX_METERED_TOKENS: i64 = 1_000_000_000;
 
+/// Prune the SQL ledger every Nth insert instead of per write (the cap becomes
+/// approximate by at most this many rows, saving a round-trip per billing).
+const LEDGER_PRUNE_EVERY: usize = 64;
+
 /// One billing entry (recorded locally only; no reporting upstream).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BillingRecord {
@@ -491,6 +495,7 @@ where
 pub struct SqliteStore {
     pool: sqlx::SqlitePool,
     ledger_max_rows: u64,
+    prune_seq: AtomicUsize,
 }
 
 impl SqliteStore {
@@ -560,6 +565,7 @@ impl SqliteStore {
         Ok(Self {
             pool,
             ledger_max_rows,
+            prune_seq: AtomicUsize::new(0),
         })
     }
 }
@@ -589,7 +595,12 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("insert billing record", e))?;
-        if self.ledger_max_rows > 0 {
+        if self.ledger_max_rows > 0
+            && self
+                .prune_seq
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(LEDGER_PRUNE_EVERY)
+        {
             sqlx::query("DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - ?")
                 .bind(self.ledger_max_rows as i64)
                 .execute(&self.pool)
@@ -780,6 +791,7 @@ impl Store for SqliteStore {
 pub struct PostgresStore {
     pool: sqlx::PgPool,
     ledger_max_rows: u64,
+    prune_seq: AtomicUsize,
 }
 
 impl PostgresStore {
@@ -846,6 +858,7 @@ impl PostgresStore {
         Ok(Self {
             pool,
             ledger_max_rows,
+            prune_seq: AtomicUsize::new(0),
         })
     }
 }
@@ -875,7 +888,12 @@ impl Store for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("insert billing record", e))?;
-        if self.ledger_max_rows > 0 {
+        if self.ledger_max_rows > 0
+            && self
+                .prune_seq
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(LEDGER_PRUNE_EVERY)
+        {
             sqlx::query("DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - $1")
                 .bind(self.ledger_max_rows as i64)
                 .execute(&self.pool)
@@ -1419,12 +1437,14 @@ mod tests {
         let store = SqliteStore::open_with_cap(dir.path().join("r.db").to_str().unwrap(), 2)
             .await
             .unwrap();
-        for m in ["a", "b", "c"] {
-            store.ledger_add(record(m)).await.unwrap();
+        // the SQL stores prune every LEDGER_PRUNE_EVERY inserts, so the cap is
+        // approximate: drive past one full prune cycle and check the bound
+        for i in 0..=LEDGER_PRUNE_EVERY {
+            store.ledger_add(record(&format!("m{i}"))).await.unwrap();
         }
         let (total, page) = store.ledger_snapshot(usize::MAX).await.unwrap();
-        assert_eq!(total, 2);
-        assert_eq!(page[0].model, "b");
+        assert_eq!(total, 2, "prune cycle enforces the cap");
+        assert_eq!(page[0].model, format!("m{}", LEDGER_PRUNE_EVERY - 1));
     }
 
     #[tokio::test]

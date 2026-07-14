@@ -906,6 +906,7 @@ dependencies = [
  "gw-config",
  "gw-consts",
  "gw-models",
+ "metrics",
  "moka",
  "redis",
  "serde",

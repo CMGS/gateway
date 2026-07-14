@@ -42,6 +42,13 @@ pub fn vendor_error(http_status: u16, v: &Value) -> Option<GatewayError> {
     ))
 }
 
+/// Fill `total_tokens` from prompt + completion when the vendor omitted it.
+pub fn fill_total_if_zero(resp: &mut GatewayResponse) {
+    if resp.total_tokens == 0 {
+        resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
+    }
+}
+
 /// What a single upstream call produced.
 #[derive(Debug, Default)]
 pub struct EngineOutcome {

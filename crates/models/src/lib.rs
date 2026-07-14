@@ -18,8 +18,8 @@ pub use params::{
     ChatParams, EmbeddingParams, ImageParams, SearchParams, SttParams, TtsParams, TypedParams,
     VideoParams,
 };
-pub use recorder::{Block, Recorder, SimpleRecorder, TimingRecorder};
-pub use request::domain::{Account, ChatMsg, ProductConf, ReqExtraParam, UserConf};
+pub use recorder::{Block, Recorder, SimpleRecorder};
+pub use request::domain::{Account, ChatMsg};
 pub use request::{GatewayRequest, ModelParamV2};
 pub use response::GatewayResponse;
 pub use response::StreamChunk;

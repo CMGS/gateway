@@ -62,7 +62,7 @@ impl OnlineHandler {
         }
         // blocklist on the ORIGINAL content, before DLP — else a blocklisted term
         // inside a redacted span (a domain in an email) is masked out and slips
-        if let Some(block) = plugins::security_check(&snap.cfg.security, &request) {
+        if let Some(block) = plugins::security_check(&snap.cfg.security, &mut request) {
             let mut ctx = DagContext::new(
                 snap.cfg.clone(),
                 snap.state.clone(),
@@ -102,18 +102,15 @@ impl OnlineHandler {
 
         if let Err(e) = gw_dag::run(&self.plan, &mut ctx).await {
             // a failed pipeline refunds its reservations whole, on the reserve's day bucket
-            if let Some(est) = ctx.quota_reserved.take() {
-                ctx.state
-                    .governance
-                    .quota_settle(&ctx.ak.ak, -est, ctx.quota_at)
-                    .await;
-            }
-            if let Some(est) = ctx.tpm_reserved.take() {
-                ctx.state
-                    .governance
-                    .token_window_settle(&ctx.ak.ak, -est, gw_consts::MINUTE)
-                    .await;
-            }
+            ctx.state
+                .governance
+                .refund_reserves(
+                    &ctx.ak.ak,
+                    ctx.quota_reserved.take().unwrap_or(0),
+                    ctx.tpm_reserved.take(),
+                    ctx.quota_at,
+                )
+                .await;
             return Err(e);
         }
 

@@ -27,6 +27,20 @@ pub struct PumpResult {
 ///
 /// A JSON body is the vendor refusing to stream — callers dispatch that
 /// themselves before pumping.
+/// A stream request answered with JSON is an error body: surface the vendor's
+/// error envelope. A JSON body with no envelope falls through to
+/// [`pump_sse`]'s generic "expected sse" error.
+pub(crate) fn reject_json_error(what: &str, status: u16, body: &UpstreamBody) -> GResult<()> {
+    if let UpstreamBody::Json(b) = body {
+        let v: Value = serde_json::from_slice(b)
+            .map_err(|e| GatewayError::internal(format!("parse {what} reply")).with_source(e))?;
+        if let Some(err) = crate::engine::vendor_error(status, &v) {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 pub async fn pump_sse<F>(
     vendor: &'static str,
     body: UpstreamBody,

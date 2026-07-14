@@ -6,10 +6,9 @@
 use gw_models::{GResult, GatewayError, GatewayResponse, Recorder};
 use serde_json::{Value, json};
 
-use crate::base::base_engine;
+use crate::base::{Base, base_engine};
 use crate::engine::{EngineOutcome, ModelEngine, StreamChunk};
 use crate::sigv4::{SigV4Params, sign};
-use crate::transport::UpstreamBody;
 
 /// SigV4 headers for a bedrock-style call. `creds` = real `(access_key, secret_key)`
 /// at go-live (from the account's env-var pair), else the inert mock credentials.
@@ -40,6 +39,29 @@ fn aws_headers(
         // Bedrock InvokeModel requires accept; content-type is added by post_json.
         ("accept".into(), "application/json".into()),
     ]
+}
+
+/// One Bedrock invoke: host + scheme from the account endpoint at go-live
+/// (else the mock sentinel); SigV4 signs this same host so URL and signature
+/// agree.
+async fn bedrock_invoke(base: &Base, uri: &str, body: Value) -> GResult<(u16, Value)> {
+    let root = base.base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
+    let host = root
+        .split_once("://")
+        .map(|(_, h)| h)
+        .unwrap_or(&root)
+        .to_owned();
+    let payload = body.to_string().into_bytes();
+    let creds = base.aws_credentials();
+    let headers = aws_headers(
+        &host,
+        uri,
+        &payload,
+        creds
+            .as_ref()
+            .map(|(a, s): &(String, String)| (a.as_str(), s.as_str())),
+    );
+    base.post_json(&format!("{root}{uri}"), headers, body).await
 }
 
 base_engine!(ErnieEngine);
@@ -186,27 +208,8 @@ impl ModelEngine for CohereEngine {
         {
             body["max_tokens"] = json!(mt);
         }
-        let uri = "/model/cohere.command-r/invoke".to_owned();
-        // host + scheme from the account endpoint at go-live (else mock sentinel);
-        // SigV4 signs this same host so URL and signature agree
-        let base = self
-            .base
-            .base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
-        let host = base
-            .split_once("://")
-            .map(|(_, h)| h)
-            .unwrap_or(&base)
-            .to_owned();
-        let payload = body.to_string().into_bytes();
-        let creds = self.base.aws_credentials();
-        let headers = aws_headers(
-            &host,
-            &uri,
-            &payload,
-            creds.as_ref().map(|(a, s)| (a.as_str(), s.as_str())),
-        );
-        let url = format!("{base}{uri}");
-        let (status, v) = self.base.post_json(&url, headers, body).await?;
+        let (status, v) =
+            bedrock_invoke(&self.base, "/model/cohere.command-r/invoke", body).await?;
         let tokens = &v["meta"]["tokens"];
         let (input, output) = (
             crate::engine::tok(&tokens["input_tokens"]),
@@ -259,26 +262,12 @@ impl ModelEngine for LlamaEngine {
                 body["temperature"] = json!(t);
             }
         }
-        let uri = "/model/meta.llama3-70b-instruct-v1/invoke".to_owned();
-        // host/scheme from the account endpoint; SigV4 signs the same host
-        let base = self
-            .base
-            .base_url("mock://bedrock-runtime.us-east-1.amazonaws.com");
-        let host = base
-            .split_once("://")
-            .map(|(_, h)| h)
-            .unwrap_or(&base)
-            .to_owned();
-        let payload = body.to_string().into_bytes();
-        let creds = self.base.aws_credentials();
-        let headers = aws_headers(
-            &host,
-            &uri,
-            &payload,
-            creds.as_ref().map(|(a, s)| (a.as_str(), s.as_str())),
-        );
-        let url = format!("{base}{uri}");
-        let (status, v) = self.base.post_json(&url, headers, body).await?;
+        let (status, v) = bedrock_invoke(
+            &self.base,
+            "/model/meta.llama3-70b-instruct-v1/invoke",
+            body,
+        )
+        .await?;
         let (pt, ct) = (
             crate::engine::tok(&v["prompt_token_count"]),
             crate::engine::tok(&v["generation_token_count"]),
@@ -374,14 +363,7 @@ impl DashScopeEngine {
             model: self.base.model_name()?.to_owned(),
             ..Default::default()
         };
-        if let UpstreamBody::Json(b) = &reply.body {
-            // a stream request answered with JSON is an error body
-            let v: Value = serde_json::from_slice(b)
-                .map_err(|e| GatewayError::internal("parse dashscope reply").with_source(e))?;
-            if let Some(err) = crate::engine::vendor_error(status, &v) {
-                return Err(err);
-            }
-        }
+        crate::pump::reject_json_error("dashscope", status, &reply.body)?;
         let mut full = String::new();
         let r = crate::pump::pump_sse(
             "dashscope",
@@ -392,9 +374,7 @@ impl DashScopeEngine {
         .await?;
         resp.message = full;
         resp.aborted = r.aborted;
-        if resp.total_tokens == 0 {
-            resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
-        }
+        crate::engine::fill_total_if_zero(&mut resp);
         resp.raw_usage_json = dashscope_raw_usage(&resp);
         Ok(EngineOutcome {
             response: resp,
@@ -435,9 +415,7 @@ impl ModelEngine for DashScopeEngine {
             ..Default::default()
         };
         dashscope_apply_usage(&v["usage"], &mut resp);
-        if resp.total_tokens == 0 {
-            resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
-        }
+        crate::engine::fill_total_if_zero(&mut resp);
         resp.raw_usage_json = dashscope_raw_usage(&resp);
         Ok(EngineOutcome::with_status(resp, status))
     }

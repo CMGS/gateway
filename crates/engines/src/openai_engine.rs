@@ -95,11 +95,7 @@ impl OpenAiEngine {
                 body.insert("messages".into(), Value::Array(msgs));
             }
         }
-        if let Value::Object(extra) = &param.raw {
-            for (k, v) in extra {
-                body.entry(k.clone()).or_insert(v.clone());
-            }
-        }
+        crate::base::merge_raw_extras(&mut body, &param.raw);
 
         Ok(UpstreamRequest {
             protocol: param.protocol,

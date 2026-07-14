@@ -118,14 +118,7 @@ impl VertexEngine {
             model: self.base.param()?.model_name.clone(),
             ..Default::default()
         };
-        if let UpstreamBody::Json(b) = &reply.body {
-            // a stream request answered with JSON is an error body
-            let v: Value = serde_json::from_slice(b)
-                .map_err(|e| GatewayError::internal("parse gemini reply").with_source(e))?;
-            if let Some(err) = crate::engine::vendor_error(status, &v) {
-                return Err(err);
-            }
-        }
+        crate::pump::reject_json_error("gemini", status, &reply.body)?;
         let mut full = String::new();
         let r = crate::pump::pump_sse(
             "gemini",
@@ -136,9 +129,7 @@ impl VertexEngine {
         .await?;
         resp.message = full;
         resp.aborted = r.aborted;
-        if resp.total_tokens == 0 {
-            resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
-        }
+        crate::engine::fill_total_if_zero(&mut resp);
         resp.raw_usage_json = vertex_raw_usage(&resp);
         Ok(EngineOutcome {
             response: resp,
@@ -182,9 +173,7 @@ impl ModelEngine for VertexEngine {
             ..Default::default()
         };
         vertex_apply_usage(&v["usageMetadata"], &mut resp);
-        if resp.total_tokens == 0 {
-            resp.total_tokens = resp.prompt_tokens.saturating_add(resp.completion_tokens);
-        }
+        crate::engine::fill_total_if_zero(&mut resp);
         resp.raw_usage_json = vertex_raw_usage(&resp);
         Ok(EngineOutcome::with_status(resp, status))
     }
@@ -343,18 +332,7 @@ impl ModelEngine for ImageEngine {
                 p.image.clone(),
                 p.mask.clone(),
             ),
-            _ => (
-                self.base
-                    .request
-                    .message
-                    .last()
-                    .map(|m| m.content.clone())
-                    .unwrap_or_default(),
-                1,
-                None,
-                None,
-                None,
-            ),
+            _ => (self.base.last_message_text(), 1, None, None, None),
         };
         if prompt.is_empty() {
             return Err(GatewayError::bad_request("image prompt must not be empty"));
@@ -421,16 +399,7 @@ impl ModelEngine for AudioEngine {
                     Some(TypedParams::AudioTts(p)) => {
                         (p.input.clone(), p.voice.clone(), p.response_format.clone())
                     }
-                    _ => (
-                        self.base
-                            .request
-                            .message
-                            .last()
-                            .map(|m| m.content.clone())
-                            .unwrap_or_default(),
-                        None,
-                        None,
-                    ),
+                    _ => (self.base.last_message_text(), None, None),
                 };
                 if input.is_empty() {
                     return Err(GatewayError::bad_request("tts input must not be empty"));
@@ -493,13 +462,7 @@ impl ModelEngine for VideoEngine {
         let param = self.base.param()?;
         let prompt = match &param.typed {
             Some(TypedParams::Video(p)) => p.prompt.clone(),
-            _ => self
-                .base
-                .request
-                .message
-                .last()
-                .map(|m| m.content.clone())
-                .unwrap_or_default(),
+            _ => self.base.last_message_text(),
         };
         if prompt.is_empty() {
             return Err(GatewayError::bad_request("video prompt must not be empty"));
@@ -548,15 +511,7 @@ impl ModelEngine for SearchEngine {
         let param = self.base.param()?;
         let (query, count) = match &param.typed {
             Some(TypedParams::Search(p)) => (p.query.clone(), p.count),
-            _ => (
-                self.base
-                    .request
-                    .message
-                    .last()
-                    .map(|m| m.content.clone())
-                    .unwrap_or_default(),
-                3,
-            ),
+            _ => (self.base.last_message_text(), 3),
         };
         if query.is_empty() {
             return Err(GatewayError::bad_request("search query must not be empty"));
@@ -742,14 +697,8 @@ fn responses_usage(usage: &Value) -> (i64, i64, Vec<u8>) {
     // floor upstream counts so a negative can't refund quota or bill a negative
     let input = crate::engine::tok(&usage["input_tokens"]);
     let output = crate::engine::tok(&usage["output_tokens"]);
-    let cached = usage["input_tokens_details"]["cached_tokens"]
-        .as_i64()
-        .unwrap_or(0)
-        .max(0);
-    let reasoning = usage["output_tokens_details"]["reasoning_tokens"]
-        .as_i64()
-        .unwrap_or(0)
-        .max(0);
+    let cached = crate::engine::tok(&usage["input_tokens_details"]["cached_tokens"]);
+    let reasoning = crate::engine::tok(&usage["output_tokens_details"]["reasoning_tokens"]);
     let raw = json!({
         "prompt_tokens": input,
         "completion_tokens": output,
@@ -858,14 +807,7 @@ impl ResponsesEngine {
             finish_reason: "completed".to_owned(),
             ..Default::default()
         };
-        if let UpstreamBody::Json(b) = &reply.body {
-            // a stream request answered with JSON is an error body
-            let v: Value = serde_json::from_slice(b)
-                .map_err(|e| GatewayError::internal("parse responses reply").with_source(e))?;
-            if let Some(err) = crate::engine::vendor_error(status, &v) {
-                return Err(err);
-            }
-        }
+        crate::pump::reject_json_error("responses", status, &reply.body)?;
         let mut full = String::new();
         let r = crate::pump::pump_sse(
             "responses",
@@ -913,63 +855,23 @@ impl ResponsesEngine {
         Ok(EngineOutcome::with_status(resp, status))
     }
 
-    /// Streaming Responses reply: accumulate `response.output_text.delta` frames;
-    /// final usage + status arrive in the `response.completed` frame's `response`.
+    /// Buffered Responses SSE: the same [`responses_apply_frame`] semantics the
+    /// live pump drives, over pre-decoded events.
     fn parse_sse(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
         let (events, _done) = SseDecoder::decode_all(bytes);
+        let mut resp = GatewayResponse {
+            model: self.model_name(),
+            finish_reason: "completed".to_owned(),
+            ..Default::default()
+        };
         let mut full = String::new();
         let mut chunks = Vec::new();
-        let mut model = self.model_name();
-        let mut finish_reason = "completed".to_owned();
-        let (mut input, mut output, mut raw_usage_json) = (0i64, 0i64, Vec::new());
         for ev in events {
             let v: Value = serde_json::from_slice(ev.as_bytes())
                 .map_err(|e| GatewayError::internal("parse responses sse frame").with_source(e))?;
-            if let Some(err) = crate::engine::vendor_error(status, &v) {
-                return Err(err);
-            }
-            match v["type"].as_str().unwrap_or_default() {
-                "response.output_text.delta" => {
-                    if let Some(d) = v["delta"].as_str() {
-                        full.push_str(d);
-                        chunks.push(StreamChunk {
-                            delta: d.to_owned(),
-                            finish_reason: None,
-                            ..Default::default()
-                        });
-                    }
-                }
-                "response.completed" => {
-                    let r = &v["response"];
-                    if let Some(m) = r["model"].as_str() {
-                        model = m.to_owned();
-                    }
-                    if let Some(st) = r["status"].as_str() {
-                        finish_reason = st.to_owned();
-                    }
-                    let (i, o, raw) = responses_usage(&r["usage"]);
-                    input = i;
-                    output = o;
-                    raw_usage_json = raw;
-                    chunks.push(StreamChunk {
-                        delta: String::new(),
-                        finish_reason: Some(finish_reason.clone()),
-                        ..Default::default()
-                    });
-                }
-                _ => {} // response.created / output_item.added / content_part.* etc.
-            }
+            chunks.extend(responses_apply_frame(&v, status, &mut resp, &mut full)?);
         }
-        let resp = GatewayResponse {
-            message: full,
-            model,
-            finish_reason,
-            prompt_tokens: input,
-            completion_tokens: output,
-            total_tokens: input.saturating_add(output),
-            raw_usage_json,
-            ..Default::default()
-        };
+        resp.message = full;
         Ok(EngineOutcome {
             response: resp,
             http_code: status,

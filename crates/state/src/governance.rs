@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::{QuotaStore, RateLimiter, TokenWindow, WindowCounter};
+use crate::{QuotaStore, RateLimiter, TokenWindow};
 
 /// Day-keyed quota buckets linger at most this long before self-expiring.
 const QUOTA_TTL_MS: i64 = 2 * 24 * 60 * 60 * 1000;
@@ -63,6 +63,23 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
     async fn token_window_settle(&self, key: &str, delta: i64, window: Duration);
     /// Add to the current TPM window.
     async fn token_window_add(&self, key: &str, tokens: i64, window: Duration);
+
+    /// Refund an admission reservation whole (daily quota + optional TPM
+    /// window) — for a request/turn that never reached billing.
+    async fn refund_reserves(
+        &self,
+        ak: &str,
+        reserved: i64,
+        tpm_reserved: Option<i64>,
+        at_epoch_secs: i64,
+    ) {
+        if reserved != 0 {
+            self.quota_settle(ak, -reserved, at_epoch_secs).await;
+        }
+        if let Some(tpm) = tpm_reserved {
+            self.token_window_settle(ak, -tpm, gw_consts::MINUTE).await;
+        }
+    }
 }
 
 /// In-process governance: wraps the local counter structs. The default.
@@ -70,7 +87,7 @@ pub trait Governance: Send + Sync + std::fmt::Debug {
 pub struct MemoryGovernance {
     rate: RateLimiter,
     quota: QuotaStore,
-    qpm: WindowCounter,
+    qpm: TokenWindow,
     tpm: TokenWindow,
 }
 
@@ -98,7 +115,7 @@ impl Governance for MemoryGovernance {
         self.quota.reset_all();
     }
     async fn window_allow(&self, key: &str, limit: i64, window: Duration) -> bool {
-        self.qpm.allow(key, limit, window)
+        self.qpm.reserve(key, 1, limit, window)
     }
     async fn token_window_check(&self, key: &str, limit: i64, window: Duration) -> bool {
         self.tpm.check(key, limit, window)
@@ -138,6 +155,37 @@ impl RedisGovernance {
         Ok(Self {
             conn: crate::redis_connect(url).await?,
         })
+    }
+
+    /// Reserve `amount` against `limit` on a self-expiring key: admit while
+    /// spent-before < limit (the reservation may overshoot once; the settle
+    /// corrects), rolling the increment back on denial. A failed round-trip
+    /// admits — limits fail open on a Redis blip.
+    async fn reserve_capped(&self, key: String, amount: i64, limit: i64, ttl_ms: i64) -> bool {
+        let mut conn = self.conn.clone();
+        let script = redis::Script::new(
+            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
+             if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
+             if v - tonumber(ARGV[1]) >= tonumber(ARGV[2]) then
+               redis.call('DECRBY', KEYS[1], ARGV[1])
+               return 0
+             end
+             return 1",
+        );
+        match script
+            .key(&key)
+            .arg(amount)
+            .arg(limit)
+            .arg(ttl_ms)
+            .invoke_async::<i64>(&mut conn)
+            .await
+        {
+            Ok(v) => v == 1,
+            Err(e) => {
+                tracing::warn!(error = %e, key, "redis reserve failed; admitting");
+                true
+            }
+        }
     }
 
     /// Increment `key` and set its TTL on first use; returns the post-increment
@@ -199,32 +247,8 @@ impl Governance for RedisGovernance {
         }
     }
     async fn quota_reserve(&self, key: &str, amount: i64, limit: i64, at: i64) -> bool {
-        let mut conn = self.conn.clone();
-        // admit while spent-before < limit (the reservation may overshoot once;
-        // the settle corrects); the date-stamped key self-expires via its TTL
-        let script = redis::Script::new(
-            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
-             if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
-             if v - tonumber(ARGV[1]) >= tonumber(ARGV[2]) then
-               redis.call('DECRBY', KEYS[1], ARGV[1])
-               return 0
-             end
-             return 1",
-        );
-        match script
-            .key(quota_key_at(key, at))
-            .arg(amount)
-            .arg(limit)
-            .arg(QUOTA_TTL_MS)
-            .invoke_async::<i64>(&mut conn)
+        self.reserve_capped(quota_key_at(key, at), amount, limit, QUOTA_TTL_MS)
             .await
-        {
-            Ok(v) => v == 1,
-            Err(e) => {
-                tracing::warn!(error = %e, key, "redis quota reserve failed; admitting");
-                true
-            }
-        }
     }
     async fn quota_settle(&self, key: &str, delta: i64, at: i64) {
         if delta == 0 {
@@ -273,30 +297,13 @@ impl Governance for RedisGovernance {
         limit: i64,
         window: Duration,
     ) -> bool {
-        let mut conn = self.conn.clone();
-        let script = redis::Script::new(
-            "local v = redis.call('INCRBY', KEYS[1], ARGV[1])
-             if v == tonumber(ARGV[1]) then redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
-             if v - tonumber(ARGV[1]) >= tonumber(ARGV[2]) then
-               redis.call('DECRBY', KEYS[1], ARGV[1])
-               return 0
-             end
-             return 1",
-        );
-        match script
-            .key(format!("gw:tpm:{key}"))
-            .arg(amount)
-            .arg(limit)
-            .arg(window.as_millis() as i64)
-            .invoke_async::<i64>(&mut conn)
-            .await
-        {
-            Ok(v) => v == 1,
-            Err(e) => {
-                tracing::warn!(error = %e, key, "redis tpm reserve failed; admitting");
-                true
-            }
-        }
+        self.reserve_capped(
+            format!("gw:tpm:{key}"),
+            amount,
+            limit,
+            window.as_millis() as i64,
+        )
+        .await
     }
     async fn token_window_settle(&self, key: &str, delta: i64, window: Duration) {
         if delta == 0 {

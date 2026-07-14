@@ -1,8 +1,6 @@
 //! `GatewayRequest` — the unified engine request — and the [`domain`] types it
 //! references.
 
-use std::collections::HashMap;
-
 pub use domain::*;
 
 /// Everything an engine needs to serve one request.
@@ -10,20 +8,10 @@ pub use domain::*;
 pub struct GatewayRequest {
     pub account: Option<Account>,
     pub message: Vec<ChatMsg>,
-    pub pressure: bool,
     pub stream: bool,
-    pub user_config: UserConf,
-    pub product_config: ProductConf,
-    pub origin_product_config: Option<ProductConf>,
     pub model_param_v2: Option<ModelParamV2>,
     pub ak: String,
-    /// proxy region (sg/us).
-    pub proxy: String,
-    pub storage_info_collect: StorageInfoCollect,
     pub is_online: bool,
-    pub extra_params: ReqExtraParam,
-    pub metrics_map: HashMap<String, String>,
-    pub realtime_params: RealtimeParam,
     /// When set, a streaming-capable engine forwards chunks here as they arrive
     /// instead of buffering; the bounded channel is the backpressure seam.
     pub stream_tx: Option<tokio::sync::mpsc::Sender<crate::StreamChunk>>,
@@ -184,85 +172,6 @@ pub mod domain {
             let secret = std::env::var(&self.secret_key_env).ok()?;
             Some((access, secret))
         }
-    }
-
-    /// User configuration; unmodeled fields pass through via `extra`.
-    #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-    pub struct UserConf {
-        #[serde(default)]
-        pub user_name: String,
-        #[serde(default)]
-        pub is_online: bool,
-        #[serde(default)]
-        pub allowed_target_regions: Vec<String>,
-        #[serde(default)]
-        pub allowed_use_llm_plugin: bool,
-        #[serde(default)]
-        pub scene: String,
-        #[serde(default)]
-        pub scene_type: i32,
-        #[serde(default)]
-        pub resource_level: String,
-        #[serde(default)]
-        pub ak: String,
-        /// service/personal
-        #[serde(default, rename = "type")]
-        pub key_type: String,
-        #[serde(default)]
-        pub allow_region_downgrade: bool,
-        #[serde(default)]
-        pub extra: Value,
-    }
-
-    /// Product configuration; long-tail fields ride in `extra`.
-    #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-    pub struct ProductConf {
-        #[serde(default)]
-        pub model_name: String,
-        #[serde(default)]
-        pub product: String,
-        #[serde(default)]
-        pub model_vendor: String,
-        #[serde(default)]
-        pub channel_name: String,
-        /// request-rate limit per time unit, 0 = unlimited.
-        #[serde(default)]
-        pub request_rate: i64,
-        /// token-rate limit per time unit, 0 = unlimited.
-        #[serde(default)]
-        pub token_rate: i64,
-        #[serde(default)]
-        pub unit: String,
-        #[serde(default)]
-        pub resource_statistics: bool,
-        /// nested config passthrough (PlatformConfig/ConfigMapping, etc.).
-        #[serde(default)]
-        pub extra: Value,
-    }
-
-    /// Side-channel params for vendor-specific extras; rest via `extra`.
-    #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-    pub struct ReqExtraParam {
-        #[serde(default)]
-        pub elevenlab_method: String,
-        #[serde(default)]
-        pub url2base64: bool,
-        #[serde(default)]
-        pub content_length: i64,
-        #[serde(default)]
-        pub extra: Value,
-    }
-
-    /// Storage collection; local build has no external storage to write.
-    #[derive(Debug, Default, Clone)]
-    pub struct StorageInfoCollect {
-        pub raw: Value,
-    }
-
-    /// Upstream realtime bridging is future work.
-    #[derive(Debug, Default, Clone)]
-    pub struct RealtimeParam {
-        pub raw: Value,
     }
 }
 

@@ -60,12 +60,13 @@ pub struct MappingSpec {
 }
 
 /// The canonical OpenAI `chat.completion` → Anthropic `message` mapping.
-/// Used when /v1/messages routes to an OpenAI-family model. Reusable,
-/// data-driven — no hardcode.
-#[allow(clippy::expect_used)] // parses a compile-time literal, covered by the mapping tests
-pub fn openai_to_anthropic() -> MappingSpec {
-    serde_json::from_str(
-        r#"{"rules":[
+/// Used when /v1/messages routes to an OpenAI-family model. Parsed once —
+/// the spec is a compile-time constant.
+pub fn openai_to_anthropic() -> &'static MappingSpec {
+    #[allow(clippy::expect_used)] // parses a compile-time literal, covered by the mapping tests
+    static SPEC: std::sync::LazyLock<MappingSpec> = std::sync::LazyLock::new(|| {
+        serde_json::from_str(
+            r#"{"rules":[
             {"op":"copy","source":"id","target":"id"},
             {"op":"default","target":"type","default":"message"},
             {"op":"default","target":"role","default":"assistant"},
@@ -79,8 +80,10 @@ pub fn openai_to_anthropic() -> MappingSpec {
             {"op":"copy","source":"usage.prompt_tokens","target":"usage.input_tokens"},
             {"op":"copy","source":"usage.completion_tokens","target":"usage.output_tokens"}
         ]}"#,
-    )
-    .expect("built-in openai→anthropic mapping is valid")
+        )
+        .expect("built-in openai→anthropic mapping is valid")
+    });
+    &SPEC
 }
 
 /// Read a dotted path with numeric array indexing (`choices.0.finish_reason`).
@@ -312,7 +315,7 @@ mod tests {
                 "usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#,
         )
         .unwrap();
-        let anthropic = transform(&openai, &openai_to_anthropic());
+        let anthropic = transform(&openai, openai_to_anthropic());
         assert_eq!(anthropic["id"], "chatcmpl-test");
         assert_eq!(anthropic["type"], "message");
         assert_eq!(anthropic["role"], "assistant");

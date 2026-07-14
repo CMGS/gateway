@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use gw_models::GResult;
 use sqlx::Row;
 
-use crate::{AkInfo, KeySource};
+use crate::{AkInfo, KeyPatch, KeySource};
 
 /// How long an instance may serve a stale key view: the fleet-wide bound on
 /// create/revoke propagation (a local write invalidates its own cache at once).
@@ -27,18 +27,8 @@ pub trait KeyStore: Send + Sync + std::fmt::Debug {
     /// Insert or replace a key. Config ownership is sticky: an admin write to
     /// a config-declared key updates values but keeps it revocable by config.
     async fn put(&self, info: AkInfo, source: KeySource) -> GResult<()>;
-    /// Update quota/lifecycle fields in place; the `Option<Option<_>>` fields
-    /// are absent = leave, `Some(None)` = clear, `Some(Some(v))` = set.
-    /// `Ok(None)` if the key doesn't exist.
-    async fn patch(
-        &self,
-        ak: &str,
-        qps: Option<f64>,
-        daily_token_quota: Option<i64>,
-        tokens_per_minute: Option<Option<i64>>,
-        expires_at_epoch_secs: Option<Option<i64>>,
-        banned: Option<bool>,
-    ) -> GResult<Option<AkInfo>>;
+    /// Update quota/lifecycle fields in place; `Ok(None)` if the key doesn't exist.
+    async fn patch(&self, ak: &str, patch: &KeyPatch) -> GResult<Option<AkInfo>>;
     /// Remove a key regardless of source; whether it existed.
     async fn revoke(&self, ak: &str) -> GResult<bool>;
     /// Every key, sorted by ak for stable listings.
@@ -140,15 +130,7 @@ impl KeyStore for PostgresKeyStore {
         Ok(())
     }
 
-    async fn patch(
-        &self,
-        ak: &str,
-        qps: Option<f64>,
-        daily_token_quota: Option<i64>,
-        tokens_per_minute: Option<Option<i64>>,
-        expires_at_epoch_secs: Option<Option<i64>>,
-        banned: Option<bool>,
-    ) -> GResult<Option<AkInfo>> {
+    async fn patch(&self, ak: &str, patch: &KeyPatch) -> GResult<Option<AkInfo>> {
         // FOR UPDATE: concurrent patches serialize instead of clobbering fields
         let mut tx = self
             .pool
@@ -166,13 +148,7 @@ impl KeyStore for PostgresKeyStore {
         .map_err(|e| crate::sqlx_err("read key for patch", e))?;
         let Some(row) = row else { return Ok(None) };
         let mut info = row_to_info(&row);
-        info.apply_patch(
-            qps,
-            daily_token_quota,
-            tokens_per_minute,
-            expires_at_epoch_secs,
-            banned,
-        );
+        info.apply_patch(patch);
         sqlx::query(
             "UPDATE access_keys SET qps = $2, daily_token_quota = $3,
              tokens_per_minute = $4, expires_at_epoch_secs = $5, banned = $6
@@ -344,13 +320,27 @@ mod tests {
 
         ks.put(info("pk-b", 2.0), KeySource::Admin).await.unwrap();
         let p = ks
-            .patch("pk-b", Some(9.0), None, Some(Some(5)), None, Some(true))
+            .patch(
+                "pk-b",
+                &KeyPatch {
+                    qps: Some(9.0),
+                    tokens_per_minute: Some(Some(5)),
+                    banned: Some(true),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap()
             .unwrap();
         assert_eq!((p.qps, p.tokens_per_minute, p.banned), (9.0, Some(5), true));
         let p = ks
-            .patch("pk-b", None, None, Some(None), None, None)
+            .patch(
+                "pk-b",
+                &KeyPatch {
+                    tokens_per_minute: Some(None),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap()
             .unwrap();

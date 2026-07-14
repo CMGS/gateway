@@ -7,72 +7,93 @@
 use gw_config::SecurityConf;
 use gw_models::{Block, GatewayRequest, GatewayResponse};
 
-/// Blocklist check. Returns Block on a hit (block=true implies hit=true). Scans
-/// the same inbound text the DLP pass covers — chat messages, the Responses
-/// native body, and the family typed params — so no surface is a bypass.
-pub fn security_check(sec: &SecurityConf, request: &GatewayRequest) -> Option<Block> {
+/// Blocklist check. Returns Block on a hit (block=true implies hit=true).
+/// Scans the same inbound text DLP covers, so no surface is a bypass; takes
+/// `&mut` only to share the one traversal with the redaction pass.
+pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> Option<Block> {
     if sec.blocklist.is_empty() {
         return None;
     }
-    // sec.blocklist is already lower-cased at config load (see SecurityConf)
-    let hit = |text: &str| {
-        let lower = text.to_lowercase();
-        sec.blocklist
-            .iter()
-            .any(|w| !w.is_empty() && lower.contains(w))
-    };
-    let mut blocked = false;
-    for msg in &request.message {
-        blocked |= hit(&msg.content);
-        if let Some(parts) = &msg.parts {
-            visit_text(parts, &mut |t| blocked |= hit(t));
+    // the shared traversal counts hits; a String is never rewritten here
+    let mut scan = |s: &mut String| usize::from(blocklist_hit(sec, s));
+    let mut blocked = 0;
+    for msg in &mut request.message {
+        blocked += usize::from(blocklist_hit(sec, &msg.content));
+        if let Some(parts) = &mut msg.parts {
+            blocked += walk_json_strings(parts, &mut scan);
         }
     }
-    if let Some(param) = request.model_param_v2.as_ref() {
-        visit_text(&param.raw, &mut |t| blocked |= hit(t));
-        if let Some(typed) = param.typed.as_ref() {
-            visit_typed_text(typed, &mut |t| blocked |= hit(t));
+    if let Some(param) = request.model_param_v2.as_mut() {
+        blocked += walk_json_strings(&mut param.raw, &mut scan);
+        if let Some(typed) = param.typed.as_mut() {
+            blocked += for_each_typed_text(typed, &mut scan);
         }
     }
-    if blocked {
+    if blocked > 0 {
         let e = gw_consts::error_code::exceptions::empty_resp_err();
         return Some(Block::blocked(e.msg, e.code as i32));
     }
     None
 }
 
-/// Visit every string leaf in a JSON value.
-fn visit_text(v: &serde_json::Value, f: &mut impl FnMut(&str)) {
+/// Case-insensitive blocklist test; terms are pre-lowercased at config load.
+/// ASCII text matches without allocating; non-ASCII falls back to a lowercase copy.
+fn blocklist_hit(sec: &SecurityConf, text: &str) -> bool {
+    if text.is_ascii() {
+        return sec
+            .blocklist
+            .iter()
+            .any(|w| contains_ignore_ascii_case(text, w));
+    }
+    let lower = text.to_lowercase();
+    sec.blocklist.iter().any(|w| lower.contains(w))
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() || n.len() > h.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// Walk every string leaf of a JSON value with a visitor that may rewrite it;
+/// returns summed hits. One walker serves both the blocklist scan and DLP.
+fn walk_json_strings(v: &mut serde_json::Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
     match v {
         serde_json::Value::String(s) => f(s),
-        serde_json::Value::Array(a) => a.iter().for_each(|x| visit_text(x, f)),
-        serde_json::Value::Object(o) => o.values().for_each(|x| visit_text(x, f)),
-        _ => {}
+        serde_json::Value::Array(a) => a.iter_mut().map(|x| walk_json_strings(x, f)).sum(),
+        serde_json::Value::Object(o) => o.values_mut().map(|x| walk_json_strings(x, f)).sum(),
+        _ => 0,
     }
 }
 
-/// Visit the free-text fields of the family typed params; chat `tools`/
-/// `tool_choice` are client JSON forwarded to the vendor, so visited too.
-fn visit_typed_text(typed: &gw_models::TypedParams, f: &mut impl FnMut(&str)) {
+/// The free-text fields of the family typed params — the ONE field list both
+/// the blocklist scan and DLP redaction traverse, so a field added here is
+/// covered by both. Chat `tools`/`tool_choice` are client JSON forwarded to
+/// the vendor, so their string leaves count too.
+fn for_each_typed_text(
+    typed: &mut gw_models::TypedParams,
+    f: &mut impl FnMut(&mut String) -> usize,
+) -> usize {
     use gw_models::TypedParams as T;
     match typed {
         T::Chat(p) => {
-            if let Some(s) = &p.system {
-                f(s);
+            let mut n = p.system.as_mut().map(&mut *f).unwrap_or(0);
+            if let Some(t) = p.tools.as_mut() {
+                n += walk_json_strings(t, f);
             }
-            if let Some(t) = &p.tools {
-                visit_text(t, f);
+            if let Some(t) = p.tool_choice.as_mut() {
+                n += walk_json_strings(t, f);
             }
-            if let Some(t) = &p.tool_choice {
-                visit_text(t, f);
-            }
+            n
         }
-        T::Embeddings(p) => p.input.iter().for_each(|s| f(s)),
-        T::AudioTts(p) => f(&p.input),
-        T::Image(p) => f(&p.prompt),
-        T::Video(p) => f(&p.prompt),
-        T::Search(p) => f(&p.query),
-        T::AudioStt(_) => {}
+        T::Embeddings(p) => p.input.iter_mut().map(&mut *f).sum(),
+        T::AudioTts(p) => f(&mut p.input),
+        T::Image(p) => f(&mut p.prompt),
+        T::Video(p) => f(&mut p.prompt),
+        T::Search(p) => f(&mut p.query),
+        T::AudioStt(_) => 0,
     }
 }
 
@@ -83,11 +104,7 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
     }
     let mut hits = 0;
     for msg in &mut request.message {
-        let (redacted, n) = redact(&msg.content);
-        if n > 0 {
-            msg.content = redacted;
-            hits += n;
-        }
+        hits += redact_str(&mut msg.content);
         // engines forward `parts` (not `content`) when present, so PII must be
         // scrubbed inside the parts' text blocks too
         if let Some(parts) = &mut msg.parts {
@@ -97,64 +114,28 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
     // non-chat surfaces carry user text outside `message` (Responses raw body,
     // family typed params) — scrub those too or they reach the vendor unredacted
     if let Some(param) = request.model_param_v2.as_mut() {
-        hits += redact_value(&mut param.raw);
+        hits += walk_json_strings(&mut param.raw, &mut redact_str);
         if let Some(typed) = param.typed.as_mut() {
-            hits += redact_typed(typed);
+            hits += for_each_typed_text(typed, &mut redact_str);
         }
     }
     hits
 }
 
-/// Redact every string leaf in a JSON value in place (only PII patterns change;
-/// non-text values pass through). Used for the Responses native passthrough body.
-fn redact_value(v: &mut serde_json::Value) -> usize {
-    match v {
-        serde_json::Value::String(s) => {
-            let (redacted, n) = redact(s);
-            if n > 0 {
-                *s = redacted;
-            }
-            n
-        }
-        serde_json::Value::Array(a) => a.iter_mut().map(redact_value).sum(),
-        serde_json::Value::Object(o) => o.values_mut().map(redact_value).sum(),
-        _ => 0,
-    }
-}
-
-/// Redact the free-text fields of the family typed params.
-fn redact_typed(typed: &mut gw_models::TypedParams) -> usize {
-    use gw_models::TypedParams as T;
-    let mut redact_str = |s: &mut String| {
-        let (redacted, n) = redact(s);
-        if n > 0 {
+/// Redact one string in place; the hit count.
+fn redact_str(s: &mut String) -> usize {
+    match redact(s) {
+        Some((redacted, n)) => {
             *s = redacted;
-        }
-        n
-    };
-    match typed {
-        T::Chat(p) => {
-            let mut n = p.system.as_mut().map(&mut redact_str).unwrap_or(0);
-            // `tools`/`tool_choice` are client JSON forwarded to the vendor
-            if let Some(t) = p.tools.as_mut() {
-                n += redact_value(t);
-            }
-            if let Some(t) = p.tool_choice.as_mut() {
-                n += redact_value(t);
-            }
             n
         }
-        T::Embeddings(p) => p.input.iter_mut().map(&mut redact_str).sum(),
-        T::AudioTts(p) => redact_str(&mut p.input),
-        T::Image(p) => redact_str(&mut p.prompt),
-        T::Video(p) => redact_str(&mut p.prompt),
-        T::Search(p) => redact_str(&mut p.query),
-        T::AudioStt(_) => 0,
+        None => 0,
     }
 }
 
 /// Redact PII inside a multimodal `parts` array's text blocks, in place.
-/// Returns the hit count. Non-text parts (images etc.) are left untouched.
+/// Deliberately narrower than the blocklist scan: non-text parts (image URLs,
+/// base64 data) are never rewritten, so a redaction can't corrupt them.
 fn redact_parts_text(parts: &mut serde_json::Value) -> usize {
     let Some(arr) = parts.as_array_mut() else {
         return 0;
@@ -163,12 +144,10 @@ fn redact_parts_text(parts: &mut serde_json::Value) -> usize {
     for p in arr {
         if p["type"] == "text"
             && let Some(t) = p["text"].as_str()
+            && let Some((redacted, n)) = redact(t)
         {
-            let (redacted, n) = redact(t);
-            if n > 0 {
-                p["text"] = serde_json::Value::String(redacted);
-                hits += n;
-            }
+            p["text"] = serde_json::Value::String(redacted);
+            hits += n;
         }
     }
     hits
@@ -181,24 +160,43 @@ pub fn dlp_redact_response(sec: &SecurityConf, response: &mut GatewayResponse) -
     if !sec.dlp_redact {
         return 0;
     }
-    let (redacted, n) = redact(&response.message);
-    if n > 0 {
-        response.message = redacted;
-    }
-    let mut hits = n;
+    let mut hits = redact_str(&mut response.message);
     if let Some(v) = &mut response.response_v2 {
-        hits += redact_value(v);
+        hits += walk_json_strings(v, &mut redact_str);
     }
     if let Some(v) = &mut response.tool_calls {
-        hits += redact_value(v);
+        hits += walk_json_strings(v, &mut redact_str);
     }
     hits
 }
 
+/// Cheap byte scan gating the full scanner: an email needs an '@', a phone
+/// needs an 11-digit run — clean text pays no allocation at all.
+fn has_pii_candidate(b: &[u8]) -> bool {
+    let mut digits = 0;
+    for &c in b {
+        if c == b'@' {
+            return true;
+        }
+        if c.is_ascii_digit() {
+            digits += 1;
+            if digits >= 11 {
+                return true;
+            }
+        } else {
+            digits = 0;
+        }
+    }
+    false
+}
+
 /// Hand-rolled scanner (no regex dep): masks `local@domain.tld` email shapes and
 /// 11-digit CN-mobile runs (1[3-9]xxxxxxxxx). Two-pass: mark spans, then rebuild.
-/// Returns (redacted, hit count).
-fn redact(text: &str) -> (String, usize) {
+/// `None` when nothing matched — the common case, kept allocation-free.
+fn redact(text: &str) -> Option<(String, usize)> {
+    if !has_pii_candidate(text.as_bytes()) {
+        return None;
+    }
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
@@ -246,7 +244,7 @@ fn redact(text: &str) -> (String, usize) {
     }
 
     if spans.is_empty() {
-        return (text.to_owned(), 0);
+        return None;
     }
     spans.sort_by_key(|&(s, _, _)| s);
     let hits = spans.len();
@@ -262,7 +260,7 @@ fn redact(text: &str) -> (String, usize) {
     if cursor < n {
         out.extend(&chars[cursor..]);
     }
-    (out, hits)
+    Some((out, hits))
 }
 
 #[cfg(test)]
@@ -279,19 +277,37 @@ mod tests {
 
     #[test]
     fn blocklist_hits() {
-        let req = GatewayRequest {
+        let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "say ForbiddenWord now")],
             ..Default::default()
         };
-        let block = security_check(&sec(), &req).unwrap();
+        let block = security_check(&sec(), &mut req).unwrap();
         assert!(block.block && block.hit);
         assert_eq!(block.err_code, 4003);
-        assert!(security_check(&sec(), &GatewayRequest::default()).is_none());
+        assert!(security_check(&sec(), &mut GatewayRequest::default()).is_none());
+    }
+
+    #[test]
+    fn blocklist_matches_non_ascii_text() {
+        let s = SecurityConf {
+            blocklist: vec!["forbiddenword".into(), "禁词".into()],
+            dlp_redact: false,
+        };
+        let mut req = GatewayRequest {
+            message: vec![ChatMsg::text("user", "前文 FORBIDDENWORD 后文")],
+            ..Default::default()
+        };
+        assert!(security_check(&s, &mut req).is_some());
+        let mut req = GatewayRequest {
+            message: vec![ChatMsg::text("user", "包含 禁词 的内容")],
+            ..Default::default()
+        };
+        assert!(security_check(&s, &mut req).is_some());
     }
 
     #[test]
     fn redacts_email_and_phone() {
-        let (r, n) = redact("mail me at john.doe@example.com or call 13812345678 ok");
+        let (r, n) = redact("mail me at john.doe@example.com or call 13812345678 ok").unwrap();
         assert_eq!(n, 2);
         assert!(r.contains("[REDACTED_EMAIL]"), "{r}");
         assert!(r.contains("[REDACTED_PHONE]"), "{r}");
@@ -300,9 +316,8 @@ mod tests {
 
     #[test]
     fn leaves_clean_text_alone() {
-        let (r, n) = redact("nothing sensitive here 123");
-        assert_eq!(n, 0);
-        assert_eq!(r, "nothing sensitive here 123");
+        assert!(redact("nothing sensitive here 123").is_none());
+        assert!(redact("digits 1381234567 stop at ten").is_none());
     }
 
     #[test]

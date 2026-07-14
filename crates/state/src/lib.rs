@@ -13,6 +13,7 @@ use gw_config::GatewayConfig;
 use gw_consts::Protocol;
 use gw_models::Account;
 
+pub mod admission;
 pub mod configstore;
 pub mod governance;
 pub mod health;
@@ -59,32 +60,35 @@ impl AkInfo {
         }
     }
 
-    /// Apply a partial quota/lifecycle patch: absent = leave, `Some(None)` =
-    /// clear, `Some(Some(v))` = set.
-    pub fn apply_patch(
-        &mut self,
-        qps: Option<f64>,
-        daily_token_quota: Option<i64>,
-        tokens_per_minute: Option<Option<i64>>,
-        expires_at_epoch_secs: Option<Option<i64>>,
-        banned: Option<bool>,
-    ) {
-        if let Some(v) = qps {
+    /// Apply a partial quota/lifecycle patch.
+    pub fn apply_patch(&mut self, patch: &KeyPatch) {
+        if let Some(v) = patch.qps {
             self.qps = v;
         }
-        if let Some(v) = daily_token_quota {
+        if let Some(v) = patch.daily_token_quota {
             self.daily_token_quota = v;
         }
-        if let Some(v) = tokens_per_minute {
+        if let Some(v) = patch.tokens_per_minute {
             self.tokens_per_minute = v;
         }
-        if let Some(v) = expires_at_epoch_secs {
+        if let Some(v) = patch.expires_at_epoch_secs {
             self.expires_at_epoch_secs = v;
         }
-        if let Some(v) = banned {
+        if let Some(v) = patch.banned {
             self.banned = v;
         }
     }
+}
+
+/// A partial quota/lifecycle update: `None` = leave the field; on the
+/// double-`Option` fields `Some(None)` = clear, `Some(Some(v))` = set.
+#[derive(Debug, Clone, Default)]
+pub struct KeyPatch {
+    pub qps: Option<f64>,
+    pub daily_token_quota: Option<i64>,
+    pub tokens_per_minute: Option<Option<i64>>,
+    pub expires_at_epoch_secs: Option<Option<i64>>,
+    pub banned: Option<bool>,
 }
 
 impl From<&gw_config::AkConf> for AkInfo {
@@ -155,24 +159,9 @@ impl AkAuth {
 
     /// Update quota/lifecycle fields of an existing key in place; returns the
     /// new view. `None` if the key doesn't exist.
-    #[allow(clippy::too_many_arguments)]
-    pub fn patch(
-        &self,
-        ak: &str,
-        qps: Option<f64>,
-        daily_token_quota: Option<i64>,
-        tokens_per_minute: Option<Option<i64>>,
-        expires_at_epoch_secs: Option<Option<i64>>,
-        banned: Option<bool>,
-    ) -> Option<AkInfo> {
+    pub fn patch(&self, ak: &str, patch: &KeyPatch) -> Option<AkInfo> {
         let mut e = self.keys.get_mut(ak)?;
-        e.0.apply_patch(
-            qps,
-            daily_token_quota,
-            tokens_per_minute,
-            expires_at_epoch_secs,
-            banned,
-        );
+        e.0.apply_patch(patch);
         Some(e.0.clone())
     }
 
@@ -210,24 +199,8 @@ impl KeyStore for AkAuth {
         AkAuth::put(self, info, source);
         Ok(())
     }
-    async fn patch(
-        &self,
-        ak: &str,
-        qps: Option<f64>,
-        daily_token_quota: Option<i64>,
-        tokens_per_minute: Option<Option<i64>>,
-        expires_at_epoch_secs: Option<Option<i64>>,
-        banned: Option<bool>,
-    ) -> gw_models::GResult<Option<AkInfo>> {
-        Ok(AkAuth::patch(
-            self,
-            ak,
-            qps,
-            daily_token_quota,
-            tokens_per_minute,
-            expires_at_epoch_secs,
-            banned,
-        ))
+    async fn patch(&self, ak: &str, patch: &KeyPatch) -> gw_models::GResult<Option<AkInfo>> {
+        Ok(AkAuth::patch(self, ak, patch))
     }
     async fn revoke(&self, ak: &str) -> gw_models::GResult<bool> {
         Ok(AkAuth::revoke(self, ak))
@@ -440,32 +413,7 @@ impl AccountPool {
     }
 }
 
-/// Fixed-window request counter, for model-level QPM.
-#[derive(Debug, Default)]
-pub struct WindowCounter {
-    entries: DashMap<String, (Instant, i64)>,
-}
-
-impl WindowCounter {
-    /// Take one permit in the current window; window resets after `window` elapses.
-    pub fn allow(&self, key: &str, limit: i64, window: std::time::Duration) -> bool {
-        let mut e = self
-            .entries
-            .entry(key.to_owned())
-            .or_insert_with(|| (Instant::now(), 0));
-        if e.0.elapsed() >= window {
-            *e = (Instant::now(), 0);
-        }
-        if e.1 < limit {
-            e.1 += 1;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// Fixed-window token accounting, for AK-level TPM.
+/// Fixed-window token accounting, for AK-level TPM and (at amount 1) QPM.
 #[derive(Debug, Default)]
 pub struct TokenWindow {
     entries: DashMap<String, (Instant, i64)>,
@@ -564,15 +512,6 @@ impl AccountHealth {
                 None => true,
             },
             None => true,
-        }
-    }
-
-    /// Health label for the accounts view: "ok" | "cooling".
-    pub fn status(&self, name: &str) -> &'static str {
-        if self.available(name) {
-            "ok"
-        } else {
-            "cooling"
         }
     }
 }
@@ -991,7 +930,15 @@ mod tests {
             "admin key preserved"
         );
         let patched = auth
-            .patch("ak-admin", Some(9.0), None, Some(Some(5)), None, Some(true))
+            .patch(
+                "ak-admin",
+                &KeyPatch {
+                    qps: Some(9.0),
+                    tokens_per_minute: Some(Some(5)),
+                    banned: Some(true),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(patched.qps, 9.0);
         assert_eq!(patched.tokens_per_minute, Some(5));

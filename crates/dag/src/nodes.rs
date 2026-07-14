@@ -3,9 +3,15 @@
 
 use gw_consts::{ErrCode, Protocol};
 use gw_models::{GResult, GatewayError};
+use gw_state::admission;
 
 use crate::context::DagContext;
 use crate::executor::{DagNode, Layer};
+
+/// A shared admission denial as the wire error every limit answers with.
+fn limit_denied(msg: String) -> GatewayError {
+    GatewayError::new(ErrCode::STOP_LIMIT_MSG, 429, msg)
+}
 
 /// Completion tokens reserved when the caller sets no max_tokens; settle
 /// corrects to actuals, so the estimate only needs to be monotone.
@@ -30,15 +36,10 @@ impl DagNode for ModelQuotaGate {
             Some(p) if !p.model_name.is_empty() => p.model_name.clone(),
             _ => return Ok(()),
         };
-        let limit = ctx.ak.model_quotas.get(&requested).copied().or_else(|| {
-            ctx.cfg
-                .find_tenant(&ctx.ak.tenant)
-                .and_then(|t| t.model_quotas.get(&requested).copied())
-        });
-        let Some(limit) = limit else {
+        let Some(limit) = admission::model_quota_limit(&ctx.cfg, &ctx.ak, &requested) else {
             return Ok(());
         };
-        let key = format!("{}|{requested}", ctx.ak.ak);
+        let key = admission::model_quota_key(&ctx.ak.ak, &requested);
         let under = ctx.state.governance.quota_check(&key, limit).await;
         // usage accrues to the requested name either way: a fallback period ends at the daily reset
         ctx.model_quota_key = Some(key);
@@ -238,18 +239,9 @@ impl DagNode for QuotaCheck {
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let est = reserve_estimate(&ctx.request);
         let at = gw_state::epoch_secs();
-        if !ctx
-            .state
-            .governance
-            .quota_reserve(&ctx.ak.ak, est, ctx.ak.daily_token_quota, at)
+        admission::reserve_daily(ctx.state.governance.as_ref(), &ctx.ak, est, at)
             .await
-        {
-            return Err(GatewayError::new(
-                ErrCode::STOP_LIMIT_MSG,
-                429,
-                format!("daily token quota exhausted for ak {}", ctx.ak.ak),
-            ));
-        }
+            .map_err(limit_denied)?;
         ctx.quota_reserved = Some(est);
         ctx.quota_at = at;
         ctx.decide("quota_check", format!("reserved {est}"));
@@ -299,25 +291,9 @@ impl DagNode for TenantRateLimit {
         "tenant_rate"
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let Some(qps) = ctx.cfg.find_tenant(&ctx.ak.tenant).and_then(|t| t.qps) else {
-            return Ok(());
-        };
-        if !ctx
-            .state
-            .governance
-            .rate_allow(&format!("tenant:{}", ctx.ak.tenant), qps)
+        admission::check_tenant_rate(ctx.state.governance.as_ref(), &ctx.cfg, &ctx.ak.tenant)
             .await
-        {
-            return Err(GatewayError::new(
-                ErrCode::STOP_LIMIT_MSG,
-                429,
-                format!(
-                    "tenant rate limit exceeded for `{}` (qps {qps})",
-                    ctx.ak.tenant
-                ),
-            ));
-        }
-        Ok(())
+            .map_err(limit_denied)
     }
 }
 
@@ -333,22 +309,9 @@ impl DagNode for RateLimit {
         &["tenant_rate"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        if !ctx
-            .state
-            .governance
-            .rate_allow(&ctx.ak.ak, ctx.ak.qps)
+        admission::check_ak_rate(ctx.state.governance.as_ref(), &ctx.ak)
             .await
-        {
-            return Err(GatewayError::new(
-                ErrCode::STOP_LIMIT_MSG,
-                429,
-                format!(
-                    "rate limit exceeded for ak {} (qps {})",
-                    ctx.ak.ak, ctx.ak.qps
-                ),
-            ));
-        }
-        Ok(())
+            .map_err(limit_denied)
     }
 }
 
@@ -364,26 +327,9 @@ impl DagNode for ProductQpmLimit {
         &["rate_limit"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let Some(qpm) = ctx.cfg.find_product(&ctx.ak.product).and_then(|p| p.qpm) else {
-            return Ok(());
-        };
-        let window = gw_consts::MINUTE;
-        if !ctx
-            .state
-            .governance
-            .window_allow(&format!("product:{}", ctx.ak.product), qpm, window)
+        admission::check_product_qpm(ctx.state.governance.as_ref(), &ctx.cfg, &ctx.ak.product)
             .await
-        {
-            return Err(GatewayError::new(
-                ErrCode::STOP_LIMIT_MSG,
-                429,
-                format!(
-                    "product qpm limit exceeded for `{}` (qpm {qpm})",
-                    ctx.ak.product
-                ),
-            ));
-        }
-        Ok(())
+            .map_err(limit_denied)
     }
 }
 
@@ -402,26 +348,9 @@ impl DagNode for ModelQpmLimit {
         let Some(param) = ctx.request.model_param_v2.as_ref() else {
             return Ok(());
         };
-        let Some(qpm) = ctx.cfg.find_model(&param.model_name).and_then(|m| m.qpm) else {
-            return Ok(());
-        };
-        let window = gw_consts::MINUTE;
-        if !ctx
-            .state
-            .governance
-            .window_allow(&format!("model:{}", param.model_name), qpm, window)
+        admission::check_model_qpm(ctx.state.governance.as_ref(), &ctx.cfg, &param.model_name)
             .await
-        {
-            return Err(GatewayError::new(
-                ErrCode::STOP_LIMIT_MSG,
-                429,
-                format!(
-                    "model qpm limit exceeded for `{}` (qpm {qpm})",
-                    param.model_name
-                ),
-            ));
-        }
-        Ok(())
+            .map_err(limit_denied)
     }
 }
 
@@ -437,29 +366,12 @@ impl DagNode for AkTpmLimit {
         &["model_qpm"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let Some(tpm) = ctx.ak.tokens_per_minute else {
-            return Ok(());
-        };
-        let window = gw_consts::MINUTE;
         let est = ctx
             .quota_reserved
             .unwrap_or_else(|| reserve_estimate(&ctx.request));
-        if !ctx
-            .state
-            .governance
-            .token_window_reserve(&ctx.ak.ak, est, tpm, window)
+        ctx.tpm_reserved = admission::reserve_tpm(ctx.state.governance.as_ref(), &ctx.ak, est)
             .await
-        {
-            return Err(GatewayError::new(
-                ErrCode::STOP_LIMIT_MSG,
-                429,
-                format!(
-                    "token-per-minute limit exceeded for ak {} (tpm {tpm})",
-                    ctx.ak.ak
-                ),
-            ));
-        }
-        ctx.tpm_reserved = Some(est);
+            .map_err(limit_denied)?;
         Ok(())
     }
 }
@@ -653,14 +565,9 @@ impl DagNode for CostCalc {
     }
 }
 
-/// Consume quota/TPM and write the ledger record for one served request.
+/// Settle reserves and write the ledger for one served request via the shared
+/// [`admission::settle_and_bill`] orchestration.
 async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) -> GResult<()> {
-    // clamp before metering so a hostile usage report can't overflow a shared counter
-    let (prompt, completion, total) = (
-        gw_state::clamp_tokens(prompt),
-        gw_state::clamp_tokens(completion),
-        gw_state::clamp_tokens(total),
-    );
     let ptu_spillover = ctx
         .outcome
         .as_ref()
@@ -674,64 +581,38 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
         .and_then(|p| p.fallback_from.as_deref())
         .unwrap_or(served);
     let account = ctx.request.account_name();
-    let record = gw_state::billing_record(
+    let record = admission::settle_and_bill(
+        ctx.state.governance.as_ref(),
+        ctx.state.store.as_ref(),
         &ctx.cfg,
-        &gw_state::BillingInput {
-            ak: &ctx.ak.ak,
-            product: &ctx.ak.product,
-            tenant: &ctx.ak.tenant,
-            requested_model: requested,
-            served_model: served,
-            protocol: param.map(|p| p.protocol.as_str()).unwrap_or_default(),
-            account: &account,
-            prompt,
-            completion,
-            total,
-            ptu_spillover,
+        admission::SettleInput {
+            billing: gw_state::BillingInput {
+                ak: &ctx.ak.ak,
+                product: &ctx.ak.product,
+                tenant: &ctx.ak.tenant,
+                requested_model: requested,
+                served_model: served,
+                protocol: param.map(|p| p.protocol.as_str()).unwrap_or_default(),
+                account: &account,
+                prompt,
+                completion,
+                total,
+                ptu_spillover,
+            },
+            reserved: ctx.quota_reserved.take().unwrap_or(0),
+            tpm_reserved: ctx.tpm_reserved.take(),
+            reserved_at: ctx.quota_at,
+            model_quota_key: ctx.model_quota_key.clone(),
         },
+    )
+    .await;
+    ctx.decide(
+        "cost_calc",
+        format!(
+            "tokens={} cost_micros={}",
+            record.total_tokens, record.cost_micros
+        ),
     );
-    let cost = record.cost_micros;
-    // settle reservations to actuals on the admission day (the model-quota
-    // counter stays soft post-hoc by design); independent keys run concurrently
-    let quota_delta = total - ctx.quota_reserved.take().unwrap_or(0);
-    let at = ctx.quota_at;
-    match &ctx.model_quota_key {
-        Some(key) => {
-            tokio::join!(
-                ctx.state
-                    .governance
-                    .quota_settle(&ctx.ak.ak, quota_delta, at),
-                ctx.state.governance.quota_consume(key, total)
-            );
-        }
-        None => {
-            ctx.state
-                .governance
-                .quota_settle(&ctx.ak.ak, quota_delta, at)
-                .await
-        }
-    }
-    let window = gw_consts::MINUTE;
-    match ctx.tpm_reserved.take() {
-        Some(est) => {
-            ctx.state
-                .governance
-                .token_window_settle(&ctx.ak.ak, total - est, window)
-                .await
-        }
-        None => {
-            ctx.state
-                .governance
-                .token_window_add(&ctx.ak.ak, total, window)
-                .await
-        }
-    }
-    // a ledger write failure must not fail an already-served response
-    if let Err(e) = ctx.state.store.ledger_add(record).await {
-        metrics::counter!("gateway_ledger_write_failures_total").increment(1);
-        tracing::error!(error = %e, "billing ledger write failed");
-    }
-    ctx.decide("cost_calc", format!("tokens={total} cost_micros={cost}"));
     Ok(())
 }
 
@@ -819,12 +700,8 @@ pub fn default_layers() -> Vec<Layer> {
 
 /// The provider a model is bound to in config, if any.
 fn model_provider(ctx: &DagContext) -> Option<String> {
-    let name = ctx
-        .request
-        .model_param_v2
-        .as_ref()
-        .map(|p| p.model_name.clone())?;
-    ctx.cfg.find_model(&name).and_then(|m| m.provider.clone())
+    let name = &ctx.request.model_param_v2.as_ref()?.model_name;
+    ctx.cfg.find_model(name).and_then(|m| m.provider.clone())
 }
 
 #[cfg(test)]

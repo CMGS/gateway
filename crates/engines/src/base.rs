@@ -73,6 +73,16 @@ impl Base {
         }
     }
 
+    /// The last message's content — the free-text fallback the non-chat
+    /// families use when typed params are absent.
+    pub fn last_message_text(&self) -> String {
+        self.request
+            .message
+            .last()
+            .map(|m| m.content.clone())
+            .unwrap_or_default()
+    }
+
     /// Bearer auth headers (the OpenAI-shaped families); real key when the
     /// account is live, inert "mock" otherwise.
     pub fn bearer_headers(&self) -> Vec<(String, String)> {
@@ -146,10 +156,8 @@ impl Base {
         mut body: Value,
         stream: bool,
     ) -> GResult<UpstreamResponse> {
-        if let (Some(obj), Value::Object(extra)) = (body.as_object_mut(), &self.param()?.raw) {
-            for (k, v) in extra {
-                obj.entry(k.clone()).or_insert_with(|| v.clone());
-            }
+        if let Some(obj) = body.as_object_mut() {
+            merge_raw_extras(obj, &self.param()?.raw);
         }
         if !headers
             .iter()
@@ -173,6 +181,16 @@ impl Base {
             .buffered()
             .await?;
         parse_json_reply(reply)
+    }
+}
+
+/// Merge `raw` passthrough fields into a wire body; typed fields stay
+/// authoritative (`or_insert`).
+pub(crate) fn merge_raw_extras(body: &mut serde_json::Map<String, Value>, raw: &Value) {
+    if let Value::Object(extra) = raw {
+        for (k, v) in extra {
+            body.entry(k.clone()).or_insert_with(|| v.clone());
+        }
     }
 }
 

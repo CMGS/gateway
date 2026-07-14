@@ -17,6 +17,7 @@ use base64::Engine as _;
 use gw_config::GatewayConfig;
 use gw_dag::DagContext;
 use gw_engines::SharedTransport;
+use gw_engines::realtime::{is_response_create, realtime_turn_started, realtime_usage};
 use gw_handler::{BatchItem, OfflineHandler, OnlineHandler};
 use gw_models::{
     ChatMsg, ChatParams, EmbeddingParams, GResult, GatewayError, GatewayRequest, ImageParams,
@@ -26,6 +27,7 @@ use gw_protocol::anthropic::{AnthUsage, MessagesRequest, MessagesResponse};
 use gw_protocol::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Usage,
 };
+use gw_state::admission;
 use gw_state::{AkInfo, GatewayState};
 use serde_json::{Value, json};
 
@@ -258,7 +260,7 @@ async fn realtime_ws(
     let ws = ws.protocols(["realtime"]);
     if account.endpoint.is_empty() {
         ws.on_upgrade(move |socket| realtime_session(socket, s, ak, model, mt, account.name))
-    } else if is_gemini_realtime(&account.provider) {
+    } else if gw_engines::realtime::is_gemini_realtime(&account.provider) {
         // no pre-generation gate signal in this dialect — refuse rather than bill after the fact
         error_response(
             501,
@@ -286,19 +288,18 @@ struct RealtimeAdmit {
 impl RealtimeAdmit {
     /// Refund this turn's unsettled reserves — for a turn dropped before its boundary frame.
     async fn refund(&self, gov: &dyn gw_state::Governance) {
-        gov.quota_settle(&self.ak.ak, -self.reserved, self.at).await;
-        if let Some(tpm) = self.tpm_reserved {
-            gov.token_window_settle(&self.ak.ak, -tpm, gw_consts::MINUTE)
-                .await;
-        }
+        gov.refund_reserves(&self.ak.ak, self.reserved, self.tpm_reserved, self.at)
+            .await;
     }
 }
 
-/// The REST governance chain applied per realtime generation, with the key
-/// re-fetched each turn so mid-session bans/de-entitlements take effect. The
-/// daily-quota and TPM reserves are taken last so a denial from any earlier
-/// check never leaves a reservation behind; a failed TPM reserve rolls back
-/// the daily reserve just taken. `Err` carries the denial message.
+/// The REST admission chain applied per realtime generation via the shared
+/// [`admission`] checks, with the key re-fetched each turn so mid-session
+/// bans/de-entitlements take effect. Two deliberate divergences from the DAG:
+/// over-quota denies instead of degrading (a session can't swap models
+/// mid-stream), and the reserve is a fixed turn estimate. Reserves are taken
+/// last so a denial never leaves one behind; a failed TPM reserve rolls back
+/// the daily reserve just taken.
 async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<RealtimeAdmit, String> {
     let snap = s.handler.config.load();
     let (cfg, state) = (&snap.cfg, &snap.state);
@@ -314,60 +315,26 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<Realtim
             ak.tenant
         ));
     }
-    let gov = &state.governance;
-    if let Some(qps) = cfg.find_tenant(&ak.tenant).and_then(|t| t.qps)
-        && !gov.rate_allow(&format!("tenant:{}", ak.tenant), qps).await
-    {
-        return Err(format!("tenant rate limit exceeded for `{}`", ak.tenant));
-    }
-    if !gov.rate_allow(&ak.ak, ak.qps).await {
-        return Err(format!(
-            "rate limit exceeded for ak {} (qps {})",
-            ak.ak, ak.qps
-        ));
-    }
-    if let Some(qpm) = cfg.find_product(&ak.product).and_then(|p| p.qpm)
+    let gov = state.governance.as_ref();
+    admission::check_tenant_rate(gov, cfg, &ak.tenant).await?;
+    admission::check_ak_rate(gov, &ak).await?;
+    admission::check_product_qpm(gov, cfg, &ak.product).await?;
+    admission::check_model_qpm(gov, cfg, model).await?;
+    if let Some(limit) = admission::model_quota_limit(cfg, &ak, model)
         && !gov
-            .window_allow(&format!("product:{}", ak.product), qpm, gw_consts::MINUTE)
+            .quota_check(&admission::model_quota_key(&ak.ak, model), limit)
             .await
-    {
-        return Err(format!("product qpm limit exceeded for `{}`", ak.product));
-    }
-    if let Some(qpm) = cfg.find_model(model).and_then(|m| m.qpm)
-        && !gov
-            .window_allow(&format!("model:{model}"), qpm, gw_consts::MINUTE)
-            .await
-    {
-        return Err(format!("model qpm limit exceeded for `{model}`"));
-    }
-    if let Some(limit) = ak.model_quotas.get(model).copied().or_else(|| {
-        cfg.find_tenant(&ak.tenant)
-            .and_then(|t| t.model_quotas.get(model).copied())
-    }) && !gov.quota_check(&format!("{}|{model}", ak.ak), limit).await
     {
         return Err(format!("model quota exhausted for `{model}`"));
     }
     let at = gw_state::epoch_secs();
-    if !gov
-        .quota_reserve(&ak.ak, REALTIME_TURN_RESERVE, ak.daily_token_quota, at)
-        .await
-    {
-        return Err(format!("daily token quota exhausted for ak {}", ak.ak));
-    }
-    let tpm_reserved = if let Some(tpm) = ak.tokens_per_minute {
-        if !gov
-            .token_window_reserve(&ak.ak, REALTIME_TURN_RESERVE, tpm, gw_consts::MINUTE)
-            .await
-        {
+    admission::reserve_daily(gov, &ak, REALTIME_TURN_RESERVE, at).await?;
+    let tpm_reserved = match admission::reserve_tpm(gov, &ak, REALTIME_TURN_RESERVE).await {
+        Ok(reserved) => reserved,
+        Err(denied) => {
             gov.quota_settle(&ak.ak, -REALTIME_TURN_RESERVE, at).await;
-            return Err(format!(
-                "token-per-minute limit exceeded for ak {} (tpm {tpm})",
-                ak.ak
-            ));
+            return Err(denied);
         }
-        Some(REALTIME_TURN_RESERVE)
-    } else {
-        None
     };
     Ok(RealtimeAdmit {
         ak,
@@ -377,10 +344,9 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<Realtim
     })
 }
 
-/// Settle one realtime turn's admission reserves to its actual total, then
-/// accrue counters and write the ledger; a zero-usage terminal frame refunds
-/// and writes nothing. Pricing shares [`gw_state::billing_record`] with the
-/// request pipeline so the two can't drift.
+/// Settle one realtime turn via the shared [`admission::settle_and_bill`]
+/// orchestration; a zero-usage terminal frame (cancelled/empty turn) refunds
+/// the reserves and writes nothing.
 async fn bill_realtime_turn(
     s: &AppState,
     admit: &RealtimeAdmit,
@@ -395,52 +361,43 @@ async fn bill_realtime_turn(
     let (it, ot) = (gw_state::clamp_tokens(it), gw_state::clamp_tokens(ot));
     let total = gw_state::clamp_tokens(it.saturating_add(ot));
     let state = s.handler.state();
-    let gov = &state.governance;
-    // reserved = 0 for an ungated dialect — the settle degenerates to a plain add
-    gov.quota_settle(&ak.ak, total - admit.reserved, admit.at)
-        .await;
-    match admit.tpm_reserved {
-        Some(tpm_res) => {
-            gov.token_window_settle(&ak.ak, total - tpm_res, gw_consts::MINUTE)
-                .await
-        }
-        None if total > 0 => gov.token_window_add(&ak.ak, total, gw_consts::MINUTE).await,
-        None => {}
-    }
     if total == 0 {
-        return; // cancelled/empty turn: reserves refunded, nothing to bill
-    }
-    if ak.model_quotas.contains_key(model)
-        || s.handler
-            .cfg()
-            .find_tenant(&ak.tenant)
-            .is_some_and(|t| t.model_quotas.contains_key(model))
-    {
-        gov.quota_consume(&format!("{}|{model}", ak.ak), total)
+        state
+            .governance
+            .refund_reserves(&ak.ak, admit.reserved, admit.tpm_reserved, admit.at)
             .await;
+        return;
     }
-    let record = gw_state::billing_record(
-        &s.handler.cfg(),
-        &gw_state::BillingInput {
-            ak: &ak.ak,
-            product: &ak.product,
-            tenant: &ak.tenant,
-            requested_model: model,
-            served_model: model,
-            protocol: mt.as_str(),
-            account,
-            prompt: it,
-            completion: ot,
-            total,
-            ptu_spillover: false,
+    let cfg = s.handler.cfg();
+    let model_quota_key = admission::model_quota_limit(&cfg, ak, model)
+        .map(|_| admission::model_quota_key(&ak.ak, model));
+    admission::settle_and_bill(
+        state.governance.as_ref(),
+        state.store.as_ref(),
+        &cfg,
+        admission::SettleInput {
+            billing: gw_state::BillingInput {
+                ak: &ak.ak,
+                product: &ak.product,
+                tenant: &ak.tenant,
+                requested_model: model,
+                served_model: model,
+                protocol: mt.as_str(),
+                account,
+                prompt: it,
+                completion: ot,
+                total,
+                ptu_spillover: false,
+            },
+            reserved: admit.reserved,
+            tpm_reserved: admit.tpm_reserved,
+            reserved_at: admit.at,
+            model_quota_key,
         },
-    );
-    metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it.max(0) as u64);
-    metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ot.max(0) as u64);
-    if let Err(e) = state.store.ledger_add(record).await {
-        metrics::counter!("gateway_ledger_write_failures_total").increment(1);
-        tracing::error!(error = %e, "realtime billing write failed");
-    }
+    )
+    .await;
+    metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it as u64);
+    metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ot as u64);
 }
 
 /// One mock realtime session.
@@ -520,60 +477,11 @@ async fn realtime_session(
     }
 }
 
-/// Whether a client frame is the OpenAI-dialect generation trigger; text and
-/// binary are both checked so a binary-encoded event can't slip past the gate.
-fn is_response_create(payload: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(payload)
-        .map(|v| v["type"] == "response.create")
-        .unwrap_or(false)
-}
-
-/// A non-OpenAI realtime dialect (Gemini Live family): no turn-start signal to
-/// gate before generation; metered off the vendor's own turn-complete frame.
-fn is_gemini_realtime(provider: &str) -> bool {
-    matches!(provider, "google" | "gemini" | "vertex")
-}
-
-/// Whether `frame` is a server-initiated (VAD) turn start the gateway must gate.
-fn realtime_turn_started(provider: &str, frame: &Value) -> bool {
-    !is_gemini_realtime(provider) && frame["type"] == "response.created"
-}
-
-/// Per-dialect turn boundary → the turn's (input, output) tokens: `Some((0, 0))`
-/// for a cancelled/empty turn (so its reservation settles instead of orphaning),
-/// `None` for a non-boundary frame. Keyed by provider so every dialect is metered.
-fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
-    let usage = if is_gemini_realtime(provider) {
-        // cumulative usage rides many frames — settle only on turnComplete or it double-counts
-        if frame["serverContent"]["turnComplete"] != Value::Bool(true) {
-            return None;
-        }
-        let u = &frame["usageMetadata"];
-        let it = u["promptTokenCount"].as_i64().unwrap_or(0);
-        let ot = u["responseTokenCount"]
-            .as_i64()
-            .or_else(|| u["candidatesTokenCount"].as_i64())
-            .unwrap_or(0);
-        (it, ot)
-    } else {
-        // a turn ends on response.done, any status, possibly with zero usage
-        if frame["type"] != "response.done" {
-            return None;
-        }
-        let u = &frame["response"]["usage"];
-        (
-            u["input_tokens"].as_i64().unwrap_or(0),
-            u["output_tokens"].as_i64().unwrap_or(0),
-        )
-    };
-    // floor at 0 so a negative upstream count can't refund quota or bill negative
-    Some((usage.0.max(0), usage.1.max(0)))
-}
-
 /// Bridge one realtime session to a real upstream over WebSocket: transparent
 /// relay plus auth, per-generation gates, and per-turn billing. Only the OpenAI
 /// dialect reaches here — [`realtime_ws`] refuses providers it can't gate; the
 /// Gemini metering in [`realtime_usage`] is groundwork for a future adapter.
+/// Per-dialect frame semantics live in [`gw_engines::realtime`].
 async fn realtime_bridge(
     mut client: axum::extract::ws::WebSocket,
     s: AppState,
@@ -636,56 +544,35 @@ async fn realtime_bridge(
     let mut suppress = false;
     loop {
         tokio::select! {
-            m = cl_rx.next() => match m {
-                Some(Ok(CMsg::Text(t))) => {
-                    // gate each generation trigger, not every control frame
-                    if is_response_create(t.as_bytes()) {
-                        match realtime_gate(&s, &ak, &model).await {
-                            Ok(admit) => {
-                                pending.push_back(admit);
-                                generations += 1;
+            m = cl_rx.next() => {
+                let (is_trigger, forward) = match m {
+                    Some(Ok(CMsg::Text(t))) => (is_response_create(t.as_bytes()), UMsg::text(t.to_string())),
+                    Some(Ok(CMsg::Binary(b))) => (is_response_create(&b), UMsg::binary(b)),
+                    Some(Ok(CMsg::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
+                };
+                // gate each generation trigger, not every control frame
+                if is_trigger {
+                    match realtime_gate(&s, &ak, &model).await {
+                        Ok(admit) => {
+                            pending.push_back(admit);
+                            generations += 1;
+                        }
+                        Err(denied) => {
+                            if cl_tx
+                                .send(CMsg::Text(send_err(denied).to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
                             }
-                            Err(denied) => {
-                                if cl_tx
-                                    .send(CMsg::Text(send_err(denied).to_string().into()))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                continue;
-                            }
+                            continue;
                         }
                     }
-                    if up_tx.send(UMsg::text(t.to_string())).await.is_err() {
-                        break;
-                    }
                 }
-                Some(Ok(CMsg::Binary(b))) => {
-                    if is_response_create(&b) {
-                        match realtime_gate(&s, &ak, &model).await {
-                            Ok(admit) => {
-                                pending.push_back(admit);
-                                generations += 1;
-                            }
-                            Err(denied) => {
-                                if cl_tx
-                                    .send(CMsg::Text(send_err(denied).to_string().into()))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    if up_tx.send(UMsg::binary(b)).await.is_err() {
-                        break;
-                    }
+                if up_tx.send(forward).await.is_err() {
+                    break;
                 }
-                Some(Ok(CMsg::Close(_))) | Some(Err(_)) | None => break,
-                Some(Ok(_)) => {} // ping/pong handled by the ws stacks
             },
             m = up_rx.next() => match m {
                 Some(Ok(UMsg::Text(t))) => {
@@ -1132,19 +1019,14 @@ async fn admin_key_patch(
         Some(v) if v.is_i64() || v.is_u64() => v.as_i64().map(Some),
         _ => None,
     };
-    let patched = s
-        .handler
-        .state()
-        .auth
-        .patch(
-            &ak,
-            body["qps"].as_f64(),
-            body["daily_token_quota"].as_i64(),
-            tri("tokens_per_minute"),
-            tri("expires_at_epoch_secs"),
-            body["banned"].as_bool(),
-        )
-        .await;
+    let patch = gw_state::KeyPatch {
+        qps: body["qps"].as_f64(),
+        daily_token_quota: body["daily_token_quota"].as_i64(),
+        tokens_per_minute: tri("tokens_per_minute"),
+        expires_at_epoch_secs: tri("expires_at_epoch_secs"),
+        banned: body["banned"].as_bool(),
+    };
+    let patched = s.handler.state().auth.patch(&ak, &patch).await;
     match patched {
         Err(e) => gateway_error(e),
         Ok(Some(info)) => (
@@ -1364,33 +1246,34 @@ async fn chat_completions(
         return error_response(400, "messages must not be empty");
     }
 
+    // move the caller's payloads (multimodal parts can be large) instead of cloning
     let messages: Vec<ChatMsg> = body
         .messages
-        .iter()
-        .map(|m| ChatMsg {
-            role: m.role.clone(),
-            content: m.content_text(),
-            parts: m.content.as_ref().and_then(|c| match c {
-                gw_protocol::openai::MessageContent::Parts(p) => Some(Value::Array(p.clone())),
-                _ => None,
-            }),
-            tool_calls: m
-                .tool_calls
-                .as_ref()
-                .and_then(|tc| serde_json::to_value(tc).ok()),
-            tool_call_id: m.tool_call_id.clone(),
+        .into_iter()
+        .map(|m| {
+            let content = m.content_text();
+            ChatMsg {
+                role: m.role,
+                content,
+                parts: m.content.and_then(|c| match c {
+                    gw_protocol::openai::MessageContent::Parts(p) => Some(Value::Array(p)),
+                    _ => None,
+                }),
+                tool_calls: m.tool_calls.and_then(|tc| serde_json::to_value(tc).ok()),
+                tool_call_id: m.tool_call_id,
+            }
         })
         .collect();
     let typed = TypedParams::Chat(ChatParams {
         temperature: body.temperature,
         top_p: body.top_p,
         max_tokens: body.max_tokens,
-        stop: body.stop.clone(),
+        stop: body.stop,
         presence_penalty: body.presence_penalty,
         frequency_penalty: body.frequency_penalty,
-        tools: body.tools.as_ref().map(|t| Value::Array(t.clone())),
-        tool_choice: body.tool_choice.clone(),
-        response_format: body.response_format.clone(),
+        tools: body.tools.map(Value::Array),
+        tool_choice: body.tool_choice,
+        response_format: body.response_format,
         logprobs: body.logprobs,
         top_logprobs: body.top_logprobs,
         system: None,
@@ -1401,7 +1284,7 @@ async fn chat_completions(
         body.model.clone(),
     );
     param.typed = Some(typed);
-    param.raw = Value::Object(body.extra.clone());
+    param.raw = Value::Object(body.extra);
 
     let request = GatewayRequest {
         is_online: true,
@@ -1413,8 +1296,7 @@ async fn chat_completions(
     };
 
     if body.stream {
-        let model = body.model.clone();
-        return chat_stream_response(s, request, ak, model, started).into_response();
+        return chat_stream_response(s, request, ak, body.model, started).into_response();
     }
 
     let ctx = match run_pipeline(&s, request, ak).await {
@@ -1512,6 +1394,35 @@ fn spawn_stream_pipeline(
     rx
 }
 
+/// A per-protocol SSE encode state driven by [`sse_stream`].
+trait SseEncodeState: Send + 'static {
+    fn queue(&mut self) -> &mut std::collections::VecDeque<Event>;
+    /// Apply one pipeline chunk (`None` = producer gone); `true` = the stream
+    /// is over once `queue` drains.
+    fn apply(&mut self, chunk: Option<gw_engines::StreamChunk>) -> bool;
+}
+
+/// The one queue-drain / recv / dispatch loop every streaming surface shares;
+/// per-protocol event shaping stays in each [`SseEncodeState`].
+fn sse_stream<S: SseEncodeState>(
+    rx: tokio::sync::mpsc::Receiver<gw_engines::StreamChunk>,
+    st: S,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>> + use<S>> {
+    let stream =
+        futures::stream::unfold((rx, st, false), |(mut rx, mut st, mut ended)| async move {
+            loop {
+                if let Some(ev) = st.queue().pop_front() {
+                    return Some((Ok::<_, Infallible>(ev), (rx, st, ended)));
+                }
+                if ended {
+                    return None;
+                }
+                ended = st.apply(rx.recv().await);
+            }
+        });
+    Sse::new(stream)
+}
+
 /// Streaming chat: pipeline chunks re-emitted as OpenAI SSE.
 fn chat_stream_response(
     s: AppState,
@@ -1523,89 +1434,97 @@ fn chat_stream_response(
     let rx = spawn_stream_pipeline(&s, request, ak, "chat_completions", started);
 
     struct St {
-        rx: tokio::sync::mpsc::Receiver<gw_engines::StreamChunk>,
         queue: std::collections::VecDeque<Event>,
         id: String,
         created: i64,
         model: String,
         pending_finish: Option<String>,
-        ended: bool,
     }
-    let st = St {
-        rx,
-        queue: std::collections::VecDeque::new(),
-        id: next_id("chatcmpl"),
-        created: gw_state::epoch_secs(),
-        model,
-        pending_finish: None,
-        ended: false,
-    };
-    let stream = futures::stream::unfold(st, |mut st| async move {
-        loop {
-            if let Some(ev) = st.queue.pop_front() {
-                return Some((Ok::<_, Infallible>(ev), st));
-            }
-            if st.ended {
-                return None;
-            }
-            match st.rx.recv().await {
+    impl SseEncodeState for St {
+        fn queue(&mut self) -> &mut std::collections::VecDeque<Event> {
+            &mut self.queue
+        }
+        fn apply(&mut self, chunk: Option<gw_engines::StreamChunk>) -> bool {
+            match chunk {
                 Some(c) if c.error.is_some() => {
                     let msg = c.error.unwrap_or_default();
-                    st.queue.push_back(Event::default().data(
+                    self.queue.push_back(Event::default().data(
                         json!({"error": {"message": msg, "type": "gateway_error"}}).to_string(),
                     ));
-                    st.queue.push_back(Event::default().data("[DONE]"));
-                    st.ended = true;
+                    self.queue.push_back(Event::default().data("[DONE]"));
+                    true
                 }
                 Some(c) => {
                     if !c.delta.is_empty() {
-                        let chunk =
-                            ChatCompletionChunk::content(&st.id, st.created, &st.model, c.delta);
+                        let chunk = ChatCompletionChunk::content(
+                            &self.id,
+                            self.created,
+                            &self.model,
+                            c.delta,
+                        );
                         if let Ok(payload) = serde_json::to_string(&chunk) {
-                            st.queue.push_back(Event::default().data(payload));
+                            self.queue.push_back(Event::default().data(payload));
                         }
                     }
                     if let Some(tc) = &c.tool_calls {
                         let calls = tc.as_array().cloned().unwrap_or_default();
-                        let chunk =
-                            ChatCompletionChunk::tool_calls(&st.id, st.created, &st.model, calls);
+                        let chunk = ChatCompletionChunk::tool_calls(
+                            &self.id,
+                            self.created,
+                            &self.model,
+                            calls,
+                        );
                         if let Ok(payload) = serde_json::to_string(&chunk) {
-                            st.queue.push_back(Event::default().data(payload));
+                            self.queue.push_back(Event::default().data(payload));
                         }
                     }
                     if let Some(fr) = c.finish_reason {
                         // held back until usage arrives so the final frame carries both
-                        st.pending_finish = Some(fr);
+                        self.pending_finish = Some(fr);
                     }
-                    if let Some((pt, ct, tt)) = c.usage_totals {
-                        let usage = Usage {
-                            prompt_tokens: pt,
-                            completion_tokens: ct,
-                            total_tokens: tt,
-                        };
-                        let mut fin =
-                            ChatCompletionChunk::finish(&st.id, st.created, &st.model, Some(usage));
-                        fin.choices[0].finish_reason = Some(
-                            st.pending_finish
-                                .take()
-                                .unwrap_or_else(|| "stop".to_owned()),
-                        );
-                        if let Ok(payload) = serde_json::to_string(&fin) {
-                            st.queue.push_back(Event::default().data(payload));
-                        }
-                        st.queue.push_back(Event::default().data("[DONE]"));
-                        st.ended = true;
+                    let Some((pt, ct, tt)) = c.usage_totals else {
+                        return false;
+                    };
+                    let usage = Usage {
+                        prompt_tokens: pt,
+                        completion_tokens: ct,
+                        total_tokens: tt,
+                    };
+                    let mut fin = ChatCompletionChunk::finish(
+                        &self.id,
+                        self.created,
+                        &self.model,
+                        Some(usage),
+                    );
+                    fin.choices[0].finish_reason = Some(
+                        self.pending_finish
+                            .take()
+                            .unwrap_or_else(|| "stop".to_owned()),
+                    );
+                    if let Ok(payload) = serde_json::to_string(&fin) {
+                        self.queue.push_back(Event::default().data(payload));
                     }
+                    self.queue.push_back(Event::default().data("[DONE]"));
+                    true
                 }
                 None => {
                     // producer gone without a usage chunk — close the stream cleanly
-                    st.queue.push_back(Event::default().data("[DONE]"));
-                    st.ended = true;
+                    self.queue.push_back(Event::default().data("[DONE]"));
+                    true
                 }
             }
         }
-    });
-    Sse::new(stream)
+    }
+    sse_stream(
+        rx,
+        St {
+            queue: std::collections::VecDeque::new(),
+            id: next_id("chatcmpl"),
+            created: gw_state::epoch_secs(),
+            model,
+            pending_finish: None,
+        },
+    )
 }
 
 /// Chunks for an engine that returned a buffered response.
@@ -1681,35 +1600,37 @@ async fn messages(
         return anthropic_error(400, "messages must not be empty");
     }
 
+    let system = body.system_text();
     let typed = TypedParams::Chat(ChatParams {
         temperature: body.temperature,
         top_p: body.top_p,
         max_tokens: body.max_tokens,
         stop: body
             .stop_sequences
-            .as_ref()
             .and_then(|s| serde_json::to_value(s).ok()),
-        tools: body.tools.as_ref().map(|t| Value::Array(t.clone())),
-        tool_choice: body.tool_choice.clone(),
-        system: body.system_text(),
+        tools: body.tools.map(Value::Array),
+        tool_choice: body.tool_choice,
+        system,
         ..Default::default()
     });
     let mut param =
         ModelParamV2::with_name(gw_consts::Protocol::AnthropicMessages, body.model.clone());
     param.typed = Some(typed);
-    param.raw = Value::Object(body.extra.clone());
+    param.raw = Value::Object(body.extra);
 
     let request = GatewayRequest {
         is_online: true,
         stream: body.stream,
         ak: ak.ak.clone(),
+        // move the caller's payloads (multimodal blocks can be large) instead of cloning
         message: body
             .messages
-            .iter()
+            .into_iter()
             .map(|m| {
-                let mut msg = ChatMsg::text(m.role.clone(), m.text());
+                let text = m.text();
+                let mut msg = ChatMsg::text(m.role, text);
                 if m.content.is_array() {
-                    msg.parts = Some(m.content.clone());
+                    msg.parts = Some(m.content);
                 }
                 msg
             })
@@ -1719,8 +1640,7 @@ async fn messages(
     };
 
     if body.stream {
-        let model = body.model.clone();
-        return messages_stream_response(s, request, ak, model, started).into_response();
+        return messages_stream_response(s, request, ak, body.model, started).into_response();
     }
 
     let ctx = match run_pipeline(&s, request, ak).await {
@@ -1777,8 +1697,7 @@ fn anthropic_tool_blocks(tool_calls: &Option<Value>) -> Vec<Value> {
         return Vec::new();
     }
     let envelope = json!({"choices": [{"message": {"tool_calls": blocks}}]});
-    let converted =
-        gw_protocol::dsl::transform(&envelope, &gw_protocol::dsl::openai_to_anthropic());
+    let converted = gw_protocol::dsl::transform(&envelope, gw_protocol::dsl::openai_to_anthropic());
     converted["content"]
         .as_array()
         .map(|a| {
@@ -1803,7 +1722,6 @@ fn messages_stream_response(
     let rx = spawn_stream_pipeline(&s, request, ak, "messages", started);
 
     struct St {
-        rx: tokio::sync::mpsc::Receiver<gw_engines::StreamChunk>,
         queue: std::collections::VecDeque<Event>,
         id: String,
         model: String,
@@ -1813,7 +1731,6 @@ fn messages_stream_response(
         /// OpenAI-shaped tool-call fragments, accumulated until the stream ends.
         tool_frags: Option<Value>,
         pending_finish: Option<String>,
-        ended: bool,
     }
 
     impl St {
@@ -1900,89 +1817,91 @@ fn messages_stream_response(
             ));
             self.queue
                 .push_back(Self::ev("message_stop", json!({"type":"message_stop"})));
-            self.ended = true;
         }
     }
 
-    let st = St {
-        rx,
-        queue: std::collections::VecDeque::new(),
-        id: next_id("msg"),
-        model,
-        started_msg: false,
-        text_idx: None,
-        next_idx: 0,
-        tool_frags: None,
-        pending_finish: None,
-        ended: false,
-    };
-    let stream = futures::stream::unfold(st, |mut st| async move {
-        loop {
-            if let Some(ev) = st.queue.pop_front() {
-                return Some((Ok::<_, Infallible>(ev), st));
-            }
-            if st.ended {
-                return None;
-            }
-            match st.rx.recv().await {
+    impl SseEncodeState for St {
+        fn queue(&mut self) -> &mut std::collections::VecDeque<Event> {
+            &mut self.queue
+        }
+        fn apply(&mut self, chunk: Option<gw_engines::StreamChunk>) -> bool {
+            match chunk {
                 Some(c) if c.error.is_some() => {
                     let msg = c.error.unwrap_or_default();
-                    st.queue.push_back(St::ev(
+                    self.queue.push_back(St::ev(
                         "error",
                         json!({"type":"error","error":{"type":"api_error","message":msg}}),
                     ));
-                    st.ended = true;
+                    true
                 }
                 Some(c) => {
                     if !c.delta.is_empty() {
-                        st.ensure_message_start();
-                        let idx = st.open_text();
-                        st.queue.push_back(St::ev(
+                        self.ensure_message_start();
+                        let idx = self.open_text();
+                        self.queue.push_back(St::ev(
                             "content_block_delta",
                             json!({"type":"content_block_delta","index":idx,
                                    "delta":{"type":"text_delta","text":c.delta}}),
                         ));
                     }
                     if let Some(tc) = &c.tool_calls {
-                        st.ensure_message_start();
+                        self.ensure_message_start();
                         let native = tc
                             .as_array()
                             .map(|a| a.iter().any(|b| b["type"] == "tool_use"))
                             .unwrap_or(false);
                         if native {
                             for block in anthropic_tool_blocks(&Some(tc.clone())) {
-                                st.emit_tool_block(&block);
+                                self.emit_tool_block(&block);
                             }
                         } else {
-                            gw_engines::merge_tool_call_fragments(&mut st.tool_frags, tc);
+                            gw_engines::merge_tool_call_fragments(&mut self.tool_frags, tc);
                         }
                     }
                     if let Some(fr) = c.finish_reason {
-                        st.pending_finish = Some(finish_anthropic(&fr));
+                        self.pending_finish = Some(finish_anthropic(&fr));
                     }
                     if let Some((pt, ct, _)) = c.usage_totals {
-                        st.finish(pt, ct);
+                        self.finish(pt, ct);
+                        return true;
                     }
+                    false
                 }
                 None => {
                     // producer gone without a usage chunk — close out cleanly
-                    st.finish(0, 0);
+                    self.finish(0, 0);
+                    true
                 }
             }
         }
-    });
-    Sse::new(stream)
+    }
+
+    sse_stream(
+        rx,
+        St {
+            queue: std::collections::VecDeque::new(),
+            id: next_id("msg"),
+            model,
+            started_msg: false,
+            text_idx: None,
+            next_idx: 0,
+            tool_frags: None,
+            pending_finish: None,
+        },
+    )
 }
 
-/// Run a non-chat family request through the pipeline.
+/// Run a non-chat family request through the pipeline. `mt` is only a
+/// placeholder protocol — the resolve_model DAG node maps the real one.
 async fn run_family(
     s: &AppState,
     ak: AkInfo,
     model: String,
+    mt: gw_consts::Protocol,
     typed: TypedParams,
     messages: Vec<ChatMsg>,
 ) -> Result<DagContext, Response> {
-    let mut param = ModelParamV2::with_name(gw_consts::Protocol::OpenaiChat, model);
+    let mut param = ModelParamV2::with_name(mt, model);
     param.typed = Some(typed);
     let request = GatewayRequest {
         is_online: true,
@@ -1994,6 +1913,14 @@ async fn run_family(
     match run_pipeline(s, request, ak).await {
         Ok(ctx) => Ok(ctx),
         Err(e) => Err(gateway_error(e)),
+    }
+}
+
+/// The engine's native payload, or a 500 naming the engine that returned none.
+fn response_v2_or_500(outcome: Option<gw_engines::EngineOutcome>, engine: &str) -> Response {
+    match outcome.and_then(|o| o.response.response_v2) {
+        Some(v) => (StatusCode::OK, Json(v)).into_response(),
+        None => error_response(500, format!("{engine} engine returned no payload")),
     }
 }
 
@@ -2028,18 +1955,18 @@ async fn completions(
         temperature: body["temperature"].as_f64(),
         ..Default::default()
     });
-    let mut param = ModelParamV2::with_name(gw_consts::Protocol::Completions, model);
-    param.typed = Some(typed);
-    let request = GatewayRequest {
-        is_online: true,
-        ak: ak.ak.clone(),
-        message: vec![ChatMsg::text("user", prompt)],
-        model_param_v2: Some(param),
-        ..Default::default()
-    };
-    let ctx = match run_pipeline(&s, request, ak).await {
+    let ctx = match run_family(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::Completions,
+        typed,
+        vec![ChatMsg::text("user", prompt)],
+    )
+    .await
+    {
         Ok(ctx) => ctx,
-        Err(e) => return gateway_error(e),
+        Err(resp) => return resp,
     };
     log_access("completions", &ctx, started);
     let Some(outcome) = ctx.outcome else {
@@ -2105,13 +2032,7 @@ async fn responses(
         Err(e) => return gateway_error(e),
     };
     log_access("responses", &ctx, started);
-    let Some(outcome) = ctx.outcome else {
-        return error_response(500, "pipeline produced no outcome");
-    };
-    match outcome.response.response_v2 {
-        Some(v) => (StatusCode::OK, Json(v)).into_response(),
-        None => error_response(500, "responses engine returned no payload"),
-    }
+    response_v2_or_500(ctx.outcome, "responses")
 }
 
 /// Streaming /v1/responses as the Responses SSE dialect; live for real vendors,
@@ -2126,12 +2047,10 @@ fn responses_stream_response(
     let rx = spawn_stream_pipeline(&s, request, ak, "responses", started);
 
     struct St {
-        rx: tokio::sync::mpsc::Receiver<gw_engines::StreamChunk>,
         queue: std::collections::VecDeque<Event>,
         model: String,
         created: bool,
         status: String,
-        ended: bool,
     }
     impl St {
         fn ensure_created(&mut self) {
@@ -2145,68 +2064,69 @@ fn responses_stream_response(
             ));
         }
     }
-    let st = St {
-        rx,
-        queue: std::collections::VecDeque::new(),
-        model,
-        created: false,
-        status: "completed".to_owned(),
-        ended: false,
-    };
-    let stream =
-        futures::stream::unfold(st, |mut st| async move {
-            loop {
-                if let Some(ev) = st.queue.pop_front() {
-                    return Some((Ok::<_, Infallible>(ev), st));
+    impl SseEncodeState for St {
+        fn queue(&mut self) -> &mut std::collections::VecDeque<Event> {
+            &mut self.queue
+        }
+        fn apply(&mut self, chunk: Option<gw_engines::StreamChunk>) -> bool {
+            match chunk {
+                Some(c) if c.error.is_some() => {
+                    self.ensure_created();
+                    let msg = c.error.unwrap_or_default();
+                    self.queue.push_back(
+                        Event::default().data(
+                            json!({"type":"error","error":{"type":"gateway_error","message":msg}})
+                                .to_string(),
+                        ),
+                    );
+                    self.queue.push_back(Event::default().data("[DONE]"));
+                    true
                 }
-                if st.ended {
-                    return None;
-                }
-                match st.rx.recv().await {
-                    Some(c) if c.error.is_some() => {
-                        st.ensure_created();
-                        let msg = c.error.unwrap_or_default();
-                        st.queue.push_back(Event::default().data(
-                        json!({"type":"error","error":{"type":"gateway_error","message":msg}})
-                            .to_string(),
-                    ));
-                        st.queue.push_back(Event::default().data("[DONE]"));
-                        st.ended = true;
+                Some(c) => {
+                    self.ensure_created();
+                    if !c.delta.is_empty() {
+                        self.queue.push_back(
+                            Event::default().data(
+                                json!({"type":"response.output_text.delta","delta":c.delta})
+                                    .to_string(),
+                            ),
+                        );
                     }
-                    Some(c) => {
-                        st.ensure_created();
-                        if !c.delta.is_empty() {
-                            st.queue.push_back(
-                                Event::default().data(
-                                    json!({"type":"response.output_text.delta","delta":c.delta})
-                                        .to_string(),
-                                ),
-                            );
-                        }
-                        if let Some(fr) = c.finish_reason {
-                            st.status = fr;
-                        }
-                        if let Some((pt, ct, tt)) = c.usage_totals {
-                            st.queue.push_back(Event::default().data(
+                    if let Some(fr) = c.finish_reason {
+                        self.status = fr;
+                    }
+                    let Some((pt, ct, tt)) = c.usage_totals else {
+                        return false;
+                    };
+                    self.queue.push_back(
+                        Event::default().data(
                             json!({"type":"response.completed","response":{
-                                "model": st.model, "status": st.status,
+                                "model": self.model, "status": self.status,
                                 "usage":{"input_tokens":pt,"output_tokens":ct,"total_tokens":tt},
                             }})
                             .to_string(),
-                        ));
-                            st.queue.push_back(Event::default().data("[DONE]"));
-                            st.ended = true;
-                        }
-                    }
-                    None => {
-                        st.ensure_created();
-                        st.queue.push_back(Event::default().data("[DONE]"));
-                        st.ended = true;
-                    }
+                        ),
+                    );
+                    self.queue.push_back(Event::default().data("[DONE]"));
+                    true
+                }
+                None => {
+                    self.ensure_created();
+                    self.queue.push_back(Event::default().data("[DONE]"));
+                    true
                 }
             }
-        });
-    Sse::new(stream)
+        }
+    }
+    sse_stream(
+        rx,
+        St {
+            queue: std::collections::VecDeque::new(),
+            model,
+            created: false,
+            status: "completed".to_owned(),
+        },
+    )
 }
 
 /// POST /v1/embeddings (OpenAI-compatible surface)
@@ -2236,18 +2156,21 @@ async fn embeddings(
         input,
         dimensions: body["dimensions"].as_i64(),
     });
-    let ctx = match run_family(&s, ak, model, typed, vec![]).await {
+    let ctx = match run_family(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::OpenaiChat,
+        typed,
+        vec![],
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
     log_access("embeddings", &ctx, started);
-    let Some(outcome) = ctx.outcome else {
-        return error_response(500, "pipeline produced no outcome");
-    };
-    match outcome.response.response_v2 {
-        Some(v) => (StatusCode::OK, Json(v)).into_response(),
-        None => error_response(500, "embeddings engine returned no payload"),
-    }
+    response_v2_or_500(ctx.outcome, "embeddings")
 }
 
 /// POST /v1/images/generations (OpenAI-compatible image generation surface)
@@ -2272,15 +2195,21 @@ async fn images_generations(
         size: body["size"].as_str().map(str::to_owned),
         ..Default::default()
     });
-    let ctx = match run_family(&s, ak, model, typed, vec![]).await {
+    let ctx = match run_family(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::OpenaiChat,
+        typed,
+        vec![],
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
     log_access("images", &ctx, started);
-    match ctx.outcome.and_then(|o| o.response.response_v2) {
-        Some(v) => (StatusCode::OK, Json(v)).into_response(),
-        None => error_response(500, "image engine returned no payload"),
-    }
+    response_v2_or_500(ctx.outcome, "image")
 }
 
 /// POST /v1/images/edits — same engine as generations; presence of `image`
@@ -2308,15 +2237,21 @@ async fn images_edits(
         image: Some(image),
         mask: body["mask"].as_str().map(str::to_owned),
     });
-    let ctx = match run_family(&s, ak, model, typed, vec![]).await {
+    let ctx = match run_family(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::OpenaiChat,
+        typed,
+        vec![],
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
     log_access("images_edits", &ctx, started);
-    match ctx.outcome.and_then(|o| o.response.response_v2) {
-        Some(v) => (StatusCode::OK, Json(v)).into_response(),
-        None => error_response(500, "image engine returned no payload"),
-    }
+    response_v2_or_500(ctx.outcome, "image")
 }
 
 /// POST /v1/audio/speech (TTS, returns audio bytes; OpenAI-compatible surface)
@@ -2341,7 +2276,16 @@ async fn audio_speech(
         voice: body["voice"].as_str().map(str::to_owned),
         response_format: Some(format.clone()),
     });
-    let ctx = match run_family(&s, ak, model, typed, vec![]).await {
+    let ctx = match run_family(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::OpenaiChat,
+        typed,
+        vec![],
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
@@ -2387,7 +2331,16 @@ async fn audio_transcriptions(
         audio_b64: audio,
         language: body["language"].as_str().map(str::to_owned),
     });
-    let ctx = match run_family(&s, ak, model, typed, vec![]).await {
+    let ctx = match run_family(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::OpenaiChat,
+        typed,
+        vec![],
+    )
+    .await
+    {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
@@ -2649,46 +2602,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn realtime_usage_per_dialect() {
-        let done = json!({"type":"response.done","response":{"usage":{"input_tokens":12,"output_tokens":34}}});
-        assert_eq!(realtime_usage("openai", &done), Some((12, 34)));
-        assert_eq!(realtime_usage("azure", &done), Some((12, 34)));
-        assert_eq!(
-            realtime_usage("openai", &json!({"type":"response.delta","delta":"hi"})),
-            None
-        );
-        let g = json!({"serverContent":{"turnComplete":true},"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}});
-        assert_eq!(realtime_usage("gemini", &g), Some((5, 9)));
-        let g2 = json!({"serverContent":{"turnComplete":true},"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":7}});
-        assert_eq!(realtime_usage("google", &g2), Some((5, 7)));
-        assert_eq!(
-            realtime_usage(
-                "gemini",
-                &json!({"serverContent":{"generationComplete":true},"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}})
-            ),
-            None,
-            "generationComplete alone is an interim frame — not billed"
-        );
-        assert_eq!(
-            realtime_usage(
-                "gemini",
-                &json!({"usageMetadata":{"promptTokenCount":5,"responseTokenCount":9}})
-            ),
-            None,
-            "interim cumulative usage is not billed"
-        );
-        assert_eq!(realtime_usage("gemini", &json!({"serverContent":{}})), None);
-        assert_eq!(
-            realtime_usage(
-                "openai",
-                &json!({"type":"response.done","response":{"usage":{"input_tokens":0,"output_tokens":0}}})
-            ),
-            Some((0, 0)),
-            "a zero-usage response.done is still a turn boundary — its reservation must settle"
-        );
     }
 
     #[tokio::test]

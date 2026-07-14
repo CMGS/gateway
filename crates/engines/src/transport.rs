@@ -192,8 +192,7 @@ impl MockTransport {
         }
 
         if req.stream {
-            let mid = reply.len() / 2;
-            let (a, b) = reply.split_at(mid);
+            let (a, b) = Self::split_half(&reply);
             let frames = [
                 json!({"id":"chatcmpl-mock","object":"chat.completion.chunk","created":MOCK_CREATED,"model":model,
                     "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}),
@@ -217,6 +216,12 @@ impl MockTransport {
                 "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt+ct}
             }))
         }
+    }
+
+    /// Two stream deltas from one reply (mock text is ASCII, so the byte
+    /// midpoint is a char boundary).
+    fn split_half(s: &str) -> (&str, &str) {
+        s.split_at(s.len() / 2)
     }
 
     fn sse_bytes(frames: &[Value], done: bool) -> Vec<u8> {
@@ -259,8 +264,7 @@ impl MockTransport {
 
         if req.stream {
             // standard anthropic streaming event sequence
-            let mid = reply.len() / 2;
-            let (a, b) = reply.split_at(mid);
+            let (a, b) = Self::split_half(&reply);
             let frames = [
                 json!({"type":"message_start","message":{"id":"msg-mock","type":"message",
                     "role":"assistant","model":model,"content":[],"stop_reason":null,
@@ -299,8 +303,7 @@ impl MockTransport {
             // real wire: LF framing, `data:` without a space, id:/event:/comment
             // lines, finish_reason the literal string "null" until the final
             // frame, usage cumulative per frame
-            let mid = reply.len() / 2;
-            let (a, b) = reply.split_at(mid);
+            let (a, b) = Self::split_half(&reply);
             let frame = |i: usize, content: &str, fr: &str, out: i64| {
                 format!(
                     "id:{i}\nevent:result\n:HTTP_STATUS/200\ndata:{}\n\n",
@@ -399,8 +402,7 @@ impl MockTransport {
         let reply = format!("[mock-vertex] you said: {user}");
         let (pt, ct) = (Self::tokens(&user) + 3, Self::tokens(&reply));
         if req.stream {
-            let mid = reply.len() / 2;
-            let (a, b) = reply.split_at(mid);
+            let (a, b) = Self::split_half(&reply);
             let frames = [
                 json!({"candidates":[{"content":{"role":"model","parts":[{"text": a}]},"index":0}]}),
                 json!({"candidates":[{"content":{"role":"model","parts":[{"text": b}]},"index":0}]}),
@@ -546,8 +548,7 @@ impl MockTransport {
         });
         if req.stream {
             // Responses streaming event sequence: text deltas, then completed.
-            let mid = reply.len() / 2;
-            let (a, b) = reply.split_at(mid);
+            let (a, b) = Self::split_half(&reply);
             let frames = [
                 json!({"type": "response.created", "response": {"model": model, "status": "in_progress"}}),
                 json!({"type": "response.output_text.delta", "delta": a}),
