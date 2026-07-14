@@ -219,9 +219,8 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> GResult<BatchJob>;
     async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>>;
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()>;
-    /// Record one item's result. First-writer-wins (a reclaimed stale executor
-    /// can't overwrite the owner's result) and rejected once the batch is
-    /// terminal (so a late insert can't land after the finalize decision).
+    /// Record one item's result: first-writer-wins, and rejected once the batch
+    /// is terminal (so a stale executor can neither overwrite nor append late).
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()>;
     /// Set status only if `claim` still matches the batch's fence token (see
     /// [`Store::batch_claim_pending`]); returns whether the write applied. So a
@@ -235,13 +234,11 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> GResult<bool> {
         self.batch_set_status(id, status).await.map(|()| true)
     }
-    /// Transition a running batch to its terminal status DERIVED from the
-    /// persisted result set (Completed iff every item has a result and all
-    /// succeeded), only if `claim` still owns it. On the fenced backend this is
-    /// serialized with result writes via the batch row lock, so a late result
-    /// insert can't land after the terminal decision. Returns `None` if the batch
-    /// is no longer owned or already terminal. The default is the single-executor
-    /// read → derive → fenced-set (no concurrent writer to race).
+    /// Set a running batch's terminal status derived from the persisted result
+    /// set (Completed iff every item has a result and all succeeded), if `claim`
+    /// still owns it; `None` if not. The fenced backend serializes this with
+    /// result writes via the batch row lock; the default is the single-executor
+    /// read-derive-set.
     async fn batch_finalize(&self, id: &str, claim: i64) -> GResult<Option<BatchStatus>> {
         let Some(job) = self.batch_get(id).await? else {
             return Ok(None);
@@ -1092,11 +1089,8 @@ impl Store for PostgresStore {
     }
 
     async fn batch_push_result(&self, id: &str, result: BatchItemResult) -> GResult<()> {
-        // first-writer-wins (DO NOTHING) so a reclaimed stale executor can't
-        // overwrite the owner's result; and only while the batch is non-terminal.
-        // The `FOR UPDATE` takes the batch row lock, serializing this insert with
-        // batch_finalize's terminal UPDATE — so a missing-index insert can't land
-        // after the finalize decided the batch was Failed.
+        // DO NOTHING (first-writer-wins) + non-terminal guard; the FOR UPDATE row
+        // lock serializes with batch_finalize so no result lands after finalize.
         sqlx::query(
             "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens)
              SELECT $1, $2, $3, $4, $5
@@ -1116,13 +1110,10 @@ impl Store for PostgresStore {
     }
 
     async fn batch_finalize(&self, id: &str, claim: i64) -> GResult<Option<BatchStatus>> {
-        // A transaction so the aggregate reads a snapshot taken AFTER the row lock
-        // is held: a single UPDATE would evaluate its result-set subquery on the
-        // statement-start snapshot, missing a result that committed while it waited
-        // for the lock (READ COMMITTED re-checks only the locked row, not
-        // subqueries) — and wrongly report Failed. Here stmt 1 takes the batch row
-        // lock (serializing with batch_push_result's FOR UPDATE), stmt 2 reads the
-        // now-current result set, stmt 3 writes the derived terminal status.
+        // Lock the row, THEN aggregate in a separate statement: a single UPDATE
+        // reads its result-set subquery on the statement-start snapshot, so a
+        // result that commits while it waits for the lock is missed (READ
+        // COMMITTED re-checks only the locked row) and it wrongly reports Failed.
         let mut tx = self
             .pool
             .begin()
@@ -1403,12 +1394,11 @@ mod tests {
             )
         };
         push(true, "owner").await.unwrap();
-        // a stale worker's later write for the same item must not overwrite it
         push(false, "stale").await.unwrap();
         let got = store.batch_get(&job.id).await.unwrap().unwrap();
         assert_eq!(got.results.len(), 1);
         assert!(got.results[0].ok);
-        assert_eq!(got.results[0].message, "owner");
+        assert_eq!(got.results[0].message, "owner", "first write wins");
     }
 
     #[tokio::test]
@@ -1426,14 +1416,11 @@ mod tests {
             .await
             .unwrap();
 
-        // one item's result is missing → finalize derives Failed
         assert_eq!(
             store.batch_finalize(&job.id, 0).await.unwrap(),
-            Some(BatchStatus::Failed)
+            Some(BatchStatus::Failed),
+            "missing item 1 → Failed"
         );
-        // a stale executor's late result for the missing item must NOT land on the
-        // now-terminal batch (which would flip it to complete-and-successful while
-        // status stays Failed)
         store
             .batch_push_result(&job.id, res(1, true))
             .await
@@ -1442,7 +1429,6 @@ mod tests {
         assert_eq!(got.results.len(), 1, "no result added to a terminal batch");
         assert_eq!(got.status, BatchStatus::Failed);
 
-        // a fully-resulted batch finalizes Completed
         let ok = store.batch_create("ak", "default", "m", 1).await.unwrap();
         store.batch_push_result(&ok.id, res(0, true)).await.unwrap();
         assert_eq!(
@@ -1589,7 +1575,6 @@ mod tests {
         let got = store.batch_get(&b.id).await.unwrap().unwrap();
         assert_eq!(got.status, BatchStatus::Running);
         assert_eq!(got.results.len(), 1);
-        // first-writer-wins: a reclaimed stale worker can't overwrite the result
         store
             .batch_push_result(
                 &b.id,
@@ -1604,11 +1589,12 @@ mod tests {
             .unwrap();
         let got = store.batch_get(&b.id).await.unwrap().unwrap();
         assert_eq!(got.results.len(), 1);
-        assert!(got.results[0].ok && got.results[0].message == "ok");
-        // finalize derives Failed (item 1 missing from a total-2 batch), then a
-        // late insert of the missing item into the now-terminal batch is rejected
-        // by the atomic status gate — so it can't flip a Failed batch to
-        // complete-and-successful after the fact
+        assert!(
+            got.results[0].ok && got.results[0].message == "ok",
+            "first write wins"
+        );
+        // finalize (item 1 missing) → Failed, then a late insert of the missing
+        // item into the terminal batch is rejected by the atomic status gate
         assert_eq!(
             store.batch_finalize(&b.id, 0).await.unwrap(),
             Some(BatchStatus::Failed)
@@ -1739,10 +1725,9 @@ mod tests {
         }
     }
 
-    /// Set GW_TEST_PG_URL to run. Reproduces the finalize-vs-insert snapshot race
-    /// with two live connections: a result insert holds the batch row lock while
-    /// finalize starts and blocks; once the insert commits, finalize must SEE the
-    /// result (Completed), not derive from a stale pre-lock snapshot (Failed).
+    /// Set GW_TEST_PG_URL to run. Two live connections: an insert holds the batch
+    /// row lock while finalize blocks; once the insert commits, finalize must see
+    /// the result (Completed), not a stale pre-lock snapshot (Failed).
     #[tokio::test]
     async fn postgres_finalize_sees_result_committed_during_lock_wait() {
         let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
@@ -1758,7 +1743,7 @@ mod tests {
             .await
             .unwrap();
 
-        // hold the batch row lock + insert the sole result, uncommitted
+        // hold the row lock + insert the sole result, uncommitted
         let mut txa = store.pool.begin().await.unwrap();
         sqlx::query(
             "INSERT INTO batch_results (batch_id, idx, ok, message, total_tokens)
@@ -1772,7 +1757,6 @@ mod tests {
         .await
         .unwrap();
 
-        // finalize starts and blocks on the row lock txa holds
         let s2 = store.clone();
         let jid = job.id.clone();
         let fin = tokio::spawn(async move { s2.batch_finalize(&jid, 0).await });

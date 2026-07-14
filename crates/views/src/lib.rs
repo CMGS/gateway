@@ -288,27 +288,21 @@ async fn realtime_ws(
     let Some(account) = account else {
         return error_response(503, format!("no healthy upstream account serves `{model}`"));
     };
-    // Only bridge to providers whose turns we can gate before generation (the
-    // OpenAI Realtime dialect — client `response.create` / server `response.created`).
-    // A dialect with no such start signal (Gemini Live et al.) would relay output
-    // and bill only after the fact, bypassing quota/entitlement — refuse it rather
-    // than serve an ungovernable session. (The bridge speaks only that dialect
-    // anyway; this makes the invariant explicit and fails a misconfig loudly.)
-    if !account.endpoint.is_empty()
-        && matches!(account.provider.as_str(), "google" | "gemini" | "vertex")
-    {
-        return error_response(
+    // select "realtime" so subprotocol-offering clients get a valid handshake
+    let ws = ws.protocols(["realtime"]);
+    if account.endpoint.is_empty() {
+        ws.on_upgrade(move |socket| realtime_session(socket, s, ak, model, mt, account.name))
+    } else if is_gemini_realtime(&account.provider) {
+        // no pre-generation gate signal for this dialect — serving it would relay
+        // output and bill only after the fact, bypassing quota/entitlement, so
+        // refuse rather than run an ungovernable session
+        error_response(
             501,
             format!(
                 "realtime is not supported for provider `{}`",
                 account.provider
             ),
-        );
-    }
-    // select "realtime" so subprotocol-offering clients get a valid handshake
-    let ws = ws.protocols(["realtime"]);
-    if account.endpoint.is_empty() {
-        ws.on_upgrade(move |socket| realtime_session(socket, s, ak, model, mt, account.name))
+        )
     } else {
         ws.on_upgrade(move |socket| realtime_bridge(socket, s, ak, model, mt, account))
     }
@@ -447,9 +441,8 @@ async fn bill_realtime_turn(
     ot: i64,
 ) {
     let ak = &admit.ak;
-    // clamp so a hostile upstream usage report can't overflow a shared counter;
-    // clamp `total` too (not just the parts) so governance and the ledger agree
-    // on it — billing_record also caps total at MAX_METERED_TOKENS.
+    // clamp parts AND total (a hostile count can't overflow a shared counter,
+    // and governance agrees with the ledger, which also caps total)
     let (it, ot) = (gw_state::clamp_tokens(it), gw_state::clamp_tokens(ot));
     let total = gw_state::clamp_tokens(it.saturating_add(ot));
     let state = s.handler.state();
@@ -588,23 +581,17 @@ fn is_response_create(payload: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Bridge one realtime session to a real upstream over WebSocket: a transparent
-/// relay plus the gateway's own concerns — auth, per-generation governance
-/// gates on `response.create`, and billing per-dialect usage frames. Gating
-/// speaks the OpenAI Realtime dialect (`response.create`); billing recognizes
-/// several dialects (see `realtime_usage`); a vendor with
-/// a different wire shape needs its own adapter before it can be metered (the
-/// unmetered-session warning below is the operator's misconfiguration signal).
+/// A non-OpenAI realtime dialect (Gemini Live family) — no `response.create`/
+/// `response.created` turn-start signal, so the gateway can't gate it before
+/// generation, and it's metered off the vendor's own turn-complete frame.
+fn is_gemini_realtime(provider: &str) -> bool {
+    matches!(provider, "google" | "gemini" | "vertex")
+}
+
 /// Whether `frame` is a server-initiated (VAD) turn start the gateway must gate:
-/// OpenAI's `response.created`, sent with no client `response.create`. Non-OpenAI
-/// dialects have no such gated auto-start, so `false` — keeping turn-start dialect
-/// knowledge here alongside the turn-boundary detector rather than as a bare
-/// literal in the bridge.
+/// OpenAI's `response.created`. Non-OpenAI dialects have no such gated auto-start.
 fn realtime_turn_started(provider: &str, frame: &Value) -> bool {
-    match provider {
-        "google" | "gemini" | "vertex" => false,
-        _ => frame["type"] == "response.created",
-    }
+    !is_gemini_realtime(provider) && frame["type"] == "response.created"
 }
 
 /// Per-dialect realtime turn boundary → the turn's (input, output) tokens.
@@ -613,43 +600,41 @@ fn realtime_turn_started(provider: &str, frame: &Value) -> bool {
 /// than orphaned at the FIFO head — and `None` for any non-boundary frame. Keyed
 /// by the account's provider so non-OpenAI vendors are metered, not relayed free.
 fn realtime_usage(provider: &str, frame: &Value) -> Option<(i64, i64)> {
-    let usage = match provider {
-        // Gemini Live: `usageMetadata` is cumulative and rides multiple server
-        // frames, so settle only on the turn-complete frame — otherwise a turn
-        // is billed once per interim frame.
-        "google" | "gemini" | "vertex" => {
-            // turnComplete is the single definitive turn boundary; settling on
-            // generationComplete too would double-count when both frames carry
-            // the cumulative usageMetadata
-            if frame["serverContent"]["turnComplete"] != Value::Bool(true) {
-                return None;
-            }
-            let u = &frame["usageMetadata"];
-            let it = u["promptTokenCount"].as_i64().unwrap_or(0);
-            let ot = u["responseTokenCount"]
-                .as_i64()
-                .or_else(|| u["candidatesTokenCount"].as_i64())
-                .unwrap_or(0);
-            (it, ot)
+    let usage = if is_gemini_realtime(provider) {
+        // Gemini Live: cumulative usageMetadata rides multiple frames, so settle
+        // only on turnComplete (the one turn boundary) — not generationComplete,
+        // which would double-count.
+        if frame["serverContent"]["turnComplete"] != Value::Bool(true) {
+            return None;
         }
-        // Default: OpenAI Realtime — a turn ends on `response.done` (any status,
-        // including cancelled/failed, which may carry zero usage).
-        _ => {
-            if frame["type"] != "response.done" {
-                return None;
-            }
-            let u = &frame["response"]["usage"];
-            (
-                u["input_tokens"].as_i64().unwrap_or(0),
-                u["output_tokens"].as_i64().unwrap_or(0),
-            )
+        let u = &frame["usageMetadata"];
+        let it = u["promptTokenCount"].as_i64().unwrap_or(0);
+        let ot = u["responseTokenCount"]
+            .as_i64()
+            .or_else(|| u["candidatesTokenCount"].as_i64())
+            .unwrap_or(0);
+        (it, ot)
+    } else {
+        // OpenAI Realtime: a turn ends on response.done (any status, incl.
+        // cancelled/failed, which may carry zero usage).
+        if frame["type"] != "response.done" {
+            return None;
         }
+        let u = &frame["response"]["usage"];
+        (
+            u["input_tokens"].as_i64().unwrap_or(0),
+            u["output_tokens"].as_i64().unwrap_or(0),
+        )
     };
-    // never trust upstream token counts: floor at 0 so a negative can't refund
-    // quota or write a negative ledger row
+    // floor at 0 so a negative upstream count can't refund quota or bill negative
     Some((usage.0.max(0), usage.1.max(0)))
 }
 
+/// Bridge one realtime session to a real upstream over WebSocket: a transparent
+/// relay plus auth, per-generation governance gates, and per-turn billing. Only
+/// the OpenAI Realtime dialect reaches here — `realtime_ws` refuses providers it
+/// can't gate before generation (see [`is_gemini_realtime`]); the Gemini metering
+/// in [`realtime_usage`] is dormant groundwork for a future Gemini Live adapter.
 async fn realtime_bridge(
     mut client: axum::extract::ws::WebSocket,
     s: AppState,

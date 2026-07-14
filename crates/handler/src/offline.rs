@@ -79,10 +79,9 @@ impl OfflineHandler {
         {
             tracing::error!(error = %e, batch = %id, "batch status write failed");
         }
-        // resume past items already recorded by a prior (crashed) executor, so a
-        // reclaim re-runs at most the one item that was in flight. A read failure
-        // means we can't know what's already done — re-running everything would
-        // re-bill, so fail the job instead.
+        // skip items a prior (crashed) executor already recorded, so a reclaim
+        // re-runs at most the one in-flight item. A read failure hides what's
+        // done — re-running all would re-bill, so fail the job instead.
         let prior = match store.batch_get(id).await {
             Ok(Some(job)) => job.results,
             Ok(None) => return, // the batch row vanished; nothing to run
@@ -182,8 +181,7 @@ impl OfflineHandler {
                     total_tokens: 0,
                 },
             };
-            // don't persist a result for a batch we've already lost — the new
-            // owner's run of this item is authoritative
+            // if we lost the claim mid-run, don't persist — the new owner is authoritative
             if lost.load(Relaxed) {
                 break;
             }
@@ -195,10 +193,7 @@ impl OfflineHandler {
         if lost.load(Relaxed) {
             return; // the reclaiming instance owns the terminal status now
         }
-        // Finalize: derive the terminal status from the PERSISTED result set and
-        // set it atomically, fenced on the claim. On the distributed backend this
-        // is serialized with result writes, so no late result can land after the
-        // decision and contradict it.
+        // fenced terminal status, derived atomically from the persisted results
         if let Err(e) = store.batch_finalize(id, claim).await {
             tracing::error!(error = %e, batch = %id, "batch finalize failed");
         }

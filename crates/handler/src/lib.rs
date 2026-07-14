@@ -63,9 +63,8 @@ impl OnlineHandler {
         if dlp {
             request.stream_tx = None;
         }
-        // Blocklist runs on the ORIGINAL content, before DLP redaction — otherwise
-        // a blocklisted term that sits inside a redacted span (a domain in an
-        // email, a blocklisted phone number) is masked out and slips the block.
+        // blocklist on the ORIGINAL content, before DLP — else a blocklisted term
+        // inside a redacted span (a domain in an email) is masked out and slips
         if let Some(block) = plugins::security_check(&snap.cfg.security, &request) {
             let mut ctx = DagContext::new(
                 snap.cfg.clone(),
