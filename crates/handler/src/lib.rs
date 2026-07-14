@@ -63,7 +63,9 @@ impl OnlineHandler {
         if dlp {
             request.stream_tx = None;
         }
-        let redacted = plugins::dlp_redact_request(&snap.cfg.security, &mut request);
+        // Blocklist runs on the ORIGINAL content, before DLP redaction — otherwise
+        // a blocklisted term that sits inside a redacted span (a domain in an
+        // email, a blocklisted phone number) is masked out and slips the block.
         if let Some(block) = plugins::security_check(&snap.cfg.security, &request) {
             let mut ctx = DagContext::new(
                 snap.cfg.clone(),
@@ -89,6 +91,7 @@ impl OnlineHandler {
             });
             return Ok(ctx);
         }
+        let redacted = plugins::dlp_redact_request(&snap.cfg.security, &mut request);
 
         let mut ctx = DagContext::new(
             snap.cfg.clone(),
@@ -442,6 +445,32 @@ mod tests {
             !out.response.message.contains("jane@corp.com"),
             "email must be redacted: {}",
             out.response.message
+        );
+    }
+
+    #[tokio::test]
+    async fn blocklist_runs_before_dlp_redaction() {
+        let mut cfg = GatewayConfig::embedded_default().unwrap();
+        cfg.security.dlp_redact = true;
+        cfg.security.blocklist = vec!["example.com".into()];
+        let cfg = Arc::new(cfg);
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        // the blocklisted domain sits inside an email DLP would otherwise mask
+        let ctx = h
+            .run(
+                chat_req("gpt-4o", "reach me at ops@example.com"),
+                ak(&h).await,
+            )
+            .await
+            .unwrap();
+        let out = ctx.outcome.expect("outcome");
+        assert_eq!(
+            out.response.finish_reason, "content_filter",
+            "blocklist must catch a term inside a redactable span"
         );
     }
 

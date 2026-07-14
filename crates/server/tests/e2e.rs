@@ -1790,6 +1790,46 @@ async fn realtime_entitlement_blocks_unentitled_tenant() {
     assert!(tokio_tungstenite::connect_async(ok).await.is_ok());
 }
 
+/// A provider whose realtime turns can't be gated before generation (no
+/// `response.create`/`response.created` signal — Gemini Live et al.) is refused
+/// at accept rather than served as an ungovernable, bill-after-the-fact session.
+#[tokio::test]
+async fn realtime_refuses_ungovernable_provider() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let yaml = r#"
+listen: {host: 127.0.0.1, port: 0}
+access_keys:
+  - {ak: ak-rt, product: rt, qps: 100, daily_token_quota: 1000000}
+accounts:
+  - {name: gem-rt, provider: gemini, endpoint: "http://127.0.0.1:1", protocols: ["realtime"]}
+models:
+  - {name: rt-model, protocol: realtime}
+"#;
+    let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(yaml).unwrap());
+    let state = Arc::new(gw_state::GatewayState::from_config(&cfg));
+    let application = gw_views::app(gw_views::AppState::new(
+        cfg,
+        state,
+        Arc::new(gw_engines::MockTransport),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, application).await.unwrap();
+    });
+
+    let mut req = format!("ws://{addr}/v1/realtime?model=rt-model")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", "Bearer ak-rt".parse().unwrap());
+    assert!(
+        tokio_tungstenite::connect_async(req).await.is_err(),
+        "realtime must refuse a provider it cannot gate before generation"
+    );
+}
+
 #[tokio::test]
 async fn dlp_redacts_streaming_output_from_the_vendor() {
     use futures::StreamExt;

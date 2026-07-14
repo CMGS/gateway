@@ -288,6 +288,23 @@ async fn realtime_ws(
     let Some(account) = account else {
         return error_response(503, format!("no healthy upstream account serves `{model}`"));
     };
+    // Only bridge to providers whose turns we can gate before generation (the
+    // OpenAI Realtime dialect — client `response.create` / server `response.created`).
+    // A dialect with no such start signal (Gemini Live et al.) would relay output
+    // and bill only after the fact, bypassing quota/entitlement — refuse it rather
+    // than serve an ungovernable session. (The bridge speaks only that dialect
+    // anyway; this makes the invariant explicit and fails a misconfig loudly.)
+    if !account.endpoint.is_empty()
+        && matches!(account.provider.as_str(), "google" | "gemini" | "vertex")
+    {
+        return error_response(
+            501,
+            format!(
+                "realtime is not supported for provider `{}`",
+                account.provider
+            ),
+        );
+    }
     // select "realtime" so subprotocol-offering clients get a valid handshake
     let ws = ws.protocols(["realtime"]);
     if account.endpoint.is_empty() {
@@ -430,9 +447,11 @@ async fn bill_realtime_turn(
     ot: i64,
 ) {
     let ak = &admit.ak;
-    // clamp so a hostile upstream usage report can't overflow a shared counter
+    // clamp so a hostile upstream usage report can't overflow a shared counter;
+    // clamp `total` too (not just the parts) so governance and the ledger agree
+    // on it — billing_record also caps total at MAX_METERED_TOKENS.
     let (it, ot) = (gw_state::clamp_tokens(it), gw_state::clamp_tokens(ot));
-    let total = it.saturating_add(ot);
+    let total = gw_state::clamp_tokens(it.saturating_add(ot));
     let state = s.handler.state();
     let gov = &state.governance;
     // settle the admission reserves to this turn's actual total on the reserved
