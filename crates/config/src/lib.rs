@@ -9,6 +9,9 @@ use serde::Deserialize;
 /// `tenants` entry named `default` gives it limits.
 pub const DEFAULT_TENANT: &str = "default";
 
+/// The repo's default config, embedded so tests and `cargo run` work with zero setup.
+pub const DEFAULT_YAML: &str = include_str!("../../../conf/gateway.yaml");
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("read config file {path}: {source}")]
@@ -390,9 +393,6 @@ pub struct GatewayConfig {
     #[serde(skip)]
     tenant_idx: std::collections::HashMap<String, usize>,
 }
-
-/// The repo's default config, embedded so tests and `cargo run` work with zero setup.
-pub const DEFAULT_YAML: &str = include_str!("../../../conf/gateway.yaml");
 
 impl GatewayConfig {
     pub fn from_yaml(yaml: &str) -> Result<Self, ConfigError> {

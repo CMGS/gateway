@@ -10,6 +10,11 @@ use gw_consts::Protocol;
 use gw_models::{GResult, GatewayError};
 use serde_json::{Value, json};
 
+/// Fixed "created" timestamp for deterministic mock payloads.
+pub const MOCK_CREATED: i64 = 1_720_000_000;
+/// 1x1 PNG-ish placeholder bytes, base64. Deterministic image/audio payload.
+pub const MOCK_B64: &str = "TU9DS0JZVEVT"; // "MOCKBYTES"
+
 /// A vendor-bound request an engine built, ready to hand to a [`Transport`].
 #[derive(Debug, Clone)]
 pub struct UpstreamRequest {
@@ -92,11 +97,6 @@ pub type SharedTransport = Arc<dyn Transport>;
 /// 503 — the DAG failover trigger.
 #[derive(Debug, Default)]
 pub struct MockTransport;
-
-/// Fixed "created" timestamp for deterministic mock payloads.
-pub const MOCK_CREATED: i64 = 1_720_000_000;
-/// 1x1 PNG-ish placeholder bytes, base64. Deterministic image/audio payload.
-pub const MOCK_B64: &str = "TU9DS0JZVEVT"; // "MOCKBYTES"
 
 impl MockTransport {
     /// Deterministic pseudo token count: ~1 token per 4 chars, min 1.
