@@ -12,17 +12,26 @@ pub fn is_response_create(frame: &Value) -> bool {
 }
 
 /// The keys that carry human text in realtime frames (both directions):
-/// message content, transcripts, instructions, tool descriptions, and the
-/// function-call output/arguments strings. Audio and other base64 payloads
-/// never ride under these names, so a rewrite here cannot corrupt them.
-const TEXT_KEYS: [&str; 6] = [
+/// message content, transcripts, instructions, tool descriptions, the
+/// function-call output/arguments strings, approval reasons, and error
+/// messages. Audio and other base64 payloads never ride under these names,
+/// so a rewrite here cannot corrupt them.
+const TEXT_KEYS: [&str; 9] = [
     "text",
     "transcript",
     "instructions",
     "output",
     "arguments",
     "description",
+    "server_description",
+    "reason",
+    "message",
 ];
+
+/// Subtrees that are pure JSON-Schema (tool definitions): every string leaf in
+/// them is text (titles, enums, descriptions) — the REST surfaces scan all of
+/// it, so realtime must too.
+const SCHEMA_KEYS: [&str; 2] = ["parameters", "input_schema"];
 
 /// Whether a frame's top-level `delta` carries text. Audio deltas reuse the
 /// same key for base64 payloads (`response.output_audio.delta`), which a
@@ -38,21 +47,38 @@ fn delta_is_text(frame_type: &str) -> bool {
 /// WebSocket surface — which fields are text is dialect knowledge owned here.
 pub fn visit_frame_text(v: &mut Value, f: &mut impl FnMut(&mut String) -> usize) -> usize {
     let text_delta = v["type"].as_str().map(delta_is_text).unwrap_or(false);
-    walk(v, text_delta, f)
+    walk(v, text_delta, false, f)
 }
 
-fn walk(v: &mut Value, text_delta: bool, f: &mut impl FnMut(&mut String) -> usize) -> usize {
+fn walk(
+    v: &mut Value,
+    text_delta: bool,
+    in_schema: bool,
+    f: &mut impl FnMut(&mut String) -> usize,
+) -> usize {
     match v {
-        Value::Array(a) => a.iter_mut().map(|x| walk(x, text_delta, f)).sum(),
+        // bare strings inside a schema array (enum values, required names)
+        Value::String(s) if in_schema => f(s),
+        Value::Array(a) => a
+            .iter_mut()
+            .map(|x| walk(x, text_delta, in_schema, f))
+            .sum(),
         Value::Object(o) => o
             .iter_mut()
             .map(|(k, x)| match x {
                 Value::String(s)
-                    if TEXT_KEYS.contains(&k.as_str()) || (k == "delta" && text_delta) =>
+                    if in_schema
+                        || TEXT_KEYS.contains(&k.as_str())
+                        || (k == "delta" && text_delta) =>
                 {
                     f(s)
                 }
-                _ => walk(x, text_delta, f),
+                _ => walk(
+                    x,
+                    text_delta,
+                    in_schema || SCHEMA_KEYS.contains(&k.as_str()),
+                    f,
+                ),
             })
             .sum(),
         _ => 0,
@@ -147,10 +173,36 @@ mod tests {
 
         let mut tools = json!({
             "type": "session.update",
-            "session": {"tools": [{"name": "t", "description": "desc", "parameters": {}}]}
+            "session": {"tools": [{"name": "t", "description": "desc", "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string", "title": "City name",
+                                         "enum": ["ForbiddenWord town"]}}
+            }}]}
         });
-        let hits = visit_frame_text(&mut tools, &mut |_| 1);
-        assert_eq!(hits, 1, "tool descriptions are scanned");
+        let mut seen = Vec::new();
+        visit_frame_text(&mut tools, &mut |s| {
+            seen.push(s.clone());
+            1
+        });
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "City name".to_owned(),
+                "ForbiddenWord town".to_owned(),
+                "desc".to_owned(),
+                "object".to_owned(),
+                "string".to_owned(),
+            ],
+            "every string leaf of a tool schema is scanned"
+        );
+
+        let mut err = json!({"type": "error", "error": {"message": "boom jane@corp.com"}});
+        assert_eq!(
+            visit_frame_text(&mut err, &mut |_| 1),
+            1,
+            "error messages are scanned"
+        );
     }
 
     #[test]
