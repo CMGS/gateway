@@ -80,19 +80,13 @@ async fn persist_content(
     } else {
         0
     };
-    let redacted_prompt = || {
-        ctx.request
-            .message
-            .iter()
-            .map(|m| m.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+    let redacted_prompt = || joined_message_text(&ctx.request);
+    let redacted_response = || {
+        ctx.outcome
+            .as_ref()
+            .map(|o| o.response.message.clone())
+            .unwrap_or_default()
     };
-    let redacted_response = ctx
-        .outcome
-        .as_ref()
-        .map(|o| o.response.message.clone())
-        .unwrap_or_default();
 
     let items = [
         (
@@ -106,9 +100,9 @@ async fn persist_content(
         (
             "response",
             if store_full {
-                raw_response.unwrap_or_else(|| redacted_response.clone())
+                raw_response.unwrap_or_else(redacted_response)
             } else {
-                redacted_response.clone()
+                redacted_response()
             },
         ),
     ];
@@ -136,6 +130,17 @@ async fn persist_content(
             tracing::warn!(error = %e, kind, "content retention write failed");
         }
     }
+}
+
+/// The request's message contents joined with newlines — the text moderation
+/// and content retention operate on.
+fn joined_message_text(request: &GatewayRequest) -> String {
+    request
+        .message
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A per-request correlation id: `req-<epoch_ms>-<seq>`, time-sortable and
@@ -273,20 +278,12 @@ impl OnlineHandler {
             return Ok(ctx);
         }
 
-        // capture raw prompt before DLP when the tenant retains full content
+        // capture raw prompt before DLP when the tenant retains full content —
+        // only worth it if a key exists (full without one downgrades to redacted)
         let retention = snap.cfg.retention_for(&ctx.ak.tenant).copied();
-        let full = matches!(
-            retention,
-            Some(r) if r.content == gw_config::ContentLevel::Full
-        );
-        let raw_prompt = full.then(|| {
-            ctx.request
-                .message
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        });
+        let capture_raw = matches!(retention, Some(r) if r.content == gw_config::ContentLevel::Full)
+            && gw_state::sealing_available();
+        let raw_prompt = capture_raw.then(|| joined_message_text(&ctx.request));
 
         let redacted = plugins::dlp_redact_request(sec, &mut ctx.request);
         if redacted > 0 {
@@ -327,7 +324,7 @@ impl OnlineHandler {
         }
 
         // capture raw response before outbound DLP for full retention
-        let raw_response = full
+        let raw_response = capture_raw
             .then(|| ctx.outcome.as_ref().map(|o| o.response.message.clone()))
             .flatten();
 
@@ -356,13 +353,7 @@ impl OnlineHandler {
     /// deny. A moderator error resolves per `moderation_fail_open`. Records a
     /// security event on a deny.
     async fn moderate(&self, ctx: &DagContext, sec: &gw_config::SecurityConf) -> Option<Block> {
-        let text = ctx
-            .request
-            .message
-            .iter()
-            .map(|m| m.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = joined_message_text(&ctx.request);
         match self.moderator.review(&text).await {
             Ok(moderation::Verdict::Allow) => None,
             Ok(moderation::Verdict::Deny(reason)) => {

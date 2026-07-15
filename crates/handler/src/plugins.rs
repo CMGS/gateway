@@ -219,14 +219,9 @@ fn redact_parts_text(parts: &mut serde_json::Value, pii: bool, secrets: bool) ->
     let mut hits = 0;
     for p in arr {
         if p["type"] == "text"
-            && let Some(t) = p["text"].as_str()
+            && let Some(serde_json::Value::String(s)) = p.get_mut("text")
         {
-            let mut s = t.to_owned();
-            let n = redact_in_place(&mut s, pii, secrets);
-            if n > 0 {
-                p["text"] = serde_json::Value::String(s);
-                hits += n;
-            }
+            hits += redact_in_place(s, pii, secrets);
         }
     }
     hits
