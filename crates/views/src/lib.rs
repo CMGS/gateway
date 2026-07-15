@@ -2769,6 +2769,8 @@ async fn batches_submit(
     };
     let mut model = body["model"].as_str().unwrap_or_default().to_owned();
     let mut batch_items = Vec::new();
+    // batch-level attribution hint; a per-item body `user` overrides it
+    let hint = user_header(&headers);
 
     if let Some(file_id) = body["input_file_id"].as_str() {
         let found = s.handler.state().store.file_get(file_id).await;
@@ -2790,7 +2792,15 @@ async fn batches_submit(
             if msgs.is_empty() {
                 return error_response(400, "input file line missing a messages array");
             }
-            batch_items.push(BatchItem { messages: msgs });
+            let user = reqbody["user"]
+                .as_str()
+                .or(hint.as_deref())
+                .unwrap_or_default()
+                .to_owned();
+            batch_items.push(BatchItem {
+                messages: msgs,
+                user,
+            });
         }
     } else if let Some(items) = body["items"].as_array() {
         for it in items {
@@ -2798,7 +2808,15 @@ async fn batches_submit(
             if msgs.is_empty() {
                 return error_response(400, "each item needs a non-empty messages array");
             }
-            batch_items.push(BatchItem { messages: msgs });
+            let user = it["user"]
+                .as_str()
+                .or(hint.as_deref())
+                .unwrap_or_default()
+                .to_owned();
+            batch_items.push(BatchItem {
+                messages: msgs,
+                user,
+            });
         }
     } else {
         return error_response(400, "either items or input_file_id is required");

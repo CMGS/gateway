@@ -18,7 +18,8 @@ use gw_engines::{EngineOutcome, SharedTransport};
 use gw_models::{Block, GResult, GatewayError, GatewayRequest, GatewayResponse};
 use gw_state::{AkInfo, GatewayState, SharedConfig};
 
-pub use offline::{BatchItem, OfflineHandler};
+pub use gw_models::BatchItem;
+pub use offline::OfflineHandler;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -871,9 +872,11 @@ mod tests {
         let items = vec![
             BatchItem {
                 messages: vec![ChatMsg::text("user", "same prompt")],
+                user: String::new(),
             },
             BatchItem {
                 messages: vec![ChatMsg::text("user", "same prompt")],
+                user: String::new(),
             },
         ];
         let job = off
@@ -896,9 +899,11 @@ mod tests {
                 vec![
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "one")],
+                        user: String::new(),
                     },
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "two")],
+                        user: String::new(),
                     },
                 ],
             )
@@ -912,6 +917,44 @@ mod tests {
         assert_eq!(
             h.state().store.ledger_snapshot(usize::MAX).await.unwrap().0,
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_attributes_each_item_to_its_user() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let off = OfflineHandler::new(h.clone());
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let job = off
+            .submit(
+                key,
+                "gpt-4o".into(),
+                vec![
+                    BatchItem {
+                        messages: vec![ChatMsg::text("user", "for alice")],
+                        user: "alice".into(),
+                    },
+                    BatchItem {
+                        messages: vec![ChatMsg::text("user", "for bob")],
+                        user: "bob".into(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        wait_terminal(&h, &job.id).await;
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        let users: std::collections::HashSet<&str> =
+            ledger.iter().map(|r| r.user_id.as_str()).collect();
+        assert!(
+            users.contains("alice") && users.contains("bob"),
+            "each shared-key batch item bills to its own user: {users:?}"
         );
     }
 
@@ -943,9 +986,11 @@ mod tests {
                 vec![
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "alpha")],
+                        user: "alice".into(),
                     },
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "beta")],
+                        user: "bob".into(),
                     },
                 ],
             )
@@ -974,5 +1019,13 @@ mod tests {
         let j = completed.expect("drain completed the batch");
         assert_eq!(j.results.len(), 2, "both items executed exactly once");
         assert!(j.results.iter().all(|r| r.ok && r.total_tokens > 0));
+        // per-item attribution survived the enqueue → drain → reconstruct round-trip
+        let (_, ledger) = state.store.ledger_snapshot(usize::MAX).await.unwrap();
+        let users: std::collections::HashSet<&str> =
+            ledger.iter().map(|r| r.user_id.as_str()).collect();
+        assert!(
+            users.contains("alice") && users.contains("bob"),
+            "distributed batch preserved per-item user attribution: {users:?}"
+        );
     }
 }

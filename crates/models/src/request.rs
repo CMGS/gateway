@@ -36,6 +36,16 @@ impl GatewayRequest {
     }
 }
 
+/// One queued batch item: a message list plus the client-supplied end-user
+/// attribution. `user` is persisted with the item so a distributed drainer on
+/// another instance still attributes and budgets it (owner still overrides at
+/// billing time); empty when the submitter gave no `user`/`x-gw-user`.
+#[derive(Debug, Clone)]
+pub struct BatchItem {
+    pub messages: Vec<ChatMsg>,
+    pub user: String,
+}
+
 /// Domain types referenced by `GatewayRequest`. Per-vendor long-tail fields
 /// ride in `raw`/`extra` passthroughs rather than being individually modeled.
 pub mod domain {

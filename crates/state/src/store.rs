@@ -362,12 +362,12 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         ak: &str,
         tenant: &str,
         model: &str,
-        items: &[Vec<gw_models::ChatMsg>],
+        items: &[gw_models::BatchItem],
     ) -> GResult<BatchJob> {
         self.batch_create(ak, tenant, model, items.len()).await
     }
     /// Load a batch's input items for execution.
-    async fn batch_load_items(&self, _id: &str) -> GResult<Vec<Vec<gw_models::ChatMsg>>> {
+    async fn batch_load_items(&self, _id: &str) -> GResult<Vec<gw_models::BatchItem>> {
         Ok(Vec::new())
     }
     /// Claim one pending batch (requeuing stale running ones first); `None` =
@@ -1328,6 +1328,8 @@ impl PostgresStore {
             "CREATE TABLE IF NOT EXISTS batch_items (
                 batch_id TEXT NOT NULL, idx BIGINT NOT NULL, messages TEXT NOT NULL,
                 PRIMARY KEY (batch_id, idx))",
+            // per-item end-user attribution so a fleet drainer still bills/budgets it
+            "ALTER TABLE batch_items ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ",
             // fence token: bumped on every claim so a reclaimed executor's fenced writes no-op
             "ALTER TABLE batches ADD COLUMN IF NOT EXISTS claim_seq BIGINT NOT NULL DEFAULT 0",
@@ -1803,7 +1805,7 @@ impl Store for PostgresStore {
         ak: &str,
         tenant: &str,
         model: &str,
-        items: &[Vec<gw_models::ChatMsg>],
+        items: &[gw_models::BatchItem],
     ) -> GResult<BatchJob> {
         // the batch becomes claimable only once all its items are committed
         let mut tx = self
@@ -1820,15 +1822,18 @@ impl Store for PostgresStore {
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| crate::sqlx_err("insert batch", e))?;
-        for (idx, msgs) in items.iter().enumerate() {
-            let json = serde_json::to_string(msgs).unwrap_or_else(|_| "[]".into());
-            sqlx::query("INSERT INTO batch_items (batch_id, idx, messages) VALUES ($1, $2, $3)")
-                .bind(&id)
-                .bind(idx as i64)
-                .bind(json)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| crate::sqlx_err("save batch item", e))?;
+        for (idx, item) in items.iter().enumerate() {
+            let json = serde_json::to_string(&item.messages).unwrap_or_else(|_| "[]".into());
+            sqlx::query(
+                "INSERT INTO batch_items (batch_id, idx, messages, user_id) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(&id)
+            .bind(idx as i64)
+            .bind(json)
+            .bind(&item.user)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| crate::sqlx_err("save batch item", e))?;
         }
         tx.commit()
             .await
@@ -1844,15 +1849,20 @@ impl Store for PostgresStore {
         })
     }
 
-    async fn batch_load_items(&self, id: &str) -> GResult<Vec<Vec<gw_models::ChatMsg>>> {
-        let rows = sqlx::query("SELECT messages FROM batch_items WHERE batch_id = $1 ORDER BY idx")
-            .bind(id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("load batch items", e))?;
+    async fn batch_load_items(&self, id: &str) -> GResult<Vec<gw_models::BatchItem>> {
+        let rows = sqlx::query(
+            "SELECT messages, user_id FROM batch_items WHERE batch_id = $1 ORDER BY idx",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("load batch items", e))?;
         Ok(rows
             .iter()
-            .map(|r| serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default())
+            .map(|r| gw_models::BatchItem {
+                messages: serde_json::from_str(r.get::<&str, _>(0)).unwrap_or_default(),
+                user: r.get::<String, _>(1),
+            })
             .collect())
     }
 
@@ -2372,8 +2382,14 @@ mod tests {
 
         assert!(store.distributed_batches());
         let qmsgs = vec![
-            vec![gw_models::ChatMsg::text("user", "one")],
-            vec![gw_models::ChatMsg::text("user", "two")],
+            gw_models::BatchItem {
+                messages: vec![gw_models::ChatMsg::text("user", "one")],
+                user: "u-one".into(),
+            },
+            gw_models::BatchItem {
+                messages: vec![gw_models::ChatMsg::text("user", "two")],
+                user: "u-two".into(),
+            },
         ];
         let qjob = store
             .batch_enqueue("ak-b", "default", "gpt-4o", &qmsgs)
@@ -2400,7 +2416,11 @@ mod tests {
         }
         let loaded = store.batch_load_items(&qjob.id).await.unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[1][0].content, "two");
+        assert_eq!(loaded[1].messages[0].content, "two");
+        assert_eq!(
+            loaded[1].user, "u-two",
+            "per-item user round-trips through pg"
+        );
 
         let fjob = store
             .batch_enqueue("ak-f", "default", "gpt-4o", &qmsgs)
