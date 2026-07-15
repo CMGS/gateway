@@ -76,10 +76,12 @@ gw-task = { path = "crates/task" }
 gw-views = { path = "crates/views" }
 base64 = "0.22"
 tiktoken-rs = "0.12"
-# pure-compute crypto (SigV4 signing, cache keys) — no network capability
+# pure-compute crypto (SigV4 signing, cache keys, content-at-rest AEAD) — no network capability
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+chacha20poly1305 = "0.10"
+regex = "1"
 
 # Faster iterative builds; keep release optimized.
 [profile.dev]

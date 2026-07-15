@@ -86,6 +86,17 @@ tenants:
     fallback_model: gpt-4o-mini
     model_prices: # e2e: tenant pays a premium over the list price
       gpt-4o: {input_price_per_1k_micros: 5000, output_price_per_1k_micros: 20000}
+    # Optional per-tenant knobs (enterprise audit/compliance):
+    # user_daily_token_quota: 100000   # soft per-end-user daily cap
+    # retention: {content: redacted, days: 30}   # none | redacted | full (full needs GW_CONTENT_KEY)
+    # security:                        # overrides the global `security:` for this tenant
+    #   blocklist: ["forbidden"]
+    #   blocklist_action: flag         # block | flag | shadow
+    #   dlp_redact: true
+    #   detect_secrets: true           # mask API keys / credentials
+    #   moderate: false                # route to the wired external moderator
+    #   regex_rules:
+    #     - {name: ssn, pattern: '\d{3}-\d{2}-\d{4}', action: block}
 
 # Public model name → wire protocol, optional provider binding (only that
 # provider's accounts serve the model), plus demo prices (micros per 1k tokens).

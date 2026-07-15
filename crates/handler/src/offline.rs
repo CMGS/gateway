@@ -2,16 +2,10 @@
 //! instance's background task; a distributed store (Postgres) only persists the
 //! items and a fleet drain loop on any instance claims and runs them.
 
-use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
+use gw_models::{BatchItem, GatewayRequest, ModelParamV2};
 use gw_state::{AkInfo, BatchItemResult, BatchJob, BatchStatus};
 
 use crate::OnlineHandler;
-
-/// One batch item: a self-contained message list.
-#[derive(Debug, Clone)]
-pub struct BatchItem {
-    pub messages: Vec<ChatMsg>,
-}
 
 /// Batch orchestration built on top of the online handler.
 #[derive(Clone)]
@@ -34,18 +28,19 @@ impl OfflineHandler {
         items: Vec<BatchItem>,
     ) -> gw_models::GResult<BatchJob> {
         let store = self.online.state().store.clone();
-        let msgs: Vec<Vec<ChatMsg>> = items.into_iter().map(|i| i.messages).collect();
         if store.distributed_batches() {
             // atomic: the job becomes claimable only once all items are saved
-            store.batch_enqueue(&ak.ak, &ak.tenant, &model, &msgs).await
+            store
+                .batch_enqueue(&ak.ak, &ak.tenant, &model, &items)
+                .await
         } else {
             let job = store
-                .batch_create(&ak.ak, &ak.tenant, &model, msgs.len())
+                .batch_create(&ak.ak, &ak.tenant, &model, items.len())
                 .await?;
             let this = self.clone();
             let (id, model) = (job.id.clone(), model.clone());
             // claim 0: non-distributed store — no fence, the heartbeat is a no-op
-            tokio::spawn(async move { this.execute(&id, &ak, &model, msgs, 0).await });
+            tokio::spawn(async move { this.execute(&id, &ak, &model, items, 0).await });
             Ok(job)
         }
     }
@@ -54,14 +49,7 @@ impl OfflineHandler {
     /// the terminal status, heartbeating between items. `claim` is the fence
     /// token (0 for the in-process path); once a heartbeat reports the batch
     /// reclaimed, this executor stops rather than double-running items.
-    async fn execute(
-        &self,
-        id: &str,
-        ak: &AkInfo,
-        model: &str,
-        items: Vec<Vec<ChatMsg>>,
-        claim: i64,
-    ) {
+    async fn execute(&self, id: &str, ak: &AkInfo, model: &str, items: Vec<BatchItem>, claim: i64) {
         let store = self.online.state().store.clone();
         // the distributed claim already set status=running with the fence bump;
         // only the in-process path needs this write — unfenced on the distributed
@@ -108,7 +96,7 @@ impl OfflineHandler {
                 }
             })
         };
-        for (index, messages) in items.into_iter().enumerate() {
+        for (index, item) in items.into_iter().enumerate() {
             if lost.load(Relaxed) {
                 break; // reclaimed by another instance; stop running new items
             }
@@ -126,7 +114,8 @@ impl OfflineHandler {
             let request = GatewayRequest {
                 is_online: false,
                 ak: ak.ak.clone(),
-                message: messages,
+                message: item.messages,
+                user_id: (!item.user.is_empty()).then_some(item.user),
                 model_param_v2: Some(ModelParamV2::with_name(
                     gw_consts::Protocol::OpenaiChat,
                     model.to_owned(),

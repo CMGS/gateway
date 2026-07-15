@@ -64,6 +64,9 @@ pub struct AkConf {
     /// Tenant this key belongs to; empty = the implicit `default` tenant.
     #[serde(default)]
     pub tenant: String,
+    /// End user this key is issued to (one key = one user); `None` = shared key.
+    #[serde(default)]
+    pub owner: Option<String>,
     pub qps: f64,
     pub daily_token_quota: i64,
     /// tokens-per-minute window limit; None = unlimited.
@@ -149,15 +152,77 @@ fn default_priority() -> i32 {
     1
 }
 
-/// Local security policy (rule-based; no cloud security service).
+/// What a fired content rule does. `block` denies the request; `flag` lets it
+/// through but records the hit; `shadow` is `flag` for a rule under evaluation —
+/// same recording, and the caller can tell trial rules apart when auditing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    #[default]
+    Block,
+    Flag,
+    Shadow,
+}
+
+impl Action {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Action::Block => "block",
+            Action::Flag => "flag",
+            Action::Shadow => "shadow",
+        }
+    }
+}
+
+/// A named regex recognizer applied to the same inbound text the blocklist
+/// scans. `pattern` is compiled once at config load into [`SecurityConf::regexes`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegexRule {
+    pub name: String,
+    pub pattern: String,
+    #[serde(default)]
+    pub action: Action,
+}
+
+/// Local security policy (rule-based; no cloud security service). Lives globally
+/// (`security:`) and per-tenant ([`TenantConf::security`]); the tenant's wins
+/// whole when present.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SecurityConf {
     /// Blocklist terms; normalized to lower-case (empties dropped) at load.
     #[serde(default)]
     pub blocklist: Vec<String>,
+    /// What a blocklist hit does (default: block).
+    #[serde(default)]
+    pub blocklist_action: Action,
     /// Whether to DLP-redact inbound/outbound content (emails/phone numbers).
     #[serde(default)]
     pub dlp_redact: bool,
+    /// Detect API keys / credentials in inbound text and redact them.
+    #[serde(default)]
+    pub detect_secrets: bool,
+    /// Route inbound text through the wired external moderator; needs a
+    /// moderator plugged into the handler (the default one allows everything).
+    #[serde(default)]
+    pub moderate: bool,
+    /// On a moderator error, admit the request (`true`) or deny it (`false`).
+    #[serde(default)]
+    pub moderation_fail_open: bool,
+    /// Named regex recognizers.
+    #[serde(default)]
+    pub regex_rules: Vec<RegexRule>,
+    /// Compiled `regex_rules`, built at config load (rules that fail to compile
+    /// are dropped with a warning). Never deserialized.
+    #[serde(skip)]
+    pub regexes: Vec<CompiledRule>,
+}
+
+/// A compiled [`RegexRule`], ready to match on the hot path.
+#[derive(Debug, Clone)]
+pub struct CompiledRule {
+    pub name: String,
+    pub action: Action,
+    pub re: regex::Regex,
 }
 
 /// Account stability policy (in-memory).
@@ -267,6 +332,16 @@ pub struct TenantConf {
     /// Per-model charged-price overrides (else the model's list price applies).
     #[serde(default)]
     pub model_prices: std::collections::HashMap<String, PriceConf>,
+    /// Per-user daily token budget (a soft cap keyed by end user); `None` =
+    /// unlimited. Enforced only when the request carries a user attribution.
+    #[serde(default)]
+    pub user_daily_token_quota: Option<i64>,
+    /// Content-safety policy for this tenant; `None` = use the global `security:`.
+    #[serde(default)]
+    pub security: Option<SecurityConf>,
+    /// Prompt/response retention for this tenant; `None` = retain nothing.
+    #[serde(default)]
+    pub retention: Option<RetentionConf>,
 }
 
 impl TenantConf {
@@ -274,6 +349,26 @@ impl TenantConf {
     pub fn admin_token(&self) -> Option<String> {
         token_from_env(&self.admin_token_env)
     }
+}
+
+/// How much request/response content a tenant retains, and for how long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentLevel {
+    /// Store nothing (the default posture).
+    None,
+    /// Store the post-DLP redacted text (privacy-preserving audit).
+    Redacted,
+    /// Store the raw text (needs `GW_CONTENT_KEY` for at-rest encryption).
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct RetentionConf {
+    pub content: ContentLevel,
+    /// Days after which stored content is purged; 0 = keep until manually purged.
+    #[serde(default)]
+    pub days: u32,
 }
 
 /// First-class provider preset: `kind` fixes the endpoint, auth style, and
@@ -370,6 +465,11 @@ pub struct GatewayConfig {
     /// Admin surface gate (dynamic config reload / key management).
     #[serde(default)]
     pub admin: AdminConf,
+    /// Trust `x-real-ip` / `x-forwarded-for` for the audit source IP. Off by
+    /// default: the audit records the real TCP peer, which a client can't forge.
+    /// Enable only when a trusted proxy fronts the gateway and sets those headers.
+    #[serde(default)]
+    pub trust_proxy_headers: bool,
     /// Stable hash of the source document; see [`Self::generation`].
     #[serde(skip)]
     generation: u64,
@@ -464,14 +564,13 @@ impl GatewayConfig {
                 protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
             });
         }
-        // lower-case once here so security_check needn't rebuild the list per request
-        self.security.blocklist = self
-            .security
-            .blocklist
-            .iter()
-            .filter(|w| !w.is_empty())
-            .map(|w| w.to_lowercase())
-            .collect();
+        // normalize the global policy and every tenant override once at load
+        compile_security(&mut self.security);
+        for t in &mut self.tenants {
+            if let Some(sec) = t.security.as_mut() {
+                compile_security(sec);
+            }
+        }
         Ok(())
     }
 
@@ -516,6 +615,15 @@ impl GatewayConfig {
         check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
         check_unique("provider", self.providers.iter().map(|p| p.name.as_str()))?;
         check_unique("tenant", self.tenants.iter().map(|t| t.name.as_str()))?;
+        // a colon in a tenant name would alias another tenant's `ub:{tenant}:{user}` budget key
+        for t in &self.tenants {
+            if t.name.contains(':') {
+                return Err(ConfigError::DuplicateName {
+                    kind: "tenant (':' not allowed in name)",
+                    name: t.name.clone(),
+                });
+            }
+        }
         // a typo'd tenant would silently fall back to the unrestricted default — reject at load
         for k in &self.access_keys {
             if !self.is_known_tenant(&k.tenant) {
@@ -599,6 +707,19 @@ impl GatewayConfig {
         Ok(())
     }
 
+    /// The effective content-safety policy for `tenant`: the tenant's own
+    /// override when present, else the global `security:`.
+    pub fn security_for(&self, tenant: &str) -> &SecurityConf {
+        self.find_tenant(tenant)
+            .and_then(|t| t.security.as_ref())
+            .unwrap_or(&self.security)
+    }
+
+    /// The retention policy for `tenant`, if it configured one.
+    pub fn retention_for(&self, tenant: &str) -> Option<&RetentionConf> {
+        self.find_tenant(tenant).and_then(|t| t.retention.as_ref())
+    }
+
     /// Whether `tenant` may call `model`: a declared tenant without an
     /// allowlist (and the implicit default) allows every model. An undeclared
     /// non-default tenant fails closed — a runtime key outliving the reload
@@ -639,6 +760,33 @@ impl GatewayConfig {
         }
         self.prices_for(model)
     }
+}
+
+/// Normalize a security policy at load: lower-case the blocklist (so scans
+/// don't rebuild it per request) and compile the regex rules (dropping any that
+/// fail to compile, loudly).
+fn compile_security(sec: &mut SecurityConf) {
+    sec.blocklist = sec
+        .blocklist
+        .iter()
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .collect();
+    sec.regexes = sec
+        .regex_rules
+        .iter()
+        .filter_map(|r| match regex::Regex::new(&r.pattern) {
+            Ok(re) => Some(CompiledRule {
+                name: r.name.clone(),
+                action: r.action,
+                re,
+            }),
+            Err(e) => {
+                tracing::warn!(rule = %r.name, error = %e, "dropping uncompilable regex rule");
+                None
+            }
+        })
+        .collect();
 }
 
 /// A token read from the named env var at call time; `None` when the name is
@@ -931,6 +1079,12 @@ tenants: [{name: t1}, {name: t1}]
             GatewayConfig::from_yaml(dup),
             Err(ConfigError::DuplicateName { kind: "tenant", .. })
         ));
+
+        let colon = "listen: {host: h, port: 1}\ntenants: [{name: 'a:b'}]";
+        assert!(
+            GatewayConfig::from_yaml(colon).is_err(),
+            "a colon in a tenant name is rejected (budget-key aliasing)"
+        );
 
         let bad_quota = r#"
 listen: {host: h, port: 1}

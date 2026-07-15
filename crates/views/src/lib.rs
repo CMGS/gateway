@@ -3,6 +3,7 @@
 //! structured access-log line per request.
 
 use std::convert::Infallible;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -32,6 +33,7 @@ use gw_state::{AkInfo, GatewayState};
 use serde_json::{Value, json};
 
 const LEDGER_PAGE_DEFAULT: usize = 100;
+const KEY_PAGE_DEFAULT: usize = 200;
 const STREAM_CHANNEL_CAP: usize = 64;
 /// Per-turn token reserve against the AK daily quota; settled to actuals at billing.
 const REALTIME_TURN_RESERVE: i64 = 1_000;
@@ -120,6 +122,10 @@ pub fn app(state: AppState) -> Router {
         .route("/admin/config", axum::routing::put(admin_config_put))
         .route("/admin/keys", post(admin_key_create).get(admin_key_list))
         .route("/admin/usage", get(admin_usage))
+        .route("/admin/usage/users", get(admin_usage_users))
+        .route("/admin/audit/events", get(admin_security_events))
+        .route("/admin/audit/ops", get(admin_audit_ops))
+        .route("/admin/audit/content/{request_id}", get(admin_content_get))
         .route(
             "/admin/keys/{ak}",
             axum::routing::patch(admin_key_patch).delete(admin_key_delete),
@@ -222,8 +228,10 @@ async fn realtime_ws(
     };
     // select "realtime" so subprotocol-offering clients get a valid handshake
     let ws = ws.protocols(["realtime"]);
+    // client attribution hint captured at connect (no per-turn body user field)
+    let hint = user_header(&headers).unwrap_or_default();
     if account.endpoint.is_empty() {
-        ws.on_upgrade(move |socket| realtime_session(socket, s, ak, model, mt, account.name))
+        ws.on_upgrade(move |socket| realtime_session(socket, s, ak, model, mt, account.name, hint))
     } else if gw_engines::realtime::is_gemini_realtime(&account.provider) {
         // no pre-generation gate signal in this dialect — refuse rather than bill after the fact
         error_response(
@@ -234,7 +242,7 @@ async fn realtime_ws(
             ),
         )
     } else {
-        ws.on_upgrade(move |socket| realtime_bridge(socket, s, ak, model, mt, account))
+        ws.on_upgrade(move |socket| realtime_bridge(socket, s, ak, model, mt, account, hint))
     }
 }
 
@@ -244,10 +252,16 @@ async fn realtime_ws(
 /// from the admission config when a reload lands mid-turn).
 struct RealtimeAdmit {
     ak: AkInfo,
+    /// Effective attribution user for this turn: the key's owner if set, else
+    /// the client's connect-time `x-gw-user` hint; empty for an ownerless key
+    /// with no hint. Captured at admission so billing and budget agree.
+    user: String,
     reserved: i64,
     /// Tokens reserved in the AK TPM window; `None` when the key has no TPM cap.
     tpm_reserved: Option<i64>,
     at: i64,
+    /// Per-turn correlation id for the ledger row.
+    request_id: String,
     snap: Arc<gw_state::Snapshot>,
 }
 
@@ -269,7 +283,12 @@ impl RealtimeAdmit {
 /// mid-stream), and the reserve is a fixed turn estimate. Reserves are taken
 /// last so a denial never leaves one behind; a failed TPM reserve rolls back
 /// the daily reserve just taken.
-async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<RealtimeAdmit, String> {
+async fn realtime_gate(
+    s: &AppState,
+    ak: &AkInfo,
+    model: &str,
+    hint: &str,
+) -> Result<RealtimeAdmit, String> {
     let snap = s.handler.config.load();
     let (cfg, state) = (&snap.cfg, &snap.state);
     let ak = match state.auth.authenticate(&ak.ak).await {
@@ -289,6 +308,7 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<Realtim
     admission::check_ak_rate(gov, &ak).await?;
     admission::check_product_qpm(gov, cfg, &ak.product).await?;
     admission::check_model_qpm(gov, cfg, model).await?;
+    admission::check_user_budget(gov, cfg, &ak.tenant, ak.attributed_user(hint)).await?;
     if let Some(limit) = admission::model_quota_limit(cfg, &ak, model)
         && !gov
             .quota_check(&admission::model_quota_key(&ak.ak, model), limit)
@@ -305,11 +325,14 @@ async fn realtime_gate(s: &AppState, ak: &AkInfo, model: &str) -> Result<Realtim
             return Err(denied);
         }
     };
+    let user = ak.attributed_user(hint).to_owned();
     Ok(RealtimeAdmit {
         ak,
+        user,
         reserved: REALTIME_TURN_RESERVE,
         tpm_reserved,
         at,
+        request_id: gw_handler::new_request_id(),
         snap,
     })
 }
@@ -345,6 +368,8 @@ async fn bill_realtime_turn(
                 ak: &ak.ak,
                 product: &ak.product,
                 tenant: &ak.tenant,
+                user_id: admit.user.as_str(),
+                request_id: &admit.request_id,
                 requested_model: model,
                 served_model: model,
                 protocol: mt.as_str(),
@@ -353,12 +378,21 @@ async fn bill_realtime_turn(
                 completion: ot,
                 total,
                 ptu_spillover: false,
+                estimated: false,
             },
             reserved: admit.reserved,
             tpm_reserved: admit.tpm_reserved,
             reserved_at: admit.at,
             model_quota_key,
         },
+    )
+    .await;
+    admission::consume_user_budget(
+        state.governance.as_ref(),
+        cfg,
+        &ak.tenant,
+        admit.user.as_str(),
+        total,
     )
     .await;
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it as u64);
@@ -373,6 +407,7 @@ async fn realtime_session(
     model: String,
     mt: gw_consts::Protocol,
     account: String,
+    hint: String,
 ) {
     use axum::extract::ws::Message;
     let send = |v: Value| Message::Text(v.to_string().into());
@@ -394,18 +429,15 @@ async fn realtime_session(
                 .await;
             continue;
         };
-        // same blocklist + inbound DLP every REST surface runs
-        let sec = &s.handler.cfg().security;
-        if let Some(block) = gw_handler::plugins::realtime_frame_blocked(sec, &mut ev) {
+        if let Err(reason) = rt_inbound_policy(&s, &ak, &hint, &mut ev).await {
             let _ = socket
-                .send(send(json!({"type":"error","message": block.message})))
+                .send(send(json!({"type":"error","message": reason})))
                 .await;
             continue;
         }
-        gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut ev);
         match ev["type"].as_str().unwrap_or_default() {
             "input_text" => {
-                let admit = match realtime_gate(&s, &ak, &model).await {
+                let admit = match realtime_gate(&s, &ak, &model, &hint).await {
                     Ok(a) => a,
                     Err(denied) => {
                         let _ = socket
@@ -489,6 +521,7 @@ async fn realtime_bridge(
     model: String,
     mt: gw_consts::Protocol,
     account: gw_models::Account,
+    hint: String,
 ) {
     use axum::extract::ws::Message as CMsg;
     use futures::{SinkExt, StreamExt};
@@ -542,6 +575,8 @@ async fn realtime_bridge(
     let mut pending: std::collections::VecDeque<RealtimeAdmit> = std::collections::VecDeque::new();
     // denied server-VAD turn: swallow its upstream frames until its terminal frame
     let mut suppress = false;
+    // outbound DLP redactions summed within a turn, recorded once at its boundary
+    let mut out_redacted = 0i64;
     loop {
         tokio::select! {
             m = cl_rx.next() => {
@@ -555,24 +590,26 @@ async fn realtime_bridge(
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
                 };
                 if let Some(mut frame) = frame {
-                    // same blocklist + inbound DLP every REST surface runs
-                    let sec = &s.handler.cfg().security;
-                    if let Some(block) = gw_handler::plugins::realtime_frame_blocked(sec, &mut frame) {
-                        if cl_tx
-                            .send(CMsg::Text(send_err(block.message).to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                    match rt_inbound_policy(&s, &ak, &hint, &mut frame).await {
+                        Err(reason) => {
+                            if cl_tx
+                                .send(CMsg::Text(send_err(reason).to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    if gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut frame) > 0 {
-                        forward = UMsg::text(frame.to_string());
+                        Ok(redacted) => {
+                            if redacted > 0 {
+                                forward = UMsg::text(frame.to_string());
+                            }
+                        }
                     }
                     // gate each generation trigger, not every control frame
                     if is_response_create(&frame) {
-                        match realtime_gate(&s, &ak, &model).await {
+                        match realtime_gate(&s, &ak, &model, &hint).await {
                             Ok(admit) => {
                                 pending.push_back(admit);
                                 generations += 1;
@@ -610,6 +647,7 @@ async fn realtime_bridge(
                 };
                 let mut relay = true;
                 let mut redacted: Option<String> = None;
+                let mut turn_ended = false;
                 match frame {
                     Some(mut v) => {
                         if suppress {
@@ -621,7 +659,7 @@ async fn realtime_bridge(
                         // server-VAD: OpenAI auto-starts a turn with no client
                         // response.create — gate it here like a manual one
                         else if realtime_turn_started(&account.provider, &v) && pending.is_empty() {
-                            match realtime_gate(&s, &ak, &model).await {
+                            match realtime_gate(&s, &ak, &model, &hint).await {
                                 Ok(admit) => pending.push_back(admit),
                                 Err(denied) => {
                                     let _ = up_tx
@@ -651,11 +689,14 @@ async fn realtime_bridge(
                                         .authenticate(&ak.ak)
                                         .await
                                         .unwrap_or_else(|| ak.clone());
+                                    let user = billed.attributed_user(&hint).to_owned();
                                     let unreserved = RealtimeAdmit {
                                         ak: billed,
+                                        user,
                                         reserved: 0,
                                         tpm_reserved: None,
                                         at: gw_state::epoch_secs(),
+                                        request_id: gw_handler::new_request_id(),
                                         snap,
                                     };
                                     bill_realtime_turn(
@@ -671,16 +712,27 @@ async fn realtime_bridge(
                                 None => {}
                             }
                             recognized += 1;
+                            turn_ended = true;
                         }
                         // outbound DLP, per frame (a span straddling deltas is
                         // beyond a relay that cannot buffer)
-                        if relay
-                            && gw_handler::plugins::dlp_redact_realtime_frame(
-                                &s.handler.cfg().security,
+                        let cfg = s.handler.cfg();
+                        let n = if relay {
+                            gw_handler::plugins::dlp_redact_realtime_frame(
+                                cfg.security_for(&ak.tenant),
                                 &mut v,
-                            ) > 0
-                        {
+                            )
+                        } else {
+                            0
+                        };
+                        if n > 0 {
                             redacted = Some(v.to_string());
+                        }
+                        // per-token events would be too hot: sum the turn, record once at its boundary
+                        out_redacted += n as i64;
+                        if turn_ended {
+                            flush_rt_out_dlp(&s, &ak, &hint, out_redacted).await;
+                            out_redacted = 0;
                         }
                     }
                     // a denied turn's non-JSON output (e.g. audio deltas) is dropped too
@@ -704,6 +756,9 @@ async fn realtime_bridge(
     for a in pending {
         a.refund().await;
     }
+    // a turn aborted before its boundary (upstream drop) still applied its
+    // redactions per frame — flush the pending count so the audit isn't lost
+    flush_rt_out_dlp(&s, &ak, &hint, out_redacted).await;
     if generations > 0 && recognized == 0 {
         tracing::warn!(
             account = %account.name,
@@ -740,13 +795,16 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
         })
         .unwrap_or_default();
     let latency = started.elapsed();
+    let user_id = ctx.effective_user_id();
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(pt.max(0) as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ct.max(0) as u64);
     tracing::info!(
         target: "access",
         surface,
+        request_id = %ctx.request.request_id,
         ak = %ctx.ak.ak,
         product = %ctx.ak.product,
+        user_id,
         model = %model,
         protocol = mt,
         account,
@@ -792,10 +850,7 @@ async fn ledger(
     State(s): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let limit = q
-        .get("limit")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(LEDGER_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
     match s.handler.state().store.ledger_snapshot(limit).await {
         Ok((count, records)) => Json(json!({ "count": count, "records": records })).into_response(),
         Err(e) => gateway_error(e),
@@ -820,6 +875,24 @@ async fn accounts(State(s): State<AppState>) -> Json<Value> {
     let mut resp = json!({ "count": data.len() });
     resp["accounts"] = Value::Array(data);
     Json(resp)
+}
+
+/// The `x-gw-user` attribution hint; surfaces fall back to the body's own user
+/// field. See [`gw_models::GatewayRequest::user_id`] for the trust model.
+fn user_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-gw-user")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty())
+}
+
+/// The one request-metadata attribution precedence the REST surfaces apply:
+/// `x-gw-user` header, else the dialect's own user field (OpenAI `user`,
+/// Anthropic `metadata.user_id`). Batch items invert it — per-item `user`
+/// first — so shared-key batches keep per-item attribution.
+fn user_hint(headers: &HeaderMap, field: &Value) -> Option<String> {
+    user_header(headers).or_else(|| field.as_str().map(str::to_owned))
 }
 
 /// AK auth: `Authorization: Bearer <ak>` or `x-api-key: <ak>`. The error is
@@ -879,6 +952,203 @@ impl AdminScope {
             AdminScope::Global => true,
             AdminScope::Tenant(t) => t == tenant,
         }
+    }
+
+    /// (actor, scope) for the audit trail: who the token spoke for.
+    fn audit_identity(&self) -> (&str, &'static str) {
+        match self {
+            AdminScope::Global => ("global", "global"),
+            AdminScope::Tenant(t) => (t.as_str(), "tenant"),
+        }
+    }
+
+    /// The tenant a scoped read is confined to: a tenant admin sees only its
+    /// own; the global admin may narrow with `?tenant=`.
+    fn tenant_filter(&self, q: &std::collections::HashMap<String, String>) -> Option<String> {
+        match self {
+            AdminScope::Tenant(t) => Some(t.clone()),
+            AdminScope::Global => q.get("tenant").cloned(),
+        }
+    }
+}
+
+/// A numeric query param, or `default` when absent/unparseable.
+fn q_num<T: std::str::FromStr>(
+    q: &std::collections::HashMap<String, String>,
+    key: &str,
+    default: T,
+) -> T {
+    q.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Write one realtime security event (`user` already resolved). The shared sink
+/// for realtime blocklist/regex hits, moderation denials, and inbound DLP hits.
+async fn write_rt_event(
+    s: &AppState,
+    ak: &AkInfo,
+    user: &str,
+    rule: &str,
+    action: &str,
+    hits: i64,
+) {
+    gw_state::SecurityEvent {
+        created_at_epoch_secs: gw_state::epoch_secs(),
+        request_id: String::new(),
+        ak: ak.ak.clone(),
+        user_id: user.to_owned(),
+        tenant: ak.tenant.clone(),
+        surface: "realtime".to_owned(),
+        rule: rule.to_owned(),
+        action: action.to_owned(),
+        hits,
+    }
+    .record(s.handler.state().store.as_ref())
+    .await;
+}
+
+/// Record a turn's summed outbound DLP redactions as one event; no-op at zero.
+async fn flush_rt_out_dlp(s: &AppState, ak: &AkInfo, hint: &str, count: i64) {
+    if count > 0 {
+        write_rt_event(s, ak, ak.attributed_user(hint), "dlp", "redact", count).await;
+    }
+}
+
+/// The full inbound content policy for one realtime frame — the same chain
+/// every REST surface runs (scan + hit events, moderation, DLP + event),
+/// shared by both WebSocket paths. `Err(reason)` denies the frame; `Ok(n)` is
+/// the DLP redaction count (n > 0 means the frame was rewritten).
+async fn rt_inbound_policy(
+    s: &AppState,
+    ak: &AkInfo,
+    hint: &str,
+    frame: &mut Value,
+) -> Result<usize, String> {
+    let cfg = s.handler.cfg();
+    let sec = cfg.security_for(&ak.tenant);
+    let (scan, text) = gw_handler::plugins::realtime_frame_scan(sec, frame, sec.moderate);
+    emit_rt_hits(s, ak, &scan.hits, hint).await;
+    if let Some(block) = scan.block {
+        return Err(block.message);
+    }
+    if let Some(reason) = realtime_moderate(s, sec, ak, hint, &text).await {
+        return Err(reason);
+    }
+    let redacted = gw_handler::plugins::dlp_redact_realtime_frame(sec, frame);
+    if redacted > 0 {
+        write_rt_event(
+            s,
+            ak,
+            ak.attributed_user(hint),
+            "dlp",
+            "redact",
+            redacted as i64,
+        )
+        .await;
+    }
+    Ok(redacted)
+}
+
+/// Record a realtime frame's content-safety hits to the security-event stream
+/// (parity with the REST surfaces).
+async fn emit_rt_hits(
+    s: &AppState,
+    ak: &AkInfo,
+    hits: &[gw_handler::plugins::RuleHit],
+    hint: &str,
+) {
+    let user = ak.attributed_user(hint);
+    for hit in hits {
+        write_rt_event(s, ak, user, &hit.rule, hit.action.as_str(), hit.count).await;
+    }
+}
+
+/// Moderate a realtime frame's inbound `text` (collected by the frame scan)
+/// via the wired moderator — parity with the REST surface, so a moderated
+/// tenant can't be bypassed over the WebSocket. `Some(reason)` denies the
+/// frame; records a moderation event.
+async fn realtime_moderate(
+    s: &AppState,
+    sec: &gw_config::SecurityConf,
+    ak: &AkInfo,
+    hint: &str,
+    text: &str,
+) -> Option<String> {
+    if !sec.moderate || text.is_empty() {
+        return None;
+    }
+    let reason = s.handler.moderate_text(sec, text).await?;
+    write_rt_event(s, ak, ak.attributed_user(hint), "moderation", "block", 1).await;
+    Some(reason)
+}
+
+/// The caller IP for the admin audit trail, resolved at request entry — before
+/// any config mutation the handler performs — so the op that flips
+/// `trust_proxy_headers` is audited under the policy in effect when it
+/// arrived, not the one it just installed. Empty when the router is driven
+/// without connect info (the test harness).
+struct AuditSourceIp(String);
+
+impl axum::extract::FromRequestParts<AppState> for AuditSourceIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        s: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0);
+        Ok(AuditSourceIp(source_ip(
+            peer,
+            &parts.headers,
+            s.handler.cfg().trust_proxy_headers,
+        )))
+    }
+}
+
+/// The caller IP for the audit trail. Roots at the real TCP `peer`, which a
+/// client cannot forge. Only when `trust_proxy` is set (a trusted proxy fronts
+/// the gateway) does it read `x-real-ip`, then the RIGHTMOST `x-forwarded-for`
+/// hop (the one that proxy appended) — never the leftmost, which a client forges.
+fn source_ip(peer: Option<std::net::SocketAddr>, headers: &HeaderMap, trust_proxy: bool) -> String {
+    if trust_proxy {
+        if let Some(ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+            return ip.trim().to_owned();
+        }
+        if let Some(ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+        {
+            return ip.trim().to_owned();
+        }
+    }
+    peer.map(|p| p.ip().to_string()).unwrap_or_default()
+}
+
+/// Record one admin-plane mutation to the audit trail (who/what/when/where).
+/// Best-effort: a store failure is logged, never fails the operation.
+async fn audit_admin(
+    s: &AppState,
+    scope: &AdminScope,
+    source: String,
+    action: &str,
+    target: &str,
+    summary: String,
+) {
+    let (actor, scope_kind) = scope.audit_identity();
+    let entry = gw_state::AdminAudit {
+        created_at_epoch_secs: gw_state::epoch_secs(),
+        actor: actor.to_owned(),
+        scope: scope_kind.to_owned(),
+        action: action.to_owned(),
+        target: target.to_owned(),
+        summary,
+        source_ip: source,
+    };
+    if let Err(e) = s.handler.state().store.admin_audit_add(&entry).await {
+        tracing::warn!(error = %e, action, "admin audit write failed");
     }
 }
 
@@ -940,7 +1210,7 @@ async fn scoped_key(
 /// The admin surfaces' public view of a key — one shape for PATCH and GET.
 fn ak_public_json(k: &AkInfo) -> Value {
     json!({
-        "ak": k.ak, "product": k.product, "tenant": k.tenant,
+        "ak": k.ak, "product": k.product, "tenant": k.tenant, "owner": k.owner,
         "qps": k.qps, "daily_token_quota": k.daily_token_quota,
         "tokens_per_minute": k.tokens_per_minute,
         "expires_at_epoch_secs": k.expires_at_epoch_secs,
@@ -976,7 +1246,11 @@ fn ct_eq(a: &str, b: &str) -> bool {
 
 /// POST /admin/reload — re-read config from source and swap it in atomically;
 /// governance, store, health, and cache are preserved.
-async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response {
+async fn admin_reload(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    AuditSourceIp(source): AuditSourceIp,
+) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
@@ -989,6 +1263,7 @@ async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response
                 accounts = cfg.accounts.len(),
                 "config reloaded"
             );
+            audit_admin(&s, &AdminScope::Global, source, "reload", "", String::new()).await;
             (
                 StatusCode::OK,
                 Json(json!({
@@ -1009,6 +1284,7 @@ async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response
 async fn admin_key_create(
     State(s): State<AppState>,
     headers: HeaderMap,
+    AuditSourceIp(source): AuditSourceIp,
     Json(body): Json<Value>,
 ) -> Response {
     let scope = match admin_auth(&s, &headers) {
@@ -1040,6 +1316,7 @@ async fn admin_key_create(
         ak: ak.to_owned(),
         product: product.to_owned(),
         tenant: tenant.to_owned(),
+        owner: body["owner"].as_str().map(str::to_owned),
         qps: body["qps"].as_f64().unwrap_or(0.0),
         daily_token_quota: body["daily_token_quota"].as_i64().unwrap_or(0),
         tokens_per_minute: body["tokens_per_minute"].as_i64(),
@@ -1065,6 +1342,15 @@ async fn admin_key_create(
     {
         return gateway_error(e);
     }
+    audit_admin(
+        &s,
+        &scope,
+        source,
+        "key_create",
+        ak,
+        format!("tenant={tenant}"),
+    )
+    .await;
     (
         StatusCode::CREATED,
         Json(json!({ "ak": ak, "status": "created" })),
@@ -1076,6 +1362,7 @@ async fn admin_key_create(
 async fn admin_key_patch(
     State(s): State<AppState>,
     headers: HeaderMap,
+    AuditSourceIp(source): AuditSourceIp,
     Path(ak): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
@@ -1102,7 +1389,10 @@ async fn admin_key_patch(
     let patched = s.handler.state().auth.patch(&ak, &patch).await;
     match patched {
         Err(e) => gateway_error(e),
-        Ok(Some(info)) => (StatusCode::OK, Json(ak_public_json(&info))).into_response(),
+        Ok(Some(info)) => {
+            audit_admin(&s, &scope, source, "key_patch", &ak, String::new()).await;
+            (StatusCode::OK, Json(ak_public_json(&info))).into_response()
+        }
         Ok(None) => error_response(404, format!("key {ak} not found")),
     }
 }
@@ -1111,6 +1401,7 @@ async fn admin_key_patch(
 async fn admin_key_delete(
     State(s): State<AppState>,
     headers: HeaderMap,
+    AuditSourceIp(source): AuditSourceIp,
     Path(ak): Path<String>,
 ) -> Response {
     let scope = match admin_auth(&s, &headers) {
@@ -1122,18 +1413,26 @@ async fn admin_key_delete(
     }
     match s.handler.state().auth.revoke(&ak).await {
         Err(e) => gateway_error(e),
-        Ok(true) => (
-            StatusCode::OK,
-            Json(json!({ "ak": ak, "status": "revoked" })),
-        )
-            .into_response(),
+        Ok(true) => {
+            audit_admin(&s, &scope, source, "key_delete", &ak, String::new()).await;
+            (
+                StatusCode::OK,
+                Json(json!({ "ak": ak, "status": "revoked" })),
+            )
+                .into_response()
+        }
         Ok(false) => error_response(404, format!("key {ak} not found")),
     }
 }
 
 /// PUT /admin/config — validate, publish to the fleet config store, and reload
 /// this instance; peers converge via the store's change feed. Global admin only.
-async fn admin_config_put(State(s): State<AppState>, headers: HeaderMap, body: String) -> Response {
+async fn admin_config_put(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    AuditSourceIp(source): AuditSourceIp,
+    body: String,
+) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
@@ -1150,7 +1449,22 @@ async fn admin_config_put(State(s): State<AppState>, headers: HeaderMap, body: S
         Ok(v) => v,
         Err(e) => return gateway_error(e),
     };
-    match s.reload().await {
+    // audit before the local reload can fail — the published version already leads the fleet
+    let reload = s.reload().await;
+    let detail = match &reload {
+        Ok(()) => String::new(),
+        Err(e) => format!("local reload failed: {e}"),
+    };
+    audit_admin(
+        &s,
+        &AdminScope::Global,
+        source,
+        "config_publish",
+        &version.to_string(),
+        detail,
+    )
+    .await;
+    match reload {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({ "status": "published", "version": version })),
@@ -1163,13 +1477,28 @@ async fn admin_config_put(State(s): State<AppState>, headers: HeaderMap, body: S
     }
 }
 
-/// GET /admin/keys — the key table, scoped: a tenant admin sees only its own keys.
-async fn admin_key_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
+/// GET /admin/keys?offset=&limit= — a page of the key table, scoped: a tenant
+/// admin sees only its own keys. Paginated so a fleet key table never loads whole.
+async fn admin_key_list(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
     let scope = match admin_auth(&s, &headers) {
         Ok(scope) => scope,
         Err(r) => return r,
     };
-    let listed = match s.handler.state().auth.list().await {
+    let offset = q_num(&q, "offset", 0);
+    let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT);
+    // the scope filters in the store before paging, or a tenant admin's page could come back empty
+    let tenant = scope.tenant_filter(&q);
+    let listed = match s
+        .handler
+        .state()
+        .auth
+        .list(tenant.as_deref(), offset, limit)
+        .await
+    {
         Ok(v) => v,
         Err(e) => return gateway_error(e),
     };
@@ -1178,7 +1507,7 @@ async fn admin_key_list(State(s): State<AppState>, headers: HeaderMap) -> Respon
         .filter(|k| scope.covers(&k.tenant))
         .map(|k| ak_public_json(&k))
         .collect();
-    let mut resp = json!({ "count": keys.len() });
+    let mut resp = json!({ "count": keys.len(), "offset": offset });
     resp["keys"] = Value::Array(keys);
     Json(resp).into_response()
 }
@@ -1194,10 +1523,7 @@ async fn admin_usage(
         Ok(scope) => scope,
         Err(r) => return r,
     };
-    let filter = match &scope {
-        AdminScope::Tenant(t) => Some(t.clone()),
-        AdminScope::Global => q.get("tenant").cloned(),
-    };
+    let filter = scope.tenant_filter(&q);
     let usage = match s
         .handler
         .state()
@@ -1209,6 +1535,164 @@ async fn admin_usage(
         Err(e) => return gateway_error(e),
     };
     Json(json!({ "usage": usage })).into_response()
+}
+
+/// GET /admin/usage/users?user=&since=&until= — precise per-user cost over a
+/// billing period, grouped by (user, requested model). Tenant-scoped like
+/// [`admin_usage`]; `since`/`until` are unix seconds (default: all time).
+async fn admin_usage_users(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let scope = match admin_auth(&s, &headers) {
+        Ok(scope) => scope,
+        Err(r) => return r,
+    };
+    let tenant = scope.tenant_filter(&q);
+    let since = q_num(&q, "since", 0);
+    let until = q_num(&q, "until", i64::MAX);
+    let usage = match s
+        .handler
+        .state()
+        .store
+        .usage_by_user(
+            tenant.as_deref(),
+            q.get("user").map(String::as_str),
+            since,
+            until,
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => return gateway_error(e),
+    };
+    if q.get("format").map(String::as_str) == Some("csv") {
+        let mut csv = String::from(
+            "user_id,model,requests,prompt_tokens,completion_tokens,total_tokens,cost_micros,vendor_cost_micros\n",
+        );
+        for u in &usage {
+            let _ = writeln!(
+                csv,
+                "{},{},{},{},{},{},{},{}",
+                csv_field(&u.user_id),
+                csv_field(&u.model),
+                u.requests,
+                u.prompt_tokens,
+                u.completion_tokens,
+                u.total_tokens,
+                u.cost_micros,
+                u.vendor_cost_micros,
+            );
+        }
+        return ([("content-type", "text/csv")], csv).into_response();
+    }
+    Json(json!({ "usage": usage })).into_response()
+}
+
+/// A CSV field, RFC-4180 quoted AND neutralized against spreadsheet formula
+/// injection: a field opening with a formula trigger (`= + - @` / tab / CR) is
+/// prefixed with `'` so Excel/Sheets treat it as text (the value is
+/// attacker-controlled — it can carry a user id).
+fn csv_field(s: &str) -> String {
+    let needs_prefix = s
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'));
+    let body = if needs_prefix {
+        format!("'{s}")
+    } else {
+        s.to_owned()
+    };
+    if body.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", body.replace('"', "\"\""))
+    } else {
+        body
+    }
+}
+
+/// GET /admin/audit/events?limit= — content-safety hits (no prompt text), newest
+/// first. Tenant-scoped: a tenant admin sees only its own tenant's events.
+async fn admin_security_events(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let scope = match admin_auth(&s, &headers) {
+        Ok(scope) => scope,
+        Err(r) => return r,
+    };
+    let tenant = scope.tenant_filter(&q);
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
+    match s
+        .handler
+        .state()
+        .store
+        .security_events(tenant.as_deref(), limit)
+        .await
+    {
+        Ok(events) => Json(json!({ "events": events })).into_response(),
+        Err(e) => gateway_error(e),
+    }
+}
+
+/// GET /admin/audit/ops?limit= — admin-operation audit trail, newest first.
+/// Global admin only (the trail spans all tenants).
+async fn admin_audit_ops(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(r) = require_global_admin(&s, &headers) {
+        return r;
+    }
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
+    match s.handler.state().store.admin_audit_list(limit).await {
+        Ok(entries) => Json(json!({ "entries": entries })).into_response(),
+        Err(e) => gateway_error(e),
+    }
+}
+
+/// GET /admin/audit/content/{request_id} — the retained prompt/response rows
+/// for one request, unsealed when the content key is present (a sealed row
+/// without it returns `content: null`). Tenant-scoped like the other reads.
+async fn admin_content_get(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Response {
+    let scope = match admin_auth(&s, &headers) {
+        Ok(scope) => scope,
+        Err(r) => return r,
+    };
+    let rows = match s.handler.state().store.content_for(&request_id).await {
+        Ok(rows) => rows,
+        Err(e) => return gateway_error(e),
+    };
+    let entries: Vec<Value> = rows
+        .into_iter()
+        .filter(|r| scope.covers(&r.tenant))
+        .map(|r| {
+            let content = if r.sealed {
+                gw_state::content::open(&r.content)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::String(r.content)
+            };
+            json!({
+                "created_at_epoch_secs": r.created_at_epoch_secs,
+                "kind": r.kind,
+                "ak": r.ak,
+                "user_id": r.user_id,
+                "tenant": r.tenant,
+                "sealed": r.sealed,
+                "expires_at_epoch_secs": r.expires_at_epoch_secs,
+                "content": content,
+            })
+        })
+        .collect();
+    Json(json!({ "request_id": request_id, "entries": entries })).into_response()
 }
 
 fn gateway_error(e: GatewayError) -> Response {
@@ -1345,6 +1829,7 @@ async fn chat_completions(
     );
     param.typed = Some(typed);
     param.raw = Value::Object(body.extra);
+    let user_id = user_hint(&headers, &param.raw["user"]);
 
     let request = GatewayRequest {
         is_online: true,
@@ -1352,6 +1837,7 @@ async fn chat_completions(
         ak: ak.ak.clone(),
         message: messages,
         model_param_v2: Some(param),
+        user_id,
         ..Default::default()
     };
 
@@ -1409,7 +1895,7 @@ fn spawn_stream_pipeline(
     started: Instant,
 ) -> tokio::sync::mpsc::Receiver<gw_engines::StreamChunk> {
     let (tx, rx) = tokio::sync::mpsc::channel::<gw_engines::StreamChunk>(STREAM_CHANNEL_CAP);
-    let dlp = s.handler.cfg().security.dlp_redact;
+    let dlp = s.handler.cfg().security_for(&ak.tenant).dlp_redact;
     if !dlp {
         request.stream_tx = Some(tx.clone());
     }
@@ -1675,6 +2161,7 @@ async fn messages(
         ModelParamV2::with_name(gw_consts::Protocol::AnthropicMessages, body.model.clone());
     param.typed = Some(typed);
     param.raw = Value::Object(body.extra);
+    let user_id = user_hint(&headers, &param.raw["metadata"]["user_id"]);
 
     let request = GatewayRequest {
         is_online: true,
@@ -1693,6 +2180,7 @@ async fn messages(
             })
             .collect(),
         model_param_v2: Some(param),
+        user_id,
         ..Default::default()
     };
 
@@ -1957,6 +2445,7 @@ async fn run_family(
     mt: gw_consts::Protocol,
     typed: TypedParams,
     messages: Vec<ChatMsg>,
+    user_id: Option<String>,
 ) -> Result<DagContext, Response> {
     let mut param = ModelParamV2::with_name(mt, model);
     param.typed = Some(typed);
@@ -1965,6 +2454,7 @@ async fn run_family(
         ak: ak.ak.clone(),
         message: messages,
         model_param_v2: Some(param),
+        user_id,
         ..Default::default()
     };
     match run_pipeline(s, request, ak).await {
@@ -2019,6 +2509,7 @@ async fn completions(
         gw_consts::Protocol::Completions,
         typed,
         vec![ChatMsg::text("user", prompt)],
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2066,6 +2557,7 @@ async fn responses(
         return error_response(400, "input is required");
     }
     let stream = body["stream"].as_bool().unwrap_or(false);
+    let user_id = user_hint(&headers, &body["user"]);
     let mut param = ModelParamV2::with_name(gw_consts::Protocol::Responses, model.clone());
     param.raw = body;
     let request = GatewayRequest {
@@ -2073,6 +2565,7 @@ async fn responses(
         stream,
         ak: ak.ak.clone(),
         model_param_v2: Some(param),
+        user_id,
         ..Default::default()
     };
 
@@ -2216,6 +2709,7 @@ async fn embeddings(
         gw_consts::Protocol::OpenaiChat,
         typed,
         vec![],
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2255,6 +2749,7 @@ async fn images_generations(
         gw_consts::Protocol::OpenaiChat,
         typed,
         vec![],
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2297,6 +2792,7 @@ async fn images_edits(
         gw_consts::Protocol::OpenaiChat,
         typed,
         vec![],
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2336,6 +2832,7 @@ async fn audio_speech(
         gw_consts::Protocol::OpenaiChat,
         typed,
         vec![],
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2391,6 +2888,7 @@ async fn audio_transcriptions(
         gw_consts::Protocol::OpenaiChat,
         typed,
         vec![],
+        user_hint(&headers, &body["user"]),
     )
     .await
     {
@@ -2432,6 +2930,15 @@ async fn batches_submit(
     };
     let mut model = body["model"].as_str().unwrap_or_default().to_owned();
     let mut batch_items = Vec::new();
+    // batch-level attribution hint; a per-item body `user` overrides it
+    let hint = user_header(&headers);
+    let item_user = |v: &Value| {
+        v["user"]
+            .as_str()
+            .or(hint.as_deref())
+            .unwrap_or_default()
+            .to_owned()
+    };
 
     if let Some(file_id) = body["input_file_id"].as_str() {
         let found = s.handler.state().store.file_get(file_id).await;
@@ -2453,7 +2960,10 @@ async fn batches_submit(
             if msgs.is_empty() {
                 return error_response(400, "input file line missing a messages array");
             }
-            batch_items.push(BatchItem { messages: msgs });
+            batch_items.push(BatchItem {
+                messages: msgs,
+                user: item_user(reqbody),
+            });
         }
     } else if let Some(items) = body["items"].as_array() {
         for it in items {
@@ -2461,7 +2971,10 @@ async fn batches_submit(
             if msgs.is_empty() {
                 return error_response(400, "each item needs a non-empty messages array");
             }
-            batch_items.push(BatchItem { messages: msgs });
+            batch_items.push(BatchItem {
+                messages: msgs,
+                user: item_user(it),
+            });
         }
     } else {
         return error_response(400, "either items or input_file_id is required");
@@ -2622,6 +3135,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_attribution_and_request_id_land_in_the_ledger() {
+        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let store = app_state.handler.state().store.clone();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer ak-demo-123")
+            .header("x-gw-user", "user-42")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = app(app_state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (_, records) = store.ledger_snapshot(10).await.unwrap();
+        let row = records.last().expect("a ledger row");
+        assert_eq!(row.user_id, "user-42", "x-gw-user attributed the cost");
+        assert!(!row.request_id.is_empty(), "request_id stamped");
+        assert!(row.created_at_epoch_secs > 0, "created_at stamped");
+        let by_user = store
+            .usage_by_user(None, Some("user-42"), 0, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(by_user.len(), 1);
+        assert!(by_user[0].total_tokens > 0);
+    }
+
+    #[test]
+    fn source_ip_roots_at_peer_and_ignores_forgeable_headers_untrusted() {
+        let peer: std::net::SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("x-real-ip", "10.0.0.5".parse().unwrap());
+        h.insert("x-forwarded-for", "1.2.3.4, 10.0.0.9".parse().unwrap());
+        assert_eq!(
+            source_ip(Some(peer), &h, false),
+            "203.0.113.7",
+            "untrusted: forgeable headers ignored, the TCP peer wins"
+        );
+        assert_eq!(
+            source_ip(None, &h, false),
+            "",
+            "no peer, no forgeable header"
+        );
+        assert_eq!(
+            source_ip(Some(peer), &h, true),
+            "10.0.0.5",
+            "trusted proxy: x-real-ip wins"
+        );
+        h.remove("x-real-ip");
+        assert_eq!(source_ip(Some(peer), &h, true), "10.0.0.9", "rightmost hop");
+    }
+
+    #[test]
+    fn csv_field_neutralizes_formula_injection() {
+        assert_eq!(csv_field("alice"), "alice");
+        assert_eq!(
+            csv_field("+cmd"),
+            "'+cmd",
+            "formula trigger prefixed with '"
+        );
+        assert_eq!(
+            csv_field("=SUM(A1,A2)"),
+            "\"'=SUM(A1,A2)\"",
+            "prefixed AND quoted (has a comma)"
+        );
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+    }
+
+    #[tokio::test]
+    async fn dlp_hit_is_recorded_as_a_security_event() {
+        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        assert!(cfg.security.dlp_redact, "embedded config has DLP on");
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let store = app_state.handler.state().store.clone();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer ak-demo-123")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"mail me at a@b.com"}]}"#,
+            ))
+            .unwrap();
+        let resp = app(app_state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let events = store.security_events(None, 10).await.unwrap();
+        assert!(
+            events.iter().any(|e| e.rule == "dlp"),
+            "an inbound PII redaction was recorded, no prompt text stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_retention_without_key_never_stores_raw_even_with_dlp_off() {
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_CONTENT_ADMIN}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, retention: {content: full, days: 1}, security: {dlp_redact: false, detect_secrets: false}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        // SAFETY: unique var name for this test; no concurrent reader of it.
+        unsafe { std::env::set_var("GW_TEST_CONTENT_ADMIN", "s3cret") };
+        assert!(
+            !gw_state::sealing_available(),
+            "test env has no content key"
+        );
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let store = app_state.handler.state().store.clone();
+        let router = app(app_state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer k1")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[{"role":"user","content":"here is sk-abcdefghijklmnopqrstuvwxyz012345"}]}"#,
+            ))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (_, rows) = store.ledger_snapshot(1).await.unwrap();
+        let stored = store.content_for(&rows[0].request_id).await.unwrap();
+        let prompt = stored
+            .iter()
+            .find(|c| c.kind == "prompt")
+            .expect("prompt stored");
+        assert!(!prompt.sealed, "no key → unsealed");
+        assert!(
+            prompt.content.contains("[REDACTED_SECRET]"),
+            "secret masked: {}",
+            prompt.content
+        );
+        for c in &stored {
+            assert!(
+                !c.content.contains("sk-abc"),
+                "raw secret never persisted: {}",
+                c.content
+            );
+        }
+
+        let read = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/admin/audit/content/{}", rows[0].request_id))
+                    .header("authorization", "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        let j = body_json(read).await;
+        let entries = j["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "prompt and response rows read back");
+        let prompt_entry = entries
+            .iter()
+            .find(|e| e["kind"] == "prompt")
+            .expect("prompt entry");
+        assert!(
+            prompt_entry["content"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED_SECRET]"),
+            "read-back returns the redacted text"
+        );
+    }
+
+    #[derive(Debug)]
+    struct DenyModerator;
+
+    #[async_trait::async_trait]
+    impl gw_handler::moderation::Moderator for DenyModerator {
+        async fn review(&self, _text: &str) -> Result<gw_handler::moderation::Verdict, String> {
+            Ok(gw_handler::moderation::Verdict::Deny(
+                "blocked by moderator".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn realtime_moderates_and_records_inbound_dlp() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {moderate: true, detect_secrets: true}\nmodels: [{name: rt, protocol: realtime}]\naccess_keys: [{ak: k1, product: p, qps: 10, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let handler = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
+        .with_moderator(Arc::new(DenyModerator));
+        let offline = OfflineHandler::new(handler.clone());
+        let app = AppState {
+            handler,
+            offline,
+            loader: None,
+            config_store: None,
+        };
+        let ak = app.handler.state().auth.authenticate("k1").await.unwrap();
+        let cfg = app.handler.cfg();
+        let sec = cfg.security_for(&ak.tenant);
+
+        assert_eq!(
+            realtime_moderate(&app, sec, &ak, "", "hello there")
+                .await
+                .as_deref(),
+            Some("blocked by moderator")
+        );
+        let mut secret = json!({"type":"input_text","text":"sk-abcdefghijklmnopqrstuvwxyz012345"});
+        let n = gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut secret);
+        assert!(n > 0);
+        write_rt_event(&app, &ak, ak.attributed_user(""), "dlp", "redact", n as i64).await;
+
+        let events = app
+            .handler
+            .state()
+            .store
+            .security_events(None, 10)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|e| e.rule == "moderation"),
+            "moderation event"
+        );
+        assert!(
+            events.iter().any(|e| e.rule == "dlp"),
+            "inbound realtime DLP event"
+        );
+    }
+
+    #[tokio::test]
     async fn chat_non_stream_ok() {
         let resp = test_app()
             .oneshot(chat_req(
@@ -2669,18 +3415,18 @@ mod tests {
         let gov = || s.handler.state().governance.clone();
         let used = || async { gov().quota_used(&ak.ak).await };
 
-        let a1 = realtime_gate(&s, &ak, "gpt-4o").await.expect("admit");
+        let a1 = realtime_gate(&s, &ak, "gpt-4o", "").await.expect("admit");
         assert_eq!(used().await, REALTIME_TURN_RESERVE, "reserved up front");
 
         bill_realtime_turn(&a1, "gpt-4o", gw_consts::Protocol::Realtime, "acc", 30, 70).await;
         assert_eq!(used().await, 100, "settled to actual (30 + 70)");
 
-        let a2 = realtime_gate(&s, &ak, "gpt-4o").await.expect("admit");
+        let a2 = realtime_gate(&s, &ak, "gpt-4o", "").await.expect("admit");
         assert_eq!(used().await, 100 + REALTIME_TURN_RESERVE);
         gov().quota_settle(&a2.ak.ak, -a2.reserved, a2.at).await;
         assert_eq!(used().await, 100, "dropped turn refunded whole");
 
-        let a3 = realtime_gate(&s, &ak, "gpt-4o").await.expect("admit");
+        let a3 = realtime_gate(&s, &ak, "gpt-4o", "").await.expect("admit");
         assert_eq!(used().await, 100 + REALTIME_TURN_RESERVE);
         let ledger_before = s.handler.state().store.ledger_snapshot(1).await.unwrap().0;
         bill_realtime_turn(&a3, "gpt-4o", gw_consts::Protocol::Realtime, "acc", 0, 0).await;
@@ -2706,14 +3452,14 @@ mod tests {
             .unwrap();
         let gov = s.handler.state().governance.clone();
 
-        let a1 = realtime_gate(&s, &ak, "gpt-4o")
+        let a1 = realtime_gate(&s, &ak, "gpt-4o", "")
             .await
             .expect("first admits");
         assert_eq!(a1.tpm_reserved, Some(REALTIME_TURN_RESERVE));
         let daily_before = gov.quota_used(&ak.ak).await;
 
         assert!(
-            realtime_gate(&s, &ak, "gpt-4o").await.is_err(),
+            realtime_gate(&s, &ak, "gpt-4o", "").await.is_err(),
             "second turn denied by the TPM reserve"
         );
         assert_eq!(
@@ -2735,7 +3481,7 @@ mod tests {
         let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
         let ak = s.handler.state().auth.authenticate("k-rt").await.unwrap();
 
-        let admit = realtime_gate(&s, &ak, "rt").await.expect("admit");
+        let admit = realtime_gate(&s, &ak, "rt", "").await.expect("admit");
         s.handler
             .reload(GatewayConfig::from_yaml(&price(2_000_000)).unwrap())
             .await
@@ -2746,6 +3492,56 @@ mod tests {
         assert_eq!(
             records[0].cost_micros, 200_000,
             "settled at the admission price, not the reloaded one"
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_attributes_user_from_owner_then_header_hint() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: rt, protocol: realtime, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 1000}]\naccess_keys: [{ak: k-shared, product: p, qps: 10, daily_token_quota: 100000}, {ak: k-owned, product: p, qps: 10, daily_token_quota: 100000, owner: bob}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+
+        let shared = s
+            .handler
+            .state()
+            .auth
+            .authenticate("k-shared")
+            .await
+            .unwrap();
+        let admit = realtime_gate(&s, &shared, "rt", "alice")
+            .await
+            .expect("admit");
+        assert_eq!(admit.user, "alice", "ownerless key attributes to the hint");
+        bill_realtime_turn(&admit, "rt", gw_consts::Protocol::Realtime, "acc", 40, 60).await;
+
+        let owned = s
+            .handler
+            .state()
+            .auth
+            .authenticate("k-owned")
+            .await
+            .unwrap();
+        let admit = realtime_gate(&s, &owned, "rt", "mallory")
+            .await
+            .expect("admit");
+        assert_eq!(
+            admit.user, "bob",
+            "owner is authoritative over a spoofed hint"
+        );
+        bill_realtime_turn(&admit, "rt", gw_consts::Protocol::Realtime, "acc", 10, 20).await;
+
+        let (_, records) = s.handler.state().store.ledger_snapshot(2).await.unwrap();
+        let users: std::collections::HashSet<&str> =
+            records.iter().map(|r| r.user_id.as_str()).collect();
+        assert!(
+            users.contains("alice"),
+            "shared-key turn billed to header hint"
+        );
+        assert!(users.contains("bob"), "owned-key turn billed to owner");
+        assert!(
+            !users.contains("mallory"),
+            "spoofed hint never overrides owner"
         );
     }
 

@@ -22,14 +22,26 @@ status codes, protocol/stage names) — no per-key or per-model cardinality.
 ## Access log
 
 One structured line per request goes to stdout (via `tracing`; control level
-with `RUST_LOG`), carrying `ak`, `product`, `model`, `protocol`, `account`,
-`status`, `prompt_tokens`, `completion_tokens`, `total_tokens`, and
-`latency_ms`.
+with `RUST_LOG`), carrying `request_id`, `ak`, `product`, `user_id`, `model`,
+`protocol`, `account`, `status`, `prompt_tokens`, `completion_tokens`,
+`total_tokens`, and `latency_ms`. `request_id` joins the access log to the
+ledger row and the audit events for the same request.
 
 ## Billing ledger
 
 `GET /internal/ledger?limit=N` returns the most recent `N` billing records
 (newest first); `count` is always the true total, independent of the page size.
 Records persist when a SQLite store is configured and can be capped with
-`storage.ledger_max_rows`. Each record has the access key, product, model,
-protocol, account, token counts, cost, and the PTU-spillover flag.
+`storage.ledger_max_rows`. Each record carries `request_id`, the access key,
+product, `user_id` (effective end user), model, protocol, account, token counts,
+cost, `created_at_epoch_secs`, the PTU-spillover flag, and an `estimated` flag
+(set when counts came from an aborted stream rather than a vendor usage payload).
+
+## Audit trails
+
+Three operator-facing audit surfaces, all under the gated `/admin` prefix and
+covered in [Governance](governance.md#audit-trails): `GET /admin/audit/events`
+(content-safety hits, no prompt text), `GET /admin/audit/ops` (admin-plane
+mutations with source IP), and `GET /admin/usage/users` (per-user cost). Content
+retention, when a tenant enables it, is read back via
+`GET /admin/audit/content/{request_id}`.

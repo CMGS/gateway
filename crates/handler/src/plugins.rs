@@ -4,40 +4,137 @@
 //! typed params. The post-stage redacts the outbound message; streaming
 //! surfaces buffer and replay the redacted text when outbound DLP is on.
 
-use gw_config::SecurityConf;
+use gw_config::{Action, SecurityConf};
 use gw_models::{Block, GatewayRequest, GatewayResponse};
 
 const BLOCKED_MSG: &str = "this content cannot be answered, please try a different request";
 
-/// Blocklist check. Returns Block on a hit (block=true implies hit=true).
-/// Scans the same inbound text DLP covers, so no surface is a bypass; takes
-/// `&mut` only to share the one traversal with the redaction pass.
-pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> Option<Block> {
-    if sec.blocklist.is_empty() {
-        return None;
+/// One content rule that fired on a request, for the security-event stream.
+pub struct RuleHit {
+    pub rule: String,
+    pub action: Action,
+    pub count: i64,
+}
+
+/// The result of scanning one request: whether to deny it, plus every rule that
+/// fired (for the audit stream). A `block`-action hit fills `block`; `flag`/
+/// `shadow` hits only populate `hits`.
+#[derive(Default)]
+pub struct ScanOutcome {
+    pub block: Option<Block>,
+    pub hits: Vec<RuleHit>,
+}
+
+/// Scan inbound text against the blocklist and the regex recognizers. One
+/// traversal of the same fields DLP covers, so no surface is a bypass. `&mut`
+/// only to share the traversal; nothing is rewritten here.
+pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanOutcome {
+    if sec.blocklist.is_empty() && sec.regexes.is_empty() {
+        return ScanOutcome::default();
     }
-    // the shared traversal counts hits; a String is never rewritten here
-    let mut scan = |s: &mut String| usize::from(blocklist_hit(sec, s));
-    let mut blocked = 0;
+    let mut counts = ScanCounts::new(sec);
+    let mut visit = |s: &mut String| counts.visit(s);
     for msg in &mut request.message {
-        blocked += usize::from(blocklist_hit(sec, &msg.content));
+        visit(&mut msg.content);
         if let Some(parts) = &mut msg.parts {
-            blocked += walk_json_strings(parts, &mut scan);
+            walk_json_strings(parts, &mut visit);
         }
     }
     if let Some(param) = request.model_param_v2.as_mut() {
-        blocked += walk_json_strings(&mut param.raw, &mut scan);
+        walk_json_strings(&mut param.raw, &mut visit);
         if let Some(typed) = param.typed.as_mut() {
-            blocked += for_each_typed_text(typed, &mut scan);
+            for_each_typed_text(typed, &mut visit);
         }
     }
-    if blocked > 0 {
-        return Some(Block::blocked(
-            BLOCKED_MSG,
-            gw_consts::ErrCode::EMPTY_RESP.value() as i32,
-        ));
+    counts.outcome()
+}
+
+/// Per-rule hit counters for one scan, shared by the REST request scan and the
+/// realtime frame scan so the two apply identical action semantics.
+struct ScanCounts<'a> {
+    sec: &'a SecurityConf,
+    blocklist: i64,
+    regex: Vec<i64>,
+}
+
+impl<'a> ScanCounts<'a> {
+    fn new(sec: &'a SecurityConf) -> Self {
+        Self {
+            sec,
+            blocklist: 0,
+            regex: vec![0; sec.regexes.len()],
+        }
     }
-    None
+
+    fn visit(&mut self, s: &str) -> usize {
+        self.blocklist += i64::from(blocklist_hit(self.sec, s));
+        for (i, r) in self.sec.regexes.iter().enumerate() {
+            self.regex[i] += r.re.find_iter(s).count() as i64;
+        }
+        0
+    }
+
+    /// Fold the counts into a [`ScanOutcome`]: a rule with count > 0 is a hit
+    /// at its action; any block-action hit denies.
+    fn outcome(self) -> ScanOutcome {
+        let mut hits = Vec::new();
+        if self.blocklist > 0 {
+            hits.push(RuleHit {
+                rule: "blocklist".to_owned(),
+                action: self.sec.blocklist_action,
+                count: self.blocklist,
+            });
+        }
+        for (r, count) in self.sec.regexes.iter().zip(self.regex) {
+            if count > 0 {
+                hits.push(RuleHit {
+                    rule: r.name.clone(),
+                    action: r.action,
+                    count,
+                });
+            }
+        }
+        let block = hits
+            .iter()
+            .any(|h| h.action == Action::Block)
+            .then(|| Block::blocked(BLOCKED_MSG, gw_consts::ErrCode::EMPTY_RESP.value() as i32));
+        ScanOutcome { block, hits }
+    }
+}
+
+/// All inbound text a request carries — message content, multimodal text
+/// parts, the Responses raw body, and the family typed params — collected via
+/// the same traversals the blocklist scan and DLP run, so the field lists
+/// cannot drift apart. The one text view moderation and content retention
+/// operate on. `&mut` only to share those traversals; nothing is rewritten.
+pub fn inbound_text(request: &mut GatewayRequest) -> String {
+    let mut out = String::new();
+    let mut collect = |s: &mut String| {
+        push_text(&mut out, s);
+        0
+    };
+    for m in &mut request.message {
+        collect(&mut m.content);
+        if let Some(parts) = &mut m.parts {
+            for_each_part_text(parts, &mut collect);
+        }
+    }
+    if let Some(param) = request.model_param_v2.as_mut() {
+        walk_json_strings(&mut param.raw, &mut collect);
+        if let Some(typed) = param.typed.as_mut() {
+            for_each_typed_text(typed, &mut collect);
+        }
+    }
+    out
+}
+
+fn push_text(out: &mut String, s: &str) {
+    if !s.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(s);
+    }
 }
 
 /// Case-insensitive blocklist test; terms are pre-lowercased at config load.
@@ -101,81 +198,143 @@ fn for_each_typed_text(
     }
 }
 
-/// Blocklist scan over a realtime frame's text-bearing fields — the same terms
-/// every REST surface blocks, so the WebSocket surface is not a bypass.
-pub fn realtime_frame_blocked(sec: &SecurityConf, frame: &mut serde_json::Value) -> Option<Block> {
-    if sec.blocklist.is_empty() {
-        return None;
-    }
-    let hits =
-        gw_engines::realtime::visit_frame_text(frame, &mut |s| usize::from(blocklist_hit(sec, s)));
-    (hits > 0).then(|| Block::blocked(BLOCKED_MSG, gw_consts::ErrCode::EMPTY_RESP.value() as i32))
-}
-
-/// DLP-redact a realtime frame's text-bearing fields in place; the hit count.
-/// Per-frame best effort: a PII span straddling two deltas is not caught — a
-/// realtime relay cannot buffer the way the REST stream surfaces do.
-pub fn dlp_redact_realtime_frame(sec: &SecurityConf, frame: &mut serde_json::Value) -> usize {
-    if !sec.dlp_redact {
-        return 0;
-    }
-    gw_engines::realtime::visit_frame_text(frame, &mut redact_str)
-}
-
-/// DLP inbound redaction: emails and 11-digit phone numbers.
-pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
-    if !sec.dlp_redact {
-        return 0;
-    }
-    let mut hits = 0;
-    for msg in &mut request.message {
-        hits += redact_str(&mut msg.content);
-        // engines forward `parts` (not `content`) when present, so PII must be
-        // scrubbed inside the parts' text blocks too
-        if let Some(parts) = &mut msg.parts {
-            hits += redact_parts_text(parts);
-        }
-    }
-    // non-chat surfaces carry user text outside `message` (Responses raw body,
-    // family typed params) — scrub those too or they reach the vendor unredacted
-    if let Some(param) = request.model_param_v2.as_mut() {
-        hits += walk_json_strings(&mut param.raw, &mut redact_str);
-        if let Some(typed) = param.typed.as_mut() {
-            hits += for_each_typed_text(typed, &mut redact_str);
-        }
-    }
-    hits
-}
-
-/// Redact one string in place; the hit count.
-fn redact_str(s: &mut String) -> usize {
-    match redact(s) {
-        Some((redacted, n)) => {
-            *s = redacted;
-            n
-        }
-        None => 0,
-    }
-}
-
-/// Redact PII inside a multimodal `parts` array's text blocks, in place.
+/// Visit a multimodal `parts` array's text blocks; returns summed hits.
 /// Deliberately narrower than the blocklist scan: non-text parts (image URLs,
-/// base64 data) are never rewritten, so a redaction can't corrupt them.
-fn redact_parts_text(parts: &mut serde_json::Value) -> usize {
+/// base64 data) are never visited, so a rewrite can't corrupt them.
+fn for_each_part_text(
+    parts: &mut serde_json::Value,
+    f: &mut impl FnMut(&mut String) -> usize,
+) -> usize {
     let Some(arr) = parts.as_array_mut() else {
         return 0;
     };
     let mut hits = 0;
     for p in arr {
         if p["type"] == "text"
-            && let Some(t) = p["text"].as_str()
-            && let Some((redacted, n)) = redact(t)
+            && let Some(serde_json::Value::String(s)) = p.get_mut("text")
         {
-            p["text"] = serde_json::Value::String(redacted);
-            hits += n;
+            hits += f(s);
         }
     }
     hits
+}
+
+/// Scan a realtime frame's text-bearing fields against the blocklist AND the
+/// regex recognizers, honoring their actions — the same policy every REST
+/// surface runs, so the WebSocket surface is not a bypass. A block-action hit
+/// denies the frame. `collect_text` also gathers the frame's text (for
+/// moderation) in the same traversal, so a moderated tenant pays one walk per
+/// frame, not two.
+pub fn realtime_frame_scan(
+    sec: &SecurityConf,
+    frame: &mut serde_json::Value,
+    collect_text: bool,
+) -> (ScanOutcome, String) {
+    let scan_rules = !sec.blocklist.is_empty() || !sec.regexes.is_empty();
+    let mut counts = ScanCounts::new(sec);
+    let mut text = String::new();
+    if scan_rules || collect_text {
+        gw_engines::realtime::visit_frame_text(frame, &mut |s| {
+            if scan_rules {
+                counts.visit(s);
+            }
+            if collect_text {
+                push_text(&mut text, s);
+            }
+            0
+        });
+    }
+    (counts.outcome(), text)
+}
+
+/// DLP-redact a realtime frame's text-bearing fields in place; the hit count.
+/// Honors both `dlp_redact` (PII) and `detect_secrets` (credentials), the same
+/// as the REST path — a realtime frame must not be a secret-redaction bypass.
+/// Per-frame best effort: a PII span straddling two deltas is not caught — a
+/// realtime relay cannot buffer the way the REST stream surfaces do.
+pub fn dlp_redact_realtime_frame(sec: &SecurityConf, frame: &mut serde_json::Value) -> usize {
+    if !sec.dlp_redact && !sec.detect_secrets {
+        return 0;
+    }
+    let (pii, secrets) = (sec.dlp_redact, sec.detect_secrets);
+    gw_engines::realtime::visit_frame_text(frame, &mut |s| redact_in_place(s, pii, secrets))
+}
+
+/// DLP inbound redaction: emails, 11-digit phone numbers, and — when
+/// `detect_secrets` is on — API keys / credentials.
+pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
+    if !sec.dlp_redact && !sec.detect_secrets {
+        return 0;
+    }
+    let secrets = sec.detect_secrets;
+    let pii = sec.dlp_redact;
+    let mut redact_field = |s: &mut String| redact_in_place(s, pii, secrets);
+    let mut hits = 0;
+    for msg in &mut request.message {
+        hits += redact_field(&mut msg.content);
+        // engines forward `parts` (not `content`) when present, so PII must be
+        // scrubbed inside the parts' text blocks too
+        if let Some(parts) = &mut msg.parts {
+            hits += for_each_part_text(parts, &mut redact_field);
+        }
+    }
+    // non-chat surfaces carry user text outside `message` (Responses raw body,
+    // family typed params) — scrub those too or they reach the vendor unredacted
+    if let Some(param) = request.model_param_v2.as_mut() {
+        hits += walk_json_strings(&mut param.raw, &mut redact_field);
+        if let Some(typed) = param.typed.as_mut() {
+            hits += for_each_typed_text(typed, &mut redact_field);
+        }
+    }
+    hits
+}
+
+/// A privacy-safe copy of `text` for content retention: PII and secrets are
+/// ALWAYS stripped, independent of the tenant's forwarding DLP flags. Retention
+/// owns its own redaction so a `redacted` row — or a keyless `full` downgrade —
+/// can never persist raw secrets/PII even when inline DLP is disabled.
+pub fn redact_retained(text: &str) -> String {
+    let mut s = text.to_owned();
+    redact_in_place(&mut s, true, true);
+    s
+}
+
+/// Redact one string in place (email/phone via `pii`, secrets via `secrets`);
+/// the hit count.
+fn redact_in_place(s: &mut String, pii: bool, secrets: bool) -> usize {
+    let mut hits = 0;
+    if pii && let Some((redacted, n)) = redact(s) {
+        *s = redacted;
+        hits += n;
+    }
+    if secrets && let Some((redacted, n)) = redact_secrets(s) {
+        *s = redacted;
+        hits += n;
+    }
+    hits
+}
+
+/// Redact one string in place; email/phone only (the outbound response path).
+fn redact_str(s: &mut String) -> usize {
+    redact_in_place(s, true, false)
+}
+
+/// Mask credential shapes (API keys, tokens, private-key headers) with
+/// `[REDACTED_SECRET]`. High-precision patterns to avoid mauling normal text.
+fn redact_secrets(text: &str) -> Option<(String, usize)> {
+    static SECRETS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        #[allow(clippy::expect_used)] // a compile-time literal, covered by tests
+        regex::Regex::new(
+            r"sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----",
+        )
+        .expect("static secret patterns compile")
+    });
+    let mut count = 0;
+    let out = SECRETS.replace_all(text, |_: &regex::Captures| {
+        count += 1;
+        "[REDACTED_SECRET]"
+    });
+    (count > 0).then(|| (out.into_owned(), count))
 }
 
 /// DLP outbound redaction: the flat `message` plus the structured payloads the
@@ -297,6 +456,7 @@ mod tests {
         SecurityConf {
             blocklist: vec!["forbiddenword".into()],
             dlp_redact: true,
+            ..Default::default()
         }
     }
 
@@ -306,10 +466,14 @@ mod tests {
             message: vec![ChatMsg::text("user", "say ForbiddenWord now")],
             ..Default::default()
         };
-        let block = security_check(&sec(), &mut req).unwrap();
+        let block = security_check(&sec(), &mut req).block.unwrap();
         assert!(block.block && block.hit);
         assert_eq!(block.err_code, 4003);
-        assert!(security_check(&sec(), &mut GatewayRequest::default()).is_none());
+        assert!(
+            security_check(&sec(), &mut GatewayRequest::default())
+                .block
+                .is_none()
+        );
     }
 
     #[test]
@@ -317,17 +481,156 @@ mod tests {
         let s = SecurityConf {
             blocklist: vec!["forbiddenword".into(), "禁词".into()],
             dlp_redact: false,
+            ..Default::default()
         };
         let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "前文 FORBIDDENWORD 后文")],
             ..Default::default()
         };
-        assert!(security_check(&s, &mut req).is_some());
+        assert!(security_check(&s, &mut req).block.is_some());
         let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "包含 禁词 的内容")],
             ..Default::default()
         };
-        assert!(security_check(&s, &mut req).is_some());
+        assert!(security_check(&s, &mut req).block.is_some());
+    }
+
+    #[test]
+    fn inbound_text_covers_non_chat_raw_and_typed() {
+        use gw_models::{ModelParamV2, TypedParams};
+        let mut param = ModelParamV2::with_name(gw_consts::Protocol::Responses, "m");
+        param.raw = serde_json::json!({"input": "secret responses text", "model": "m"});
+        let mut req = GatewayRequest {
+            model_param_v2: Some(param),
+            ..Default::default()
+        };
+        assert!(
+            inbound_text(&mut req).contains("secret responses text"),
+            "Responses input rides in raw with an empty message"
+        );
+
+        let mut param = ModelParamV2::with_name(gw_consts::Protocol::Embeddings, "m");
+        param.typed = Some(TypedParams::Embeddings(gw_models::EmbeddingParams {
+            input: vec!["typed embed text".into()],
+            dimensions: None,
+        }));
+        let mut req = GatewayRequest {
+            model_param_v2: Some(param),
+            ..Default::default()
+        };
+        assert!(
+            inbound_text(&mut req).contains("typed embed text"),
+            "embeddings input rides in typed with an empty message"
+        );
+    }
+
+    fn ssn_block() -> SecurityConf {
+        SecurityConf {
+            regexes: vec![gw_config::CompiledRule {
+                name: "ssn".into(),
+                action: Action::Block,
+                re: regex::Regex::new(r"\d{3}-\d{2}-\d{4}").unwrap(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn realtime_frame_scan_honors_regex_and_actions() {
+        let s = ssn_block();
+        let mut frame = serde_json::json!({"type":"input_text","text":"my ssn is 123-45-6789"});
+        let (out, text) = realtime_frame_scan(&s, &mut frame, true);
+        assert!(out.block.is_some(), "regex Block denies on realtime too");
+        assert!(
+            text.contains("123-45-6789"),
+            "collect_text gathers the frame text in the same walk"
+        );
+
+        let s2 = SecurityConf {
+            blocklist: vec!["watch".into()],
+            blocklist_action: Action::Flag,
+            ..Default::default()
+        };
+        let mut frame = serde_json::json!({"type":"input_text","text":"please watch this"});
+        let (out, text) = realtime_frame_scan(&s2, &mut frame, false);
+        assert!(out.block.is_none(), "flag does not block realtime");
+        assert_eq!(out.hits.len(), 1);
+        assert!(text.is_empty(), "no text collected unless asked");
+    }
+
+    #[test]
+    fn realtime_frame_redacts_secrets_when_detect_secrets_on() {
+        let s = SecurityConf {
+            detect_secrets: true,
+            dlp_redact: false,
+            ..Default::default()
+        };
+        let mut frame = serde_json::json!({
+            "type":"input_text","text":"here is sk-abcdefghijklmnopqrstuvwxyz012345"
+        });
+        let n = dlp_redact_realtime_frame(&s, &mut frame);
+        assert_eq!(n, 1, "secret masked even with dlp_redact off");
+        let text = frame["text"].as_str().unwrap();
+        assert!(
+            text.contains("[REDACTED_SECRET]") && !text.contains("sk-abc"),
+            "{text}"
+        );
+
+        let none = SecurityConf::default();
+        let mut frame =
+            serde_json::json!({"type":"input_text","text":"sk-abcdefghijklmnopqrstuvwxyz012345"});
+        assert_eq!(
+            dlp_redact_realtime_frame(&none, &mut frame),
+            0,
+            "both flags off leaves the frame untouched"
+        );
+    }
+
+    #[test]
+    fn redact_retained_strips_pii_and_secrets_unconditionally() {
+        let out =
+            redact_retained("mail john.doe@example.com key sk-abcdefghijklmnopqrstuvwxyz012345");
+        assert!(out.contains("[REDACTED_EMAIL]"), "{out}");
+        assert!(out.contains("[REDACTED_SECRET]"), "{out}");
+        assert!(
+            !out.contains("example.com") && !out.contains("sk-abc"),
+            "{out}"
+        );
+        assert_eq!(redact_retained("clean text"), "clean text");
+    }
+
+    #[test]
+    fn flag_action_records_a_hit_without_blocking() {
+        let s = SecurityConf {
+            blocklist: vec!["watchword".into()],
+            blocklist_action: Action::Flag,
+            ..Default::default()
+        };
+        let mut req = GatewayRequest {
+            message: vec![ChatMsg::text("user", "contains watchword here")],
+            ..Default::default()
+        };
+        let out = security_check(&s, &mut req);
+        assert!(out.block.is_none(), "flag does not deny");
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].action, Action::Flag);
+    }
+
+    #[test]
+    fn regex_rule_blocks_and_redact_secrets_masks() {
+        let s = ssn_block();
+        let mut req = GatewayRequest {
+            message: vec![ChatMsg::text("user", "my ssn is 123-45-6789")],
+            ..Default::default()
+        };
+        assert!(
+            security_check(&s, &mut req).block.is_some(),
+            "regex Block denies"
+        );
+
+        let (masked, n) = redact_secrets("key sk-abcdefghijklmnopqrstuvwxyz012345 end").unwrap();
+        assert_eq!(n, 1);
+        assert!(masked.contains("[REDACTED_SECRET]") && !masked.contains("sk-abc"));
     }
 
     #[test]

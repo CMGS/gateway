@@ -384,6 +384,30 @@ impl DagNode for AkTpmLimit {
     }
 }
 
+/// model_access/user_budget: per-user daily token budget (soft cap), keyed by
+/// the effective end user. No-op without a tenant limit or a user attribution.
+pub struct UserBudgetGate;
+
+#[async_trait::async_trait]
+impl DagNode for UserBudgetGate {
+    fn name(&self) -> &'static str {
+        "user_budget"
+    }
+    fn deps(&self) -> &'static [&'static str] {
+        &["ak_tpm"]
+    }
+    async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
+        admission::check_user_budget(
+            ctx.state.governance.as_ref(),
+            &ctx.cfg,
+            &ctx.ak.tenant,
+            ctx.effective_user_id(),
+        )
+        .await
+        .map_err(limit_denied)
+    }
+}
+
 /// model_access/call_engine: factory dispatch + engine execution + failover.
 /// On an upstream 5xx the failed account is excluded and reselected once (a
 /// PTU → paygo spill sets `ptu_spillover`); a second failure propagates as-is.
@@ -395,7 +419,7 @@ impl DagNode for CallEngine {
         "call_engine"
     }
     fn deps(&self) -> &'static [&'static str] {
-        &["ak_tpm"]
+        &["user_budget"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
         let threshold = ctx.cfg.stability.failure_threshold;
@@ -536,7 +560,7 @@ impl DagNode for CostCalc {
             };
             let ct = enc.encode_len(&resp.message) as i64;
             ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
-            return bill(ctx, pt, ct, pt.saturating_add(ct)).await;
+            return bill(ctx, pt, ct, pt.saturating_add(ct), true).await;
         }
         // default rate is 1:1; the formula carries future weighted rates.
         // saturating sums so a malformed usage subtree can't overflow the totals
@@ -564,13 +588,20 @@ impl DagNode for CostCalc {
                 resp.prompt_tokens.saturating_add(resp.completion_tokens),
             ),
         };
-        bill(ctx, prompt, completion, total).await
+        bill(ctx, prompt, completion, total, false).await
     }
 }
 
 /// Settle reserves and write the ledger for one served request via the shared
-/// [`admission::settle_and_bill`] orchestration.
-async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) -> GResult<()> {
+/// [`admission::settle_and_bill`] orchestration. `estimated` marks a bill from
+/// an aborted stream's estimated counts rather than a vendor usage payload.
+async fn bill(
+    ctx: &mut DagContext,
+    prompt: i64,
+    completion: i64,
+    total: i64,
+    estimated: bool,
+) -> GResult<()> {
     let ptu_spillover = ctx
         .outcome
         .as_ref()
@@ -583,6 +614,12 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
     let requested = param
         .and_then(|p| p.fallback_from.as_deref())
         .unwrap_or(served);
+    // locals first: the whole-ctx borrow `effective_user_id` needs can't overlap these takes
+    let (reserved, tpm_reserved, model_quota_key) = (
+        ctx.quota_reserved.take().unwrap_or(0),
+        ctx.tpm_reserved.take(),
+        ctx.model_quota_key.take(),
+    );
     let record = admission::settle_and_bill(
         ctx.state.governance.as_ref(),
         ctx.state.store.as_ref(),
@@ -592,6 +629,8 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
                 ak: &ctx.ak.ak,
                 product: &ctx.ak.product,
                 tenant: &ctx.ak.tenant,
+                user_id: ctx.effective_user_id(),
+                request_id: &ctx.request.request_id,
                 requested_model: requested,
                 served_model: served,
                 protocol: param.map(|p| p.protocol.as_str()).unwrap_or_default(),
@@ -600,12 +639,21 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
                 completion,
                 total,
                 ptu_spillover,
+                estimated,
             },
-            reserved: ctx.quota_reserved.take().unwrap_or(0),
-            tpm_reserved: ctx.tpm_reserved.take(),
+            reserved,
+            tpm_reserved,
             reserved_at: ctx.quota_at,
-            model_quota_key: ctx.model_quota_key.take(),
+            model_quota_key,
         },
+    )
+    .await;
+    admission::consume_user_budget(
+        ctx.state.governance.as_ref(),
+        &ctx.cfg,
+        &ctx.ak.tenant,
+        ctx.effective_user_id(),
+        record.total_tokens,
     )
     .await;
     ctx.decide(
@@ -690,6 +738,7 @@ pub fn default_layers() -> Vec<Layer> {
                 Box::new(ProductQpmLimit),
                 Box::new(ModelQpmLimit),
                 Box::new(AkTpmLimit),
+                Box::new(UserBudgetGate),
                 Box::new(CallEngine),
             ],
         },

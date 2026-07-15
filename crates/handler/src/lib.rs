@@ -3,21 +3,28 @@
 //! DAG layers, then the plugin post-stage; `OfflineHandler` reuses the same
 //! chain for batches.
 
+pub mod moderation;
 pub mod offline;
 pub mod plugins;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::FutureExt;
 use gw_config::GatewayConfig;
 use gw_dag::DagContext;
 use gw_engines::http_transport::UpstreamPolicy;
 use gw_engines::{EngineOutcome, SharedTransport};
-use gw_models::{GResult, GatewayError, GatewayRequest, GatewayResponse};
+use gw_models::{Block, GResult, GatewayError, GatewayRequest, GatewayResponse};
 use gw_state::{AkInfo, GatewayState, SharedConfig};
 
-pub use offline::{BatchItem, OfflineHandler};
+pub use gw_models::BatchItem;
+pub use offline::OfflineHandler;
+
+const MODERATION_UNAVAILABLE: &str = "content moderation is unavailable";
+
+static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Runs one request through the plugin pre-stage, the DAG, and the plugin post-stage.
 #[derive(Clone)]
@@ -25,6 +32,7 @@ pub struct OnlineHandler {
     pub config: SharedConfig,
     pub transport: SharedTransport,
     plan: Arc<gw_dag::Plan>,
+    moderator: Arc<dyn moderation::Moderator>,
 }
 
 impl OnlineHandler {
@@ -38,9 +46,17 @@ impl OnlineHandler {
             config,
             transport,
             plan,
+            moderator: moderation::default_moderator(),
         };
         handler.push_policies(&handler.cfg());
         handler
+    }
+
+    /// Plug an external content moderator into the pre-stage (enable per tenant
+    /// via `security.moderate`).
+    pub fn with_moderator(mut self, moderator: Arc<dyn moderation::Moderator>) -> Self {
+        self.moderator = moderator;
+        self
     }
 
     /// The live config snapshot (cheap atomic load). Introspection surfaces read
@@ -67,43 +83,21 @@ impl OnlineHandler {
     /// Run one request: plugin pre → DAG (4 layers) → plugin post.
     /// The returned context carries the outcome, decision log, billing effects.
     pub async fn run(&self, mut request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
+        if request.request_id.is_empty() {
+            request.request_id = new_request_id();
+        }
         // one consistent snapshot for the whole request
         let snap = self.config.load();
+        let sec = snap.cfg.security_for(&ak.tenant);
         // outbound DLP is a response-buffering boundary: a masked span can
         // straddle deltas, so no engine may stream raw ones — enforced here so
         // no caller can opt out
-        let dlp = snap.cfg.security.dlp_redact;
+        let dlp = sec.dlp_redact;
         if dlp {
             request.stream_tx = None;
         }
-        // blocklist on the ORIGINAL content, before DLP — else a blocklisted term
-        // inside a redacted span (a domain in an email) is masked out and slips
-        if let Some(block) = plugins::security_check(&snap.cfg.security, &mut request) {
-            let mut ctx = DagContext::new(
-                snap.cfg.clone(),
-                snap.state.clone(),
-                self.transport.clone(),
-                request,
-                ak,
-            );
-            ctx.decide(
-                "security_check",
-                format!("blocked (code {})", block.err_code),
-            );
-            let response = GatewayResponse {
-                message: block.message.clone(),
-                finish_reason: "content_filter".to_owned(),
-                ..Default::default()
-            };
-            ctx.outcome = Some(EngineOutcome {
-                response,
-                http_code: 200,
-                block,
-                ..Default::default()
-            });
-            return Ok(ctx);
-        }
-        let redacted = plugins::dlp_redact_request(&snap.cfg.security, &mut request);
+        // scan the ORIGINAL content pre-DLP: a blocklisted term inside a redacted span would slip
+        let scan = plugins::security_check(sec, &mut request);
 
         let mut ctx = DagContext::new(
             snap.cfg.clone(),
@@ -112,8 +106,42 @@ impl OnlineHandler {
             request,
             ak,
         );
+        // every fired rule is recorded (block/flag/shadow alike); only a block-action hit denies
+        for hit in &scan.hits {
+            emit_security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count).await;
+        }
+        if let Some(block) = scan.block {
+            ctx.decide(
+                "security_check",
+                format!("blocked (code {})", block.err_code),
+            );
+            ctx.outcome = Some(content_filter_outcome(block));
+            return Ok(ctx);
+        }
+
+        // pre-DLP text, computed once for moderation and the retained prompt
+        let retention = snap
+            .cfg
+            .retention_for(&ctx.ak.tenant)
+            .copied()
+            .filter(|r| r.content != gw_config::ContentLevel::None);
+        let inbound =
+            (sec.moderate || retention.is_some()).then(|| plugins::inbound_text(&mut ctx.request));
+
+        if sec.moderate
+            && let Some(block) = self
+                .moderate(&ctx, sec, inbound.as_deref().unwrap_or_default())
+                .await
+        {
+            ctx.decide("moderation", "denied");
+            ctx.outcome = Some(content_filter_outcome(block));
+            return Ok(ctx);
+        }
+
+        let redacted = plugins::dlp_redact_request(sec, &mut ctx.request);
         if redacted > 0 {
             ctx.decide("dlp", format!("redacted {redacted} span(s) inbound"));
+            emit_security_event(&ctx, "dlp", "redact", redacted as i64).await;
         }
 
         // a panicking node must refund too, not leak the reserves; unwind-safe —
@@ -148,8 +176,15 @@ impl OnlineHandler {
             outcome.response.model = requested;
         }
 
+        // raw response pre-outbound-DLP, only when full retention can store it (key present)
+        let capture_raw = matches!(retention, Some(r) if r.content == gw_config::ContentLevel::Full)
+            && gw_state::sealing_available();
+        let raw_response = capture_raw
+            .then(|| ctx.outcome.as_ref().map(|o| o.response.message.clone()))
+            .flatten();
+
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
-            let n = plugins::dlp_redact_response(&snap.cfg.security, &mut outcome.response);
+            let n = plugins::dlp_redact_response(sec, &mut outcome.response);
             // raw decoded deltas are pre-redaction; drop them so no downstream
             // reconstruction can replay unmasked text past the boundary
             if dlp {
@@ -159,10 +194,73 @@ impl OnlineHandler {
         } else {
             0
         };
+        if let Some(r) = retention {
+            persist_content(
+                &ctx,
+                r,
+                capture_raw,
+                inbound.unwrap_or_default(),
+                raw_response,
+            )
+            .await;
+        }
         if redacted_out > 0 {
             ctx.decide("dlp", format!("redacted {redacted_out} span(s) outbound"));
+            emit_security_event(&ctx, "dlp", "redact_out", redacted_out as i64).await;
         }
         Ok(ctx)
+    }
+
+    /// Run the wired moderator over raw text; `Some(reason)` to deny, `None` to
+    /// allow. The seam the realtime surface uses (it has no `DagContext`); the
+    /// caller records the security event on its own surface.
+    pub async fn moderate_text(&self, sec: &gw_config::SecurityConf, text: &str) -> Option<String> {
+        match self.moderation(sec, text).await {
+            Moderation::Allow => None,
+            Moderation::Deny(reason) => Some(reason),
+            Moderation::Unavailable => Some(MODERATION_UNAVAILABLE.to_owned()),
+        }
+    }
+
+    /// Run the wired moderator over the request's pre-DLP inbound `text`;
+    /// `Some(Block)` to deny. Records a security event on a moderator deny.
+    async fn moderate(
+        &self,
+        ctx: &DagContext,
+        sec: &gw_config::SecurityConf,
+        text: &str,
+    ) -> Option<Block> {
+        match self.moderation(sec, text).await {
+            Moderation::Allow => None,
+            Moderation::Deny(reason) => {
+                emit_security_event(ctx, "moderation", "block", 1).await;
+                Some(Block::blocked(
+                    reason,
+                    gw_consts::ErrCode::EMPTY_RESP.value() as i32,
+                ))
+            }
+            Moderation::Unavailable => Some(Block::blocked(
+                MODERATION_UNAVAILABLE,
+                gw_consts::ErrCode::SYSTEM_ERROR.value() as i32,
+            )),
+        }
+    }
+
+    /// The one moderator-verdict resolution every surface shares, so the
+    /// fail-open posture can't drift between REST and realtime.
+    async fn moderation(&self, sec: &gw_config::SecurityConf, text: &str) -> Moderation {
+        match self.moderator.review(text).await {
+            Ok(moderation::Verdict::Allow) => Moderation::Allow,
+            Ok(moderation::Verdict::Deny(reason)) => Moderation::Deny(reason),
+            Err(e) => {
+                tracing::warn!(error = %e, fail_open = sec.moderation_fail_open, "moderator error");
+                if sec.moderation_fail_open {
+                    Moderation::Allow
+                } else {
+                    Moderation::Unavailable
+                }
+            }
+        }
     }
 
     /// Derive the upstream policies (timeouts/connect-retries) from `cfg` and
@@ -188,6 +286,137 @@ impl OnlineHandler {
             .collect();
         self.transport.reload_policies(default, per_account);
     }
+}
+
+/// One resolved moderator verdict: `Unavailable` is a moderator error under a
+/// fail-closed posture (fail-open resolves to `Allow`).
+enum Moderation {
+    Allow,
+    Deny(String),
+    Unavailable,
+}
+
+/// A per-request correlation id: `req-<epoch_ms>-<seq>`, time-sortable and
+/// unique within the process (the seq disambiguates same-millisecond requests).
+pub fn new_request_id() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("req-{ms}-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The 200-with-`content_filter` outcome every pre-stage denial returns.
+fn content_filter_outcome(block: Block) -> EngineOutcome {
+    EngineOutcome {
+        response: GatewayResponse {
+            message: block.message.clone(),
+            finish_reason: "content_filter".to_owned(),
+            ..Default::default()
+        },
+        http_code: 200,
+        block,
+        ..Default::default()
+    }
+}
+
+/// Record a content-safety outcome (no prompt text) against this request's
+/// key/user/tenant. Best-effort. Surface = the request protocol, or "batch"
+/// for offline items.
+async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i64) {
+    let surface = if ctx.request.is_online {
+        ctx.request
+            .model_param_v2
+            .as_ref()
+            .map(|p| p.protocol.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    } else {
+        "batch".to_owned()
+    };
+    gw_state::SecurityEvent {
+        created_at_epoch_secs: gw_state::epoch_secs(),
+        request_id: ctx.request.request_id.clone(),
+        ak: ctx.ak.ak.clone(),
+        user_id: ctx.effective_user_id().to_owned(),
+        tenant: ctx.ak.tenant.clone(),
+        surface,
+        rule: rule.to_owned(),
+        action: action.to_owned(),
+        hits,
+    }
+    .record(ctx.state.store.as_ref())
+    .await;
+}
+
+/// Persist this request's prompt and response per the tenant's retention policy.
+/// `inbound` is the pre-DLP prompt text; `store_full` (resolved once by the
+/// caller: full level AND a content key) stores it sealed, else it is stored
+/// PII/secret-stripped — retention owns that redaction, so a row can't hold
+/// raw content even with DLP off. Best-effort — a store failure is logged.
+async fn persist_content(
+    ctx: &DagContext,
+    retention: gw_config::RetentionConf,
+    store_full: bool,
+    inbound: String,
+    raw_response: Option<String>,
+) {
+    if retention.content == gw_config::ContentLevel::Full && !store_full {
+        tracing::warn!("full retention configured but GW_CONTENT_KEY unset; storing redacted text");
+    }
+
+    let now = gw_state::epoch_secs();
+    let expires = if retention.days > 0 {
+        now + retention.days as i64 * 86_400
+    } else {
+        0
+    };
+    let redacted_response = || {
+        plugins::redact_retained(
+            ctx.outcome
+                .as_ref()
+                .map(|o| o.response.message.as_str())
+                .unwrap_or_default(),
+        )
+    };
+    let prompt = if store_full {
+        inbound
+    } else {
+        plugins::redact_retained(&inbound)
+    };
+    let response = if store_full {
+        raw_response.unwrap_or_else(redacted_response)
+    } else {
+        redacted_response()
+    };
+
+    let writes = [("prompt", prompt), ("response", response)]
+        .into_iter()
+        .filter(|(_, text)| !text.is_empty())
+        .map(|(kind, text)| {
+            // seal whenever a key exists (defense in depth even for redacted text)
+            let (content, sealed) = match gw_state::content::seal(&text) {
+                Some(ct) => (ct, true),
+                None => (text, false),
+            };
+            let record = gw_state::ContentRecord {
+                created_at_epoch_secs: now,
+                request_id: ctx.request.request_id.clone(),
+                ak: ctx.ak.ak.clone(),
+                user_id: ctx.effective_user_id().to_owned(),
+                tenant: ctx.ak.tenant.clone(),
+                kind: kind.to_owned(),
+                content,
+                sealed,
+                expires_at_epoch_secs: expires,
+            };
+            async move {
+                if let Err(e) = ctx.state.store.content_add(&record).await {
+                    tracing::warn!(error = %e, kind, "content retention write failed");
+                }
+            }
+        });
+    futures::future::join_all(writes).await;
 }
 
 #[cfg(test)]
@@ -230,6 +459,110 @@ mod tests {
             model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, name)),
             ..Default::default()
         }
+    }
+
+    #[derive(Debug)]
+    struct DenyModerator;
+
+    #[async_trait::async_trait]
+    impl moderation::Moderator for DenyModerator {
+        async fn review(&self, _text: &str) -> Result<moderation::Verdict, String> {
+            Ok(moderation::Verdict::Deny("nope".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn moderator_denies_when_tenant_enables_it() {
+        let mut cfg = GatewayConfig::embedded_default().unwrap();
+        cfg.security.moderate = true;
+        let cfg = Arc::new(cfg);
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
+        .with_moderator(Arc::new(DenyModerator));
+        let ctx = h
+            .run(chat_req("gpt-4o", "hello"), ak(&h).await)
+            .await
+            .unwrap();
+        let out = ctx.outcome.expect("outcome");
+        assert!(out.block.block);
+        assert_eq!(out.response.finish_reason, "content_filter");
+        assert!(
+            h.state()
+                .store
+                .ledger_snapshot(1)
+                .await
+                .unwrap()
+                .1
+                .is_empty(),
+            "a moderated deny bills nothing"
+        );
+    }
+
+    #[derive(Debug)]
+    struct ErrModerator;
+
+    #[async_trait::async_trait]
+    impl moderation::Moderator for ErrModerator {
+        async fn review(&self, _text: &str) -> Result<moderation::Verdict, String> {
+            Err("moderator upstream down".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn moderate_text_allow_deny_and_failure_posture() {
+        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let base = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let mut sec = gw_config::SecurityConf::default();
+        assert_eq!(base.moderate_text(&sec, "x").await, None, "default allows");
+        let deny = base.clone().with_moderator(Arc::new(DenyModerator));
+        assert_eq!(deny.moderate_text(&sec, "x").await.as_deref(), Some("nope"));
+        let err = base.with_moderator(Arc::new(ErrModerator));
+        sec.moderation_fail_open = true;
+        assert_eq!(
+            err.moderate_text(&sec, "x").await,
+            None,
+            "error + fail-open allows"
+        );
+        sec.moderation_fail_open = false;
+        assert!(
+            err.moderate_text(&sec, "x").await.is_some(),
+            "error + fail-closed denies"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_user_budget_denies_over_the_cap() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, user_daily_token_quota: 5}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let with_user = |content: &str| GatewayRequest {
+            is_online: true,
+            message: vec![ChatMsg::text("user", content)],
+            model_param_v2: Some(ModelParamV2::with_name(Protocol::OpenaiChat, "gpt-4o")),
+            user_id: Some("u1".into()),
+            ..Default::default()
+        };
+        h.run(with_user("first burns the budget"), key.clone())
+            .await
+            .unwrap();
+        let err = h
+            .run(with_user("second is over"), key)
+            .await
+            .err()
+            .expect("second denied by the per-user budget");
+        assert_eq!(err.http_status, 429);
     }
 
     #[tokio::test]
@@ -558,6 +891,7 @@ mod tests {
             ak: "ak-t1".into(),
             product: "p".into(),
             tenant: "t1".into(),
+            owner: None,
             qps: 10.0,
             daily_token_quota: 100_000,
             tokens_per_minute: None,
@@ -598,9 +932,11 @@ mod tests {
         let items = vec![
             BatchItem {
                 messages: vec![ChatMsg::text("user", "same prompt")],
+                user: String::new(),
             },
             BatchItem {
                 messages: vec![ChatMsg::text("user", "same prompt")],
+                user: String::new(),
             },
         ];
         let job = off
@@ -623,9 +959,11 @@ mod tests {
                 vec![
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "one")],
+                        user: String::new(),
                     },
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "two")],
+                        user: String::new(),
                     },
                 ],
             )
@@ -639,6 +977,44 @@ mod tests {
         assert_eq!(
             h.state().store.ledger_snapshot(usize::MAX).await.unwrap().0,
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_attributes_each_item_to_its_user() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let off = OfflineHandler::new(h.clone());
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let job = off
+            .submit(
+                key,
+                "gpt-4o".into(),
+                vec![
+                    BatchItem {
+                        messages: vec![ChatMsg::text("user", "for alice")],
+                        user: "alice".into(),
+                    },
+                    BatchItem {
+                        messages: vec![ChatMsg::text("user", "for bob")],
+                        user: "bob".into(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        wait_terminal(&h, &job.id).await;
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        let users: std::collections::HashSet<&str> =
+            ledger.iter().map(|r| r.user_id.as_str()).collect();
+        assert!(
+            users.contains("alice") && users.contains("bob"),
+            "each shared-key batch item bills to its own user: {users:?}"
         );
     }
 
@@ -670,9 +1046,11 @@ mod tests {
                 vec![
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "alpha")],
+                        user: "alice".into(),
                     },
                     BatchItem {
                         messages: vec![ChatMsg::text("user", "beta")],
+                        user: "bob".into(),
                     },
                 ],
             )
@@ -701,5 +1079,12 @@ mod tests {
         let j = completed.expect("drain completed the batch");
         assert_eq!(j.results.len(), 2, "both items executed exactly once");
         assert!(j.results.iter().all(|r| r.ok && r.total_tokens > 0));
+        let (_, ledger) = state.store.ledger_snapshot(usize::MAX).await.unwrap();
+        let users: std::collections::HashSet<&str> =
+            ledger.iter().map(|r| r.user_id.as_str()).collect();
+        assert!(
+            users.contains("alice") && users.contains("bob"),
+            "distributed batch preserved per-item user attribution: {users:?}"
+        );
     }
 }

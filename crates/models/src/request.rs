@@ -12,6 +12,13 @@ pub struct GatewayRequest {
     pub model_param_v2: Option<ModelParamV2>,
     pub ak: String,
     pub is_online: bool,
+    /// End-user attribution from request metadata (OpenAI `user` / Anthropic
+    /// `metadata.user_id` / `x-gw-user`); only trusted when the key is shared —
+    /// a key's own `owner` overrides it at billing.
+    pub user_id: Option<String>,
+    /// Correlation id assigned at ingress; joins access log, ledger, and audit
+    /// events for one request. Empty until the handler stamps it.
+    pub request_id: String,
     /// When set, a streaming-capable engine forwards chunks here as they arrive
     /// instead of buffering; the bounded channel is the backpressure seam.
     pub stream_tx: Option<tokio::sync::mpsc::Sender<crate::StreamChunk>>,
@@ -27,6 +34,16 @@ impl GatewayRequest {
     pub fn account_name(&self) -> &str {
         self.account.as_ref().map(|a| a.name.as_str()).unwrap_or("")
     }
+}
+
+/// One queued batch item: a message list plus the client-supplied end-user
+/// attribution. `user` is persisted with the item so a distributed drainer on
+/// another instance still attributes and budgets it (owner still overrides at
+/// billing time); empty when the submitter gave no `user`/`x-gw-user`.
+#[derive(Debug, Clone)]
+pub struct BatchItem {
+    pub messages: Vec<ChatMsg>,
+    pub user: String,
 }
 
 /// Domain types referenced by `GatewayRequest`. Per-vendor long-tail fields

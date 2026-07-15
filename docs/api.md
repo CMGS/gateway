@@ -20,6 +20,11 @@ error shape, so its SDKs can dispatch on it:
 {"type": "error", "error": {"type": "invalid_request_error", "message": "..."}}
 ```
 
+For per-user attribution on a shared key, send `x-gw-user: <id>` (it also reads
+OpenAI's body `user` field and Anthropic's `metadata.user_id`). A key's own
+`owner` overrides the hint, so a key issued to one user always bills to that
+user. See [Governance](governance.md#per-user-attribution-and-billing).
+
 ## OpenAI-compatible
 
 | Method | Path | Notes |
@@ -89,10 +94,13 @@ A realtime model bound to an account with a real `endpoint` bridges the session
 to that vendor's realtime WebSocket: a transparent relay, with the gateway
 enforcing the same governance chain as the REST path per generation — tenant and
 AK QPS, product/model QPM, per-(key, model) and daily-token quota, TPM — plus
-billing (shared pricing) from the vendor's usage. Content security also applies:
-the blocklist gates inbound frames and DLP redacts text fields in both
-directions (per frame — a PII span straddling two deltas is beyond a relay
-that cannot buffer). Each generation re-checks the
+billing (shared pricing) from the vendor's usage. The full content policy also
+applies, so the WebSocket is not a bypass: the blocklist, regex recognizers, and
+(when enabled) the external moderator gate inbound frames, and DLP — emails,
+phone numbers, and credential masking — redacts text fields in both directions
+(per frame — a PII span straddling two deltas is beyond a relay that cannot
+buffer). Every hit is audited without prompt text; per-user attribution comes
+from the `x-gw-user` hint captured at connect. Each generation re-checks the
 key, so a key banned, expired, or revoked (or a model de-entitled) mid-session
 stops generating. An endpoint-less account serves a local mock session (OpenAI
 Realtime event shape) for offline development.
@@ -122,14 +130,20 @@ surface on a private network regardless.
 | POST | `/admin/reload` | re-read config from source and swap it in atomically (global token only) |
 | PUT | `/admin/config` | validate + publish a new config document to the fleet config store; every instance reloads via the change feed (global token; needs `storage.postgres_url`) |
 | GET | `/admin/keys` | list keys (a tenant token sees only its own tenant's) |
-| POST | `/admin/keys` | create/replace a key: `{ak, product, tenant?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` |
+| POST | `/admin/keys` | create/replace a key: `{ak, product, tenant?, owner?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` (`owner` binds the key to one end user — authoritative for attribution) |
 | PATCH | `/admin/keys/{ak}` | update any of `qps` / `daily_token_quota` / `tokens_per_minute` / `expires_at_epoch_secs` (null clears) / `banned` |
 | DELETE | `/admin/keys/{ak}` | revoke a key |
 | GET | `/admin/usage` | ledger rollup by tenant × model (requests, tokens, charged `cost_micros`, `vendor_cost_micros` for margin); `?tenant=` filter for the global token |
+| GET | `/admin/usage/users` | per-user cost rollup (user × model) over a billing period: `?since=&until=` (unix secs), `?user=` filter, `?format=csv` export; tenant-scoped |
+| GET | `/admin/audit/events` | content-safety hits (blocklist / regex / DLP / moderation) recorded without prompt text; `?limit=`; tenant-scoped |
+| GET | `/admin/audit/ops` | admin-operation trail (key CRUD, config publish, reload) with actor, target, and source IP; `?limit=`; global token only |
+| GET | `/admin/audit/content/{request_id}` | retained prompt/response for one request, unsealed when `GW_CONTENT_KEY` is set (sealed rows without it return `content: null`); tenant-scoped |
 
 Two token tiers: the global token (`admin.token_env`) manages everything; a
-tenant's `admin_token_env` token manages only that tenant's keys and usage
-(cross-tenant keys answer 404, reload/config-publish answer 403).
+tenant's `admin_token_env` token manages only that tenant's keys, usage, and
+content-safety events, scoped to its own tenant (cross-tenant keys answer 404;
+reload, config-publish, and the cross-tenant `/admin/audit/ops` trail answer
+403).
 
 A reload rebuilds the AK table (config keys), models, providers, tenants, and
 accounts while preserving the runtime seams — governance counters, the durable

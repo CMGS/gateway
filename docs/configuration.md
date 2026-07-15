@@ -6,7 +6,9 @@ One YAML file configures the gateway. Resolution order:
 2. otherwise the embedded default (the repo's `conf/gateway.yaml`)
 
 `GW_HOST` / `GW_PORT` override `listen.host` / `listen.port` at runtime
-(the container image sets `GW_HOST=0.0.0.0`).
+(the container image sets `GW_HOST=0.0.0.0`). `GW_CONTENT_KEY` (64 hex chars =
+32 bytes) is the deployment key that seals retained content at rest; without it,
+`full` retention refuses to store raw text and falls back to redacted.
 
 ## Sections
 
@@ -47,6 +49,9 @@ access_keys:
   - ak: ak-demo-123          # bearer / x-api-key value clients send
     product: demo            # product group (for product-level QPM)
     tenant: acme             # optional; absent = the unrestricted `default` tenant
+    owner: alice             # optional; binds the key to one end user (authoritative
+                             # for per-user attribution; a shared key omits it and
+                             # falls back to the request's `x-gw-user` / `user`)
     qps: 100                 # per-key request rate
     daily_token_quota: 1000000
     tokens_per_minute: 600   # optional TPM window limit
@@ -69,11 +74,25 @@ tenants:
     admin_token_env: ACME_ADMIN_TOKEN   # optional tenant-scoped /admin token
     model_prices:            # optional per-model charged-price override for this tenant
       gpt-4o: {input_price_per_1k_micros: 5000, output_price_per_1k_micros: 20000}
+    user_daily_token_quota: 100000  # optional soft per-end-user daily cap
+    security:                # optional; overrides the global `security:` WHOLE for this tenant
+      blocklist: ["forbidden"]
+      blocklist_action: flag        # block | flag | shadow
+      detect_secrets: true
+      regex_rules:
+        - {name: ssn, pattern: '\d{3}-\d{2}-\d{4}', action: block}
+    retention:               # optional prompt/response retention; absent = retain nothing
+      content: redacted      # none | redacted | full  (full needs GW_CONTENT_KEY)
+      days: 30               # purge after N days; 0 = keep until manually purged
 ```
 
 Keys without a `tenant` join the implicit `default` tenant (no pooled limits,
 entitled to every model), so a flat config keeps working unchanged. The model
 catalog (`GET /v1/models`) filters to the caller's entitlement.
+
+`user_daily_token_quota`, `security`, and `retention` are enterprise controls
+detailed in [Governance](governance.md); `security` replaces the global policy
+outright when present (it is not merged field-by-field).
 
 ### `models` — public model names and dispatch
 
@@ -134,9 +153,15 @@ the charged `cost_micros` and margin is queryable per tenant/model via
 ### `security`, `stability`, `products`
 
 ```yaml
-security:
-  dlp_redact: true             # redact emails/phone numbers before egress
-  blocklist: ["badword"]       # reject requests containing listed terms
+security:                      # global default; a tenant may override it whole
+  dlp_redact: true             # redact emails/phone numbers, both directions
+  detect_secrets: true         # also mask API keys / credentials in inbound text
+  blocklist: ["badword"]       # reject/flag requests containing listed terms
+  blocklist_action: block      # block (deny) | flag (record) | shadow (trial a rule)
+  regex_rules:                 # named recognizers, each with its own action
+    - {name: ssn, pattern: '\d{3}-\d{2}-\d{4}', action: block}
+  moderate: false              # route inbound text through the wired external moderator
+  moderation_fail_open: false  # on a moderator error: admit (true) or deny (false)
 
 stability:
   failure_threshold: 3         # consecutive failures before an account cools down
@@ -145,6 +170,20 @@ stability:
 products:
   - name: myproduct
     qpm: 120                   # product-level request rate
+```
+
+Every rule that fires (block / flag / DLP / moderation) is recorded without the
+prompt text to the security-event stream (`GET /admin/audit/events`). The same
+policy runs on the realtime WebSocket, so it is not a bypass. `moderate` needs a
+moderator wired into the handler — the default one allows everything. See
+[Governance](governance.md#enterprise-content-policy).
+
+### Top-level flags
+
+```yaml
+trust_proxy_headers: false     # audit source IP: false = the real TCP peer (unforgeable);
+                               # true = trust x-real-ip / rightmost x-forwarded-for hop
+                               # (only behind a proxy that sets them)
 ```
 
 ## Observability

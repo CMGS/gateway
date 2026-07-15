@@ -71,6 +71,14 @@ impl DagContext {
         self.decisions.push((node, what.into()));
     }
 
+    /// The effective end user: the key's `owner` (authoritative) else request
+    /// metadata; `""` when neither is present. Resolution lives on [`AkInfo`] so
+    /// REST and realtime can't diverge on an empty owner.
+    pub fn effective_user_id(&self) -> &str {
+        self.ak
+            .attributed_user(self.request.user_id.as_deref().unwrap_or_default())
+    }
+
     /// The decision trail as `"stage: detail"` lines.
     pub fn decision_lines(&self) -> impl Iterator<Item = String> + '_ {
         self.decisions.iter().map(|(n, w)| format!("{n}: {w}"))
