@@ -419,11 +419,13 @@ async fn realtime_session(
                 .await;
             continue;
         };
-        // same blocklist + inbound DLP every REST surface runs, tenant policy first
+        // same policy (blocklist + regex + actions) + inbound DLP every REST
+        // surface runs, tenant policy first
         let cfg = s.handler.cfg();
         let sec = cfg.security_for(&ak.tenant);
-        if let Some(block) = gw_handler::plugins::realtime_frame_blocked(sec, &mut ev) {
-            emit_rt_block(&s, &ak).await;
+        let scan = gw_handler::plugins::realtime_frame_scan(sec, &mut ev);
+        emit_rt_hits(&s, &ak, &scan.hits).await;
+        if let Some(block) = scan.block {
             let _ = socket
                 .send(send(json!({"type":"error","message": block.message})))
                 .await;
@@ -582,11 +584,13 @@ async fn realtime_bridge(
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
                 };
                 if let Some(mut frame) = frame {
-                    // same blocklist + inbound DLP every REST surface runs, tenant policy first
+                    // same policy (blocklist + regex + actions) + inbound DLP every
+                    // REST surface runs, tenant policy first
                     let cfg = s.handler.cfg();
                     let sec = cfg.security_for(&ak.tenant);
-                    if let Some(block) = gw_handler::plugins::realtime_frame_blocked(sec, &mut frame) {
-                        emit_rt_block(&s, &ak).await;
+                    let scan = gw_handler::plugins::realtime_frame_scan(sec, &mut frame);
+                    emit_rt_hits(&s, &ak, &scan.hits).await;
+                    if let Some(block) = scan.block {
                         if cl_tx
                             .send(CMsg::Text(send_err(block.message).to_string().into()))
                             .await
@@ -952,32 +956,39 @@ fn q_num<T: std::str::FromStr>(
     q.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// Record a realtime blocklist block to the security-event stream (parity with
-/// the REST surfaces). Per-frame DLP redactions are not recorded — too hot.
-async fn emit_rt_block(s: &AppState, ak: &AkInfo) {
-    let event = gw_state::SecurityEvent {
-        created_at_epoch_secs: gw_state::epoch_secs(),
-        request_id: String::new(),
-        ak: ak.ak.clone(),
-        user_id: ak.owner.clone().unwrap_or_default(),
-        tenant: ak.tenant.clone(),
-        surface: "realtime".to_owned(),
-        rule: "blocklist".to_owned(),
-        action: "block".to_owned(),
-        hits: 1,
-    };
-    if let Err(e) = s.handler.state().store.security_event_add(&event).await {
-        tracing::warn!(error = %e, "realtime security event write failed");
+/// Record a realtime frame's content-safety hits to the security-event stream
+/// (parity with the REST surfaces). Per-frame DLP redactions are not recorded —
+/// too hot.
+async fn emit_rt_hits(s: &AppState, ak: &AkInfo, hits: &[gw_handler::plugins::RuleHit]) {
+    for hit in hits {
+        let event = gw_state::SecurityEvent {
+            created_at_epoch_secs: gw_state::epoch_secs(),
+            request_id: String::new(),
+            ak: ak.ak.clone(),
+            user_id: ak.owner.clone().unwrap_or_default(),
+            tenant: ak.tenant.clone(),
+            surface: "realtime".to_owned(),
+            rule: hit.rule.clone(),
+            action: hit.action.as_str().to_owned(),
+            hits: hit.count,
+        };
+        if let Err(e) = s.handler.state().store.security_event_add(&event).await {
+            tracing::warn!(error = %e, "realtime security event write failed");
+        }
     }
 }
 
-/// The caller IP for the audit trail, from the LB's forwarding headers.
+/// The caller IP for the audit trail. Prefers `x-real-ip` (the immediate peer
+/// the trusted proxy sets) and, failing that, the RIGHTMOST `x-forwarded-for`
+/// hop (appended by that proxy) — never the leftmost, which a client can forge.
 fn source_ip(headers: &HeaderMap) -> String {
+    if let Some(ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        return ip.trim().to_owned();
+    }
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .and_then(|v| v.rsplit(',').next())
         .map(|s| s.trim().to_owned())
         .unwrap_or_default()
 }
@@ -1337,7 +1348,16 @@ async fn admin_key_list(
     };
     let offset = q_num(&q, "offset", 0);
     let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT);
-    let listed = match s.handler.state().auth.list(offset, limit).await {
+    // filter by the caller's scope IN the store, before paging, so a tenant
+    // admin's page isn't emptied by a post-hoc filter over the global table
+    let tenant = scope.tenant_filter(&q);
+    let listed = match s
+        .handler
+        .state()
+        .auth
+        .list(tenant.as_deref(), offset, limit)
+        .await
+    {
         Ok(v) => v,
         Err(e) => return gateway_error(e),
     };
@@ -1428,12 +1448,24 @@ async fn admin_usage_users(
     Json(json!({ "usage": usage })).into_response()
 }
 
-/// Quote a CSV field that may contain a comma, quote, or newline (RFC 4180).
+/// A CSV field, RFC-4180 quoted AND neutralized against spreadsheet formula
+/// injection: a field opening with a formula trigger (`= + - @` / tab / CR) is
+/// prefixed with `'` so Excel/Sheets treat it as text (the value is
+/// attacker-controlled — it can carry a user id).
 fn csv_field(s: &str) -> String {
-    if s.contains([',', '"', '\n']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
+    let needs_prefix = s
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'));
+    let body = if needs_prefix {
+        format!("'{s}")
     } else {
         s.to_owned()
+    };
+    if body.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", body.replace('"', "\"\""))
+    } else {
+        body
     }
 }
 
@@ -2934,6 +2966,31 @@ mod tests {
             .unwrap();
         assert_eq!(by_user.len(), 1);
         assert!(by_user[0].total_tokens > 0);
+    }
+
+    #[test]
+    fn source_ip_prefers_trusted_hop_over_spoofable_xff() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "1.2.3.4, 10.0.0.9".parse().unwrap());
+        assert_eq!(source_ip(&h), "10.0.0.9", "rightmost (proxy-appended) hop");
+        h.insert("x-real-ip", "10.0.0.5".parse().unwrap());
+        assert_eq!(source_ip(&h), "10.0.0.5", "x-real-ip wins over XFF");
+    }
+
+    #[test]
+    fn csv_field_neutralizes_formula_injection() {
+        assert_eq!(csv_field("alice"), "alice");
+        assert_eq!(
+            csv_field("+cmd"),
+            "'+cmd",
+            "formula trigger prefixed with '"
+        );
+        assert_eq!(
+            csv_field("=SUM(A1,A2)"),
+            "\"'=SUM(A1,A2)\"",
+            "prefixed AND quoted (has a comma)"
+        );
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
     }
 
     #[tokio::test]

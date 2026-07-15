@@ -611,6 +611,16 @@ impl GatewayConfig {
         check_unique("product", self.products.iter().map(|p| p.name.as_str()))?;
         check_unique("provider", self.providers.iter().map(|p| p.name.as_str()))?;
         check_unique("tenant", self.tenants.iter().map(|t| t.name.as_str()))?;
+        // ':' separates the per-user budget counter key `ub:{tenant}:{user}`, so a
+        // colon in a tenant name could alias another tenant's budget counter
+        for t in &self.tenants {
+            if t.name.contains(':') {
+                return Err(ConfigError::DuplicateName {
+                    kind: "tenant (':' not allowed in name)",
+                    name: t.name.clone(),
+                });
+            }
+        }
         // a typo'd tenant would silently fall back to the unrestricted default — reject at load
         for k in &self.access_keys {
             if !self.is_known_tenant(&k.tenant) {
@@ -1066,6 +1076,12 @@ tenants: [{name: t1}, {name: t1}]
             GatewayConfig::from_yaml(dup),
             Err(ConfigError::DuplicateName { kind: "tenant", .. })
         ));
+
+        let colon = "listen: {host: h, port: 1}\ntenants: [{name: 'a:b'}]";
+        assert!(
+            GatewayConfig::from_yaml(colon).is_err(),
+            "a colon in a tenant name is rejected (budget-key aliasing)"
+        );
 
         let bad_quota = r#"
 listen: {host: h, port: 1}

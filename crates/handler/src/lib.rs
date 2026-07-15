@@ -80,7 +80,7 @@ async fn persist_content(
     } else {
         0
     };
-    let redacted_prompt = || joined_message_text(&ctx.request);
+    let redacted_prompt = || plugins::inbound_text(&ctx.request);
     let redacted_response = || {
         ctx.outcome
             .as_ref()
@@ -130,17 +130,6 @@ async fn persist_content(
             tracing::warn!(error = %e, kind, "content retention write failed");
         }
     }
-}
-
-/// The request's message contents joined with newlines — the text moderation
-/// and content retention operate on.
-fn joined_message_text(request: &GatewayRequest) -> String {
-    request
-        .message
-        .iter()
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// A per-request correlation id: `req-<epoch_ms>-<seq>`, time-sortable and
@@ -283,7 +272,7 @@ impl OnlineHandler {
         let retention = snap.cfg.retention_for(&ctx.ak.tenant).copied();
         let capture_raw = matches!(retention, Some(r) if r.content == gw_config::ContentLevel::Full)
             && gw_state::sealing_available();
-        let raw_prompt = capture_raw.then(|| joined_message_text(&ctx.request));
+        let raw_prompt = capture_raw.then(|| plugins::inbound_text(&ctx.request));
 
         let redacted = plugins::dlp_redact_request(sec, &mut ctx.request);
         if redacted > 0 {
@@ -353,7 +342,7 @@ impl OnlineHandler {
     /// deny. A moderator error resolves per `moderation_fail_open`. Records a
     /// security event on a deny.
     async fn moderate(&self, ctx: &DagContext, sec: &gw_config::SecurityConf) -> Option<Block> {
-        let text = joined_message_text(&ctx.request);
+        let text = plugins::inbound_text(&ctx.request);
         match self.moderator.review(&text).await {
             Ok(moderation::Verdict::Allow) => None,
             Ok(moderation::Verdict::Deny(reason)) => {

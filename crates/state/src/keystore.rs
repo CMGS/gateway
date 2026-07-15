@@ -31,9 +31,12 @@ pub trait KeyStore: Send + Sync + std::fmt::Debug {
     async fn patch(&self, ak: &str, patch: &KeyPatch) -> GResult<Option<AkInfo>>;
     /// Remove a key regardless of source; whether it existed.
     async fn revoke(&self, ak: &str) -> GResult<bool>;
-    /// A page of keys, sorted by ak (stable). `offset`/`limit` bound the scan so
-    /// a fleet key table with millions of rows never loads whole.
-    async fn list(&self, offset: usize, limit: usize) -> GResult<Vec<AkInfo>>;
+    /// A page of keys, sorted by ak (stable), optionally confined to one tenant
+    /// (a tenant admin's scope). `offset`/`limit` bound the scan so a fleet key
+    /// table with millions of rows never loads whole — and the tenant filter
+    /// applies BEFORE paging, so a scoped page isn't emptied by a later filter.
+    async fn list(&self, tenant: Option<&str>, offset: usize, limit: usize)
+    -> GResult<Vec<AkInfo>>;
     /// Re-apply the config file's key set, leaving admin-created keys untouched.
     async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> GResult<()>;
 }
@@ -187,12 +190,18 @@ impl KeyStore for PostgresKeyStore {
         Ok(n > 0)
     }
 
-    async fn list(&self, offset: usize, limit: usize) -> GResult<Vec<AkInfo>> {
+    async fn list(
+        &self,
+        tenant: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> GResult<Vec<AkInfo>> {
         let rows = sqlx::query(
             "SELECT ak, product, tenant, qps, daily_token_quota, tokens_per_minute,
              expires_at_epoch_secs, banned, model_quotas, owner FROM access_keys
-             ORDER BY ak LIMIT $1 OFFSET $2",
+             WHERE ($1::text IS NULL OR tenant = $1) ORDER BY ak LIMIT $2 OFFSET $3",
         )
+        .bind(tenant)
         .bind(limit.min(i64::MAX as usize) as i64)
         .bind(offset.min(i64::MAX as usize) as i64)
         .fetch_all(&self.pool)

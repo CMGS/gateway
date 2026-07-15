@@ -170,9 +170,15 @@ impl AkAuth {
         Some(e.0.clone())
     }
 
-    /// A page of keys, sorted by ak (stable), `offset..offset+limit`.
-    pub fn list(&self, offset: usize, limit: usize) -> Vec<AkInfo> {
-        let mut keys: Vec<AkInfo> = self.keys.iter().map(|e| e.value().0.clone()).collect();
+    /// A page of keys, sorted by ak (stable), optionally confined to `tenant`,
+    /// `offset..offset+limit` — the filter applies before paging.
+    pub fn list(&self, tenant: Option<&str>, offset: usize, limit: usize) -> Vec<AkInfo> {
+        let mut keys: Vec<AkInfo> = self
+            .keys
+            .iter()
+            .map(|e| e.value().0.clone())
+            .filter(|k| tenant.is_none_or(|t| t == k.tenant))
+            .collect();
         keys.sort_by(|a, b| a.ak.cmp(&b.ak));
         keys.into_iter().skip(offset).take(limit).collect()
     }
@@ -210,8 +216,13 @@ impl KeyStore for AkAuth {
     async fn revoke(&self, ak: &str) -> gw_models::GResult<bool> {
         Ok(AkAuth::revoke(self, ak))
     }
-    async fn list(&self, offset: usize, limit: usize) -> gw_models::GResult<Vec<AkInfo>> {
-        Ok(AkAuth::list(self, offset, limit))
+    async fn list(
+        &self,
+        tenant: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> gw_models::GResult<Vec<AkInfo>> {
+        Ok(AkAuth::list(self, tenant, offset, limit))
     }
     async fn reload_config_keys(&self, keys: &[gw_config::AkConf]) -> gw_models::GResult<()> {
         AkAuth::reload_config_keys(self, keys);
