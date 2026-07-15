@@ -994,19 +994,45 @@ async fn emit_rt_hits(
     }
 }
 
-/// The caller IP for the audit trail. Prefers `x-real-ip` (the immediate peer
-/// the trusted proxy sets) and, failing that, the RIGHTMOST `x-forwarded-for`
-/// hop (appended by that proxy) — never the leftmost, which a client can forge.
-fn source_ip(headers: &HeaderMap) -> String {
-    if let Some(ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        return ip.trim().to_owned();
+/// The connecting peer's socket address, read from the connect-info extension.
+/// An infallible extractor: `None` when the router is driven without connect
+/// info (the test harness), `Some` when served over a real listener.
+struct ClientPeer(Option<std::net::SocketAddr>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ClientPeer {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(ClientPeer(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|ci| ci.0),
+        ))
     }
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit(',').next())
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default()
+}
+
+/// The caller IP for the audit trail. Roots at the real TCP `peer`, which a
+/// client cannot forge. Only when `trust_proxy` is set (a trusted proxy fronts
+/// the gateway) does it read `x-real-ip`, then the RIGHTMOST `x-forwarded-for`
+/// hop (the one that proxy appended) — never the leftmost, which a client forges.
+fn source_ip(peer: Option<std::net::SocketAddr>, headers: &HeaderMap, trust_proxy: bool) -> String {
+    if trust_proxy {
+        if let Some(ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+            return ip.trim().to_owned();
+        }
+        if let Some(ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+        {
+            return ip.trim().to_owned();
+        }
+    }
+    peer.map(|p| p.ip().to_string()).unwrap_or_default()
 }
 
 /// Record one admin-plane mutation to the audit trail (who/what/when/where).
@@ -1015,6 +1041,7 @@ async fn audit_admin(
     s: &AppState,
     scope: &AdminScope,
     headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
     action: &str,
     target: &str,
     summary: String,
@@ -1027,7 +1054,7 @@ async fn audit_admin(
         action: action.to_owned(),
         target: target.to_owned(),
         summary,
-        source_ip: source_ip(headers),
+        source_ip: source_ip(peer, headers, s.handler.cfg().trust_proxy_headers),
     };
     if let Err(e) = s.handler.state().store.admin_audit_add(&entry).await {
         tracing::warn!(error = %e, action, "admin audit write failed");
@@ -1128,7 +1155,11 @@ fn ct_eq(a: &str, b: &str) -> bool {
 
 /// POST /admin/reload — re-read config from source and swap it in atomically;
 /// governance, store, health, and cache are preserved.
-async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response {
+async fn admin_reload(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    ClientPeer(peer): ClientPeer,
+) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
@@ -1145,6 +1176,7 @@ async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response
                 &s,
                 &AdminScope::Global,
                 &headers,
+                peer,
                 "reload",
                 "",
                 String::new(),
@@ -1170,6 +1202,7 @@ async fn admin_reload(State(s): State<AppState>, headers: HeaderMap) -> Response
 async fn admin_key_create(
     State(s): State<AppState>,
     headers: HeaderMap,
+    ClientPeer(peer): ClientPeer,
     Json(body): Json<Value>,
 ) -> Response {
     let scope = match admin_auth(&s, &headers) {
@@ -1231,6 +1264,7 @@ async fn admin_key_create(
         &s,
         &scope,
         &headers,
+        peer,
         "key_create",
         ak,
         format!("tenant={tenant}"),
@@ -1247,6 +1281,7 @@ async fn admin_key_create(
 async fn admin_key_patch(
     State(s): State<AppState>,
     headers: HeaderMap,
+    ClientPeer(peer): ClientPeer,
     Path(ak): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
@@ -1274,7 +1309,7 @@ async fn admin_key_patch(
     match patched {
         Err(e) => gateway_error(e),
         Ok(Some(info)) => {
-            audit_admin(&s, &scope, &headers, "key_patch", &ak, String::new()).await;
+            audit_admin(&s, &scope, &headers, peer, "key_patch", &ak, String::new()).await;
             (StatusCode::OK, Json(ak_public_json(&info))).into_response()
         }
         Ok(None) => error_response(404, format!("key {ak} not found")),
@@ -1285,6 +1320,7 @@ async fn admin_key_patch(
 async fn admin_key_delete(
     State(s): State<AppState>,
     headers: HeaderMap,
+    ClientPeer(peer): ClientPeer,
     Path(ak): Path<String>,
 ) -> Response {
     let scope = match admin_auth(&s, &headers) {
@@ -1297,7 +1333,7 @@ async fn admin_key_delete(
     match s.handler.state().auth.revoke(&ak).await {
         Err(e) => gateway_error(e),
         Ok(true) => {
-            audit_admin(&s, &scope, &headers, "key_delete", &ak, String::new()).await;
+            audit_admin(&s, &scope, &headers, peer, "key_delete", &ak, String::new()).await;
             (
                 StatusCode::OK,
                 Json(json!({ "ak": ak, "status": "revoked" })),
@@ -1310,7 +1346,12 @@ async fn admin_key_delete(
 
 /// PUT /admin/config — validate, publish to the fleet config store, and reload
 /// this instance; peers converge via the store's change feed. Global admin only.
-async fn admin_config_put(State(s): State<AppState>, headers: HeaderMap, body: String) -> Response {
+async fn admin_config_put(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    ClientPeer(peer): ClientPeer,
+    body: String,
+) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
@@ -1339,6 +1380,7 @@ async fn admin_config_put(State(s): State<AppState>, headers: HeaderMap, body: S
         &s,
         &AdminScope::Global,
         &headers,
+        peer,
         "config_publish",
         &version.to_string(),
         detail,
@@ -3009,12 +3051,22 @@ mod tests {
     }
 
     #[test]
-    fn source_ip_prefers_trusted_hop_over_spoofable_xff() {
+    fn source_ip_roots_at_peer_and_ignores_forgeable_headers_untrusted() {
+        let peer: std::net::SocketAddr = "203.0.113.7:5000".parse().unwrap();
         let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", "1.2.3.4, 10.0.0.9".parse().unwrap());
-        assert_eq!(source_ip(&h), "10.0.0.9", "rightmost (proxy-appended) hop");
         h.insert("x-real-ip", "10.0.0.5".parse().unwrap());
-        assert_eq!(source_ip(&h), "10.0.0.5", "x-real-ip wins over XFF");
+        h.insert("x-forwarded-for", "1.2.3.4, 10.0.0.9".parse().unwrap());
+        // default (untrusted): the client's headers are ignored, the TCP peer wins
+        assert_eq!(source_ip(Some(peer), &h, false), "203.0.113.7");
+        assert_eq!(
+            source_ip(None, &h, false),
+            "",
+            "no peer, no forgeable header"
+        );
+        // trusted proxy: x-real-ip, then the rightmost (proxy-appended) XFF hop
+        assert_eq!(source_ip(Some(peer), &h, true), "10.0.0.5");
+        h.remove("x-real-ip");
+        assert_eq!(source_ip(Some(peer), &h, true), "10.0.0.9", "rightmost hop");
     }
 
     #[test]

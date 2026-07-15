@@ -466,6 +466,11 @@ pub struct GatewayConfig {
     /// Admin surface gate (dynamic config reload / key management).
     #[serde(default)]
     pub admin: AdminConf,
+    /// Trust `x-real-ip` / `x-forwarded-for` for the audit source IP. Off by
+    /// default: the audit records the real TCP peer, which a client can't forge.
+    /// Enable only when a trusted proxy fronts the gateway and sets those headers.
+    #[serde(default)]
+    pub trust_proxy_headers: bool,
     /// Stable hash of the source document; see [`Self::generation`].
     #[serde(skip)]
     generation: u64,
