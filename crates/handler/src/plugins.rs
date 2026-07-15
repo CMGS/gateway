@@ -4,40 +4,78 @@
 //! typed params. The post-stage redacts the outbound message; streaming
 //! surfaces buffer and replay the redacted text when outbound DLP is on.
 
-use gw_config::SecurityConf;
+use gw_config::{Action, SecurityConf};
 use gw_models::{Block, GatewayRequest, GatewayResponse};
 
 const BLOCKED_MSG: &str = "this content cannot be answered, please try a different request";
 
-/// Blocklist check. Returns Block on a hit (block=true implies hit=true).
-/// Scans the same inbound text DLP covers, so no surface is a bypass; takes
-/// `&mut` only to share the one traversal with the redaction pass.
-pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> Option<Block> {
-    if sec.blocklist.is_empty() {
-        return None;
+/// One content rule that fired on a request, for the security-event stream.
+pub struct RuleHit {
+    pub rule: String,
+    pub action: Action,
+    pub count: i64,
+}
+
+/// The result of scanning one request: whether to deny it, plus every rule that
+/// fired (for the audit stream). A `block`-action hit fills `block`; `flag`/
+/// `shadow` hits only populate `hits`.
+#[derive(Default)]
+pub struct ScanOutcome {
+    pub block: Option<Block>,
+    pub hits: Vec<RuleHit>,
+}
+
+/// Scan inbound text against the blocklist and the regex recognizers. One
+/// traversal of the same fields DLP covers, so no surface is a bypass. `&mut`
+/// only to share the traversal; nothing is rewritten here.
+pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanOutcome {
+    if sec.blocklist.is_empty() && sec.regexes.is_empty() {
+        return ScanOutcome::default();
     }
-    // the shared traversal counts hits; a String is never rewritten here
-    let mut scan = |s: &mut String| usize::from(blocklist_hit(sec, s));
-    let mut blocked = 0;
+    let mut blocklist_count = 0i64;
+    let mut regex_counts = vec![0i64; sec.regexes.len()];
+    let mut visit = |s: &mut String| {
+        blocklist_count += i64::from(blocklist_hit(sec, s));
+        for (i, r) in sec.regexes.iter().enumerate() {
+            regex_counts[i] += r.re.find_iter(s).count() as i64;
+        }
+        0
+    };
     for msg in &mut request.message {
-        blocked += usize::from(blocklist_hit(sec, &msg.content));
+        visit(&mut msg.content);
         if let Some(parts) = &mut msg.parts {
-            blocked += walk_json_strings(parts, &mut scan);
+            walk_json_strings(parts, &mut visit);
         }
     }
     if let Some(param) = request.model_param_v2.as_mut() {
-        blocked += walk_json_strings(&mut param.raw, &mut scan);
+        walk_json_strings(&mut param.raw, &mut visit);
         if let Some(typed) = param.typed.as_mut() {
-            blocked += for_each_typed_text(typed, &mut scan);
+            for_each_typed_text(typed, &mut visit);
         }
     }
-    if blocked > 0 {
-        return Some(Block::blocked(
-            BLOCKED_MSG,
-            gw_consts::ErrCode::EMPTY_RESP.value() as i32,
-        ));
+
+    let mut hits = Vec::new();
+    if blocklist_count > 0 {
+        hits.push(RuleHit {
+            rule: "blocklist".to_owned(),
+            action: sec.blocklist_action,
+            count: blocklist_count,
+        });
     }
-    None
+    for (r, count) in sec.regexes.iter().zip(regex_counts) {
+        if count > 0 {
+            hits.push(RuleHit {
+                rule: r.name.clone(),
+                action: r.action,
+                count,
+            });
+        }
+    }
+    let block = hits
+        .iter()
+        .any(|h| h.action == Action::Block)
+        .then(|| Block::blocked(BLOCKED_MSG, gw_consts::ErrCode::EMPTY_RESP.value() as i32));
+    ScanOutcome { block, hits }
 }
 
 /// Case-insensitive blocklist test; terms are pre-lowercased at config load.
@@ -122,46 +160,59 @@ pub fn dlp_redact_realtime_frame(sec: &SecurityConf, frame: &mut serde_json::Val
     gw_engines::realtime::visit_frame_text(frame, &mut redact_str)
 }
 
-/// DLP inbound redaction: emails and 11-digit phone numbers.
+/// DLP inbound redaction: emails, 11-digit phone numbers, and — when
+/// `detect_secrets` is on — API keys / credentials.
 pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> usize {
-    if !sec.dlp_redact {
+    if !sec.dlp_redact && !sec.detect_secrets {
         return 0;
     }
+    let secrets = sec.detect_secrets;
+    let pii = sec.dlp_redact;
+    let mut redact_field = |s: &mut String| redact_in_place(s, pii, secrets);
     let mut hits = 0;
     for msg in &mut request.message {
-        hits += redact_str(&mut msg.content);
+        hits += redact_field(&mut msg.content);
         // engines forward `parts` (not `content`) when present, so PII must be
         // scrubbed inside the parts' text blocks too
         if let Some(parts) = &mut msg.parts {
-            hits += redact_parts_text(parts);
+            hits += redact_parts_text(parts, pii, secrets);
         }
     }
     // non-chat surfaces carry user text outside `message` (Responses raw body,
     // family typed params) — scrub those too or they reach the vendor unredacted
     if let Some(param) = request.model_param_v2.as_mut() {
-        hits += walk_json_strings(&mut param.raw, &mut redact_str);
+        hits += walk_json_strings(&mut param.raw, &mut redact_field);
         if let Some(typed) = param.typed.as_mut() {
-            hits += for_each_typed_text(typed, &mut redact_str);
+            hits += for_each_typed_text(typed, &mut redact_field);
         }
     }
     hits
 }
 
-/// Redact one string in place; the hit count.
-fn redact_str(s: &mut String) -> usize {
-    match redact(s) {
-        Some((redacted, n)) => {
-            *s = redacted;
-            n
-        }
-        None => 0,
+/// Redact one string in place (email/phone via `pii`, secrets via `secrets`);
+/// the hit count.
+fn redact_in_place(s: &mut String, pii: bool, secrets: bool) -> usize {
+    let mut hits = 0;
+    if pii && let Some((redacted, n)) = redact(s) {
+        *s = redacted;
+        hits += n;
     }
+    if secrets && let Some((redacted, n)) = redact_secrets(s) {
+        *s = redacted;
+        hits += n;
+    }
+    hits
+}
+
+/// Redact one string in place; email/phone only (the outbound/realtime path).
+fn redact_str(s: &mut String) -> usize {
+    redact_in_place(s, true, false)
 }
 
 /// Redact PII inside a multimodal `parts` array's text blocks, in place.
 /// Deliberately narrower than the blocklist scan: non-text parts (image URLs,
 /// base64 data) are never rewritten, so a redaction can't corrupt them.
-fn redact_parts_text(parts: &mut serde_json::Value) -> usize {
+fn redact_parts_text(parts: &mut serde_json::Value, pii: bool, secrets: bool) -> usize {
     let Some(arr) = parts.as_array_mut() else {
         return 0;
     };
@@ -169,13 +220,34 @@ fn redact_parts_text(parts: &mut serde_json::Value) -> usize {
     for p in arr {
         if p["type"] == "text"
             && let Some(t) = p["text"].as_str()
-            && let Some((redacted, n)) = redact(t)
         {
-            p["text"] = serde_json::Value::String(redacted);
-            hits += n;
+            let mut s = t.to_owned();
+            let n = redact_in_place(&mut s, pii, secrets);
+            if n > 0 {
+                p["text"] = serde_json::Value::String(s);
+                hits += n;
+            }
         }
     }
     hits
+}
+
+/// Mask credential shapes (API keys, tokens, private-key headers) with
+/// `[REDACTED_SECRET]`. High-precision patterns to avoid mauling normal text.
+fn redact_secrets(text: &str) -> Option<(String, usize)> {
+    static SECRETS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        #[allow(clippy::expect_used)] // a compile-time literal, covered by tests
+        regex::Regex::new(
+            r"sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----",
+        )
+        .expect("static secret patterns compile")
+    });
+    let mut count = 0;
+    let out = SECRETS.replace_all(text, |_: &regex::Captures| {
+        count += 1;
+        "[REDACTED_SECRET]"
+    });
+    (count > 0).then(|| (out.into_owned(), count))
 }
 
 /// DLP outbound redaction: the flat `message` plus the structured payloads the
@@ -307,10 +379,14 @@ mod tests {
             message: vec![ChatMsg::text("user", "say ForbiddenWord now")],
             ..Default::default()
         };
-        let block = security_check(&sec(), &mut req).unwrap();
+        let block = security_check(&sec(), &mut req).block.unwrap();
         assert!(block.block && block.hit);
         assert_eq!(block.err_code, 4003);
-        assert!(security_check(&sec(), &mut GatewayRequest::default()).is_none());
+        assert!(
+            security_check(&sec(), &mut GatewayRequest::default())
+                .block
+                .is_none()
+        );
     }
 
     #[test]
@@ -324,12 +400,59 @@ mod tests {
             message: vec![ChatMsg::text("user", "前文 FORBIDDENWORD 后文")],
             ..Default::default()
         };
-        assert!(security_check(&s, &mut req).is_some());
+        assert!(security_check(&s, &mut req).block.is_some());
         let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "包含 禁词 的内容")],
             ..Default::default()
         };
-        assert!(security_check(&s, &mut req).is_some());
+        assert!(security_check(&s, &mut req).block.is_some());
+    }
+
+    #[test]
+    fn flag_action_records_a_hit_without_blocking() {
+        let s = SecurityConf {
+            blocklist: vec!["watchword".into()],
+            blocklist_action: Action::Flag,
+            ..Default::default()
+        };
+        let mut req = GatewayRequest {
+            message: vec![ChatMsg::text("user", "contains watchword here")],
+            ..Default::default()
+        };
+        let out = security_check(&s, &mut req);
+        assert!(out.block.is_none(), "flag does not deny");
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].action, Action::Flag);
+    }
+
+    #[test]
+    fn regex_rule_blocks_and_redact_secrets_masks() {
+        let mut s = SecurityConf {
+            regex_rules: vec![gw_config::RegexRule {
+                name: "ssn".into(),
+                pattern: r"\d{3}-\d{2}-\d{4}".into(),
+                action: Action::Block,
+            }],
+            ..Default::default()
+        };
+        // compile_security runs at config load; replicate it for the unit test
+        s.regexes = vec![gw_config::CompiledRule {
+            name: "ssn".into(),
+            action: Action::Block,
+            re: regex::Regex::new(r"\d{3}-\d{2}-\d{4}").unwrap(),
+        }];
+        let mut req = GatewayRequest {
+            message: vec![ChatMsg::text("user", "my ssn is 123-45-6789")],
+            ..Default::default()
+        };
+        assert!(
+            security_check(&s, &mut req).block.is_some(),
+            "regex Block denies"
+        );
+
+        let (masked, n) = redact_secrets("key sk-abcdefghijklmnopqrstuvwxyz012345 end").unwrap();
+        assert_eq!(n, 1);
+        assert!(masked.contains("[REDACTED_SECRET]") && !masked.contains("sk-abc"));
     }
 
     #[test]

@@ -403,8 +403,9 @@ async fn realtime_session(
                 .await;
             continue;
         };
-        // same blocklist + inbound DLP every REST surface runs
-        let sec = &s.handler.cfg().security;
+        // same blocklist + inbound DLP every REST surface runs, tenant policy first
+        let cfg = s.handler.cfg();
+        let sec = cfg.security_for(&ak.tenant);
         if let Some(block) = gw_handler::plugins::realtime_frame_blocked(sec, &mut ev) {
             emit_rt_block(&s, &ak).await;
             let _ = socket
@@ -565,8 +566,9 @@ async fn realtime_bridge(
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
                 };
                 if let Some(mut frame) = frame {
-                    // same blocklist + inbound DLP every REST surface runs
-                    let sec = &s.handler.cfg().security;
+                    // same blocklist + inbound DLP every REST surface runs, tenant policy first
+                    let cfg = s.handler.cfg();
+                    let sec = cfg.security_for(&ak.tenant);
                     if let Some(block) = gw_handler::plugins::realtime_frame_blocked(sec, &mut frame) {
                         emit_rt_block(&s, &ak).await;
                         if cl_tx
@@ -686,9 +688,10 @@ async fn realtime_bridge(
                         }
                         // outbound DLP, per frame (a span straddling deltas is
                         // beyond a relay that cannot buffer)
+                        let cfg = s.handler.cfg();
                         if relay
                             && gw_handler::plugins::dlp_redact_realtime_frame(
-                                &s.handler.cfg().security,
+                                cfg.security_for(&ak.tenant),
                                 &mut v,
                             ) > 0
                         {
@@ -1632,7 +1635,7 @@ fn spawn_stream_pipeline(
     started: Instant,
 ) -> tokio::sync::mpsc::Receiver<gw_engines::StreamChunk> {
     let (tx, rx) = tokio::sync::mpsc::channel::<gw_engines::StreamChunk>(STREAM_CHANNEL_CAP);
-    let dlp = s.handler.cfg().security.dlp_redact;
+    let dlp = s.handler.cfg().security_for(&ak.tenant).dlp_redact;
     if !dlp {
         request.stream_tx = Some(tx.clone());
     }

@@ -815,6 +815,7 @@ dependencies = [
  "gw-engines",
  "gw-models",
  "gw-state",
+ "regex",
  "serde_json",
  "tokio",
  "tracing",

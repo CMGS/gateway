@@ -683,6 +683,19 @@ impl GatewayConfig {
         Ok(())
     }
 
+    /// The effective content-safety policy for `tenant`: the tenant's own
+    /// override when present, else the global `security:`.
+    pub fn security_for(&self, tenant: &str) -> &SecurityConf {
+        self.find_tenant(tenant)
+            .and_then(|t| t.security.as_ref())
+            .unwrap_or(&self.security)
+    }
+
+    /// The retention policy for `tenant`, if it configured one.
+    pub fn retention_for(&self, tenant: &str) -> Option<&RetentionConf> {
+        self.find_tenant(tenant).and_then(|t| t.retention.as_ref())
+    }
+
     /// Whether `tenant` may call `model`: a declared tenant without an
     /// allowlist (and the implicit default) allows every model. An undeclared
     /// non-default tenant fails closed — a runtime key outliving the reload

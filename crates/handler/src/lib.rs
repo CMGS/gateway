@@ -115,25 +115,34 @@ impl OnlineHandler {
         if request.request_id.is_empty() {
             request.request_id = new_request_id();
         }
-        // one consistent snapshot for the whole request
+        // one consistent snapshot for the whole request; the tenant's own
+        // security policy wins over the global one when it sets one
         let snap = self.config.load();
+        let sec = snap.cfg.security_for(&ak.tenant);
         // outbound DLP is a response-buffering boundary: a masked span can
         // straddle deltas, so no engine may stream raw ones — enforced here so
         // no caller can opt out
-        let dlp = snap.cfg.security.dlp_redact;
+        let dlp = sec.dlp_redact;
         if dlp {
             request.stream_tx = None;
         }
-        // blocklist on the ORIGINAL content, before DLP — else a blocklisted term
-        // inside a redacted span (a domain in an email) is masked out and slips
-        if let Some(block) = plugins::security_check(&snap.cfg.security, &mut request) {
-            let mut ctx = DagContext::new(
-                snap.cfg.clone(),
-                snap.state.clone(),
-                self.transport.clone(),
-                request,
-                ak,
-            );
+        // scan the ORIGINAL content, before DLP — else a blocklisted term inside
+        // a redacted span (a domain in an email) is masked out and slips
+        let scan = plugins::security_check(sec, &mut request);
+
+        let mut ctx = DagContext::new(
+            snap.cfg.clone(),
+            snap.state.clone(),
+            self.transport.clone(),
+            request,
+            ak,
+        );
+        // every rule that fired is recorded (block/flag/shadow alike); only a
+        // block-action hit denies the request
+        for hit in &scan.hits {
+            emit_security_event(&ctx, &hit.rule, hit.action.as_str(), hit.count).await;
+        }
+        if let Some(block) = scan.block {
             ctx.decide(
                 "security_check",
                 format!("blocked (code {})", block.err_code),
@@ -149,18 +158,9 @@ impl OnlineHandler {
                 block,
                 ..Default::default()
             });
-            emit_security_event(&ctx, "blocklist", "block", 1).await;
             return Ok(ctx);
         }
-        let redacted = plugins::dlp_redact_request(&snap.cfg.security, &mut request);
-
-        let mut ctx = DagContext::new(
-            snap.cfg.clone(),
-            snap.state.clone(),
-            self.transport.clone(),
-            request,
-            ak,
-        );
+        let redacted = plugins::dlp_redact_request(sec, &mut ctx.request);
         if redacted > 0 {
             ctx.decide("dlp", format!("redacted {redacted} span(s) inbound"));
             emit_security_event(&ctx, "dlp", "redact", redacted as i64).await;
@@ -199,7 +199,7 @@ impl OnlineHandler {
         }
 
         let redacted_out = if let Some(outcome) = ctx.outcome.as_mut() {
-            let n = plugins::dlp_redact_response(&snap.cfg.security, &mut outcome.response);
+            let n = plugins::dlp_redact_response(sec, &mut outcome.response);
             // raw decoded deltas are pre-redaction; drop them so no downstream
             // reconstruction can replay unmasked text past the boundary
             if dlp {
