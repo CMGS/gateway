@@ -103,7 +103,10 @@ Every ledger row carries a `user_id`, `request_id`, and `created_at_epoch_secs`.
 The effective user is the key's `owner` (one key = one user, the enterprise
 model) if set, else request metadata — the `x-gw-user` header, OpenAI's `user`
 field, or Anthropic's `metadata.user_id`. `owner` is authoritative; the
-metadata hint is only trusted for shared keys. `GET /admin/usage/users?user=&since=&until=`
+metadata hint is only trusted for shared keys. This holds on every surface —
+REST, realtime (the `x-gw-user` hint is captured at WS connect), and batch
+(each item's `user`, or the submitter's `x-gw-user`, is persisted with the item
+so a fleet drainer still attributes and budgets it). `GET /admin/usage/users?user=&since=&until=`
 returns per-(user, model) cost over a billing period (add `format=csv` for
 export). `TenantConf.user_daily_token_quota` sets a soft per-user daily cap.
 
@@ -124,9 +127,16 @@ error).
 - **Content-safety events** (`/admin/audit/events`): who/which-rule/what-action,
   no prompt text; tenant-scoped.
 - **Admin operations** (`/admin/audit/ops`, global admin only): every key CRUD,
-  config publish, and reload with actor, action, target, and source IP.
+  config publish, and reload with actor, action, target, and source IP. A
+  config publish is recorded even when the local reload fails, since the version
+  is already the fleet's source of truth. The source IP is the real TCP peer;
+  set `trust_proxy_headers: true` (top level) to instead trust `x-real-ip` /
+  `x-forwarded-for` — do that ONLY behind a proxy that sets them, or a direct
+  client could forge the recorded IP.
 - **Content retention** (`tenants[].retention`): `none` (default), `redacted`
-  (post-DLP text), or `full` (raw). Stored in `request_content`, sealed at rest
-  with XChaCha20-Poly1305 under `GW_CONTENT_KEY` (64 hex chars); `full` refuses
-  to store raw without a key and falls back to redacted. `days` sets expiry; an
-  hourly purge deletes elapsed content.
+  (PII/secrets stripped), or `full` (raw). Stored in `request_content`, sealed
+  at rest with XChaCha20-Poly1305 under `GW_CONTENT_KEY` (64 hex chars).
+  Retention owns its redaction, so `redacted` — and a keyless `full` that falls
+  back to it — never persists raw secrets/PII even if the tenant forwards
+  traffic with DLP off. `full` refuses to store raw without a key. `days` sets
+  expiry; an hourly purge deletes elapsed content.
