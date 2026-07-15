@@ -28,6 +28,74 @@ fn app() -> Router {
 }
 
 #[tokio::test]
+async fn admin_audit_freezes_source_ip_before_a_trust_flip() {
+    const V1: &str = r#"
+listen: {host: 127.0.0.1, port: 0}
+admin: {token_env: GW_TEST_ADMIN_TOKEN_TRUST}
+trust_proxy_headers: false
+access_keys: [{ak: ak-x, product: demo, qps: 100, daily_token_quota: 1000000}]
+models: [{name: gpt-4o, protocol: openai-chat}]
+accounts: [{name: mock-openai-1, provider: openai, protocols: ["openai-chat"]}]
+"#;
+    // SAFETY: unique var name for this test; no concurrent reader of it.
+    unsafe { std::env::set_var("GW_TEST_ADMIN_TOKEN_TRUST", "s3cret") };
+    let v1 = GatewayConfig::from_yaml(V1).unwrap();
+    let v2_yaml = V1.replace("trust_proxy_headers: false", "trust_proxy_headers: true");
+    let loader: gw_views::ConfigLoader = Arc::new(move || {
+        let yaml = v2_yaml.clone();
+        Box::pin(async move { GatewayConfig::from_yaml(&yaml).map_err(|e| e.to_string()) })
+            as gw_views::ConfigFuture
+    });
+    let state = Arc::new(GatewayState::from_config(&v1));
+    let shared = gw_state::SharedConfig::new(Arc::new(v1), state);
+    let app = gw_views::app(gw_views::AppState::with_config(
+        shared,
+        Arc::new(gw_engines::MockTransport),
+        Some(loader),
+    ));
+
+    // this reload FLIPS trust_proxy_headers on, while forging x-real-ip on the
+    // very same request — the op must be audited under the pre-reload policy
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/reload")
+                .header("authorization", "Bearer s3cret")
+                .header("x-real-ip", "9.9.9.9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    let ops = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/audit/ops")
+                .header("authorization", "Bearer s3cret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let j = body_json(ops).await;
+    let reload = j["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "reload")
+        .expect("reload audited");
+    assert_ne!(
+        reload["source_ip"], "9.9.9.9",
+        "the trust-enabling op must not trust its own forged header"
+    );
+}
+
+#[tokio::test]
 async fn admin_reload_is_gated_and_swaps_keys_live() {
     let r = app()
         .oneshot(

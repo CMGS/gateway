@@ -439,7 +439,24 @@ async fn realtime_session(
                 .await;
             continue;
         }
-        gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut ev);
+        if let Some(reason) = realtime_moderate(&s, sec, &ak, &hint, &mut ev).await {
+            let _ = socket
+                .send(send(json!({"type":"error","message": reason})))
+                .await;
+            continue;
+        }
+        let redacted = gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut ev);
+        if redacted > 0 {
+            write_rt_event(
+                &s,
+                &ak,
+                ak.attributed_user(&hint),
+                "dlp",
+                "redact",
+                redacted as i64,
+            )
+            .await;
+        }
         match ev["type"].as_str().unwrap_or_default() {
             "input_text" => {
                 let admit = match realtime_gate(&s, &ak, &model, &hint).await {
@@ -609,7 +626,20 @@ async fn realtime_bridge(
                         }
                         continue;
                     }
-                    if gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut frame) > 0 {
+                    if let Some(reason) = realtime_moderate(&s, sec, &ak, &hint, &mut frame).await {
+                        if cl_tx
+                            .send(CMsg::Text(send_err(reason).to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    let redacted = gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut frame);
+                    if redacted > 0 {
+                        write_rt_event(&s, &ak, ak.attributed_user(&hint), "dlp", "redact", redacted as i64)
+                            .await;
                         forward = UMsg::text(frame.to_string());
                     }
                     // gate each generation trigger, not every control frame
@@ -967,31 +997,81 @@ fn q_num<T: std::str::FromStr>(
     q.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// Write one realtime security event (`user` already resolved). The shared sink
+/// for realtime blocklist/regex hits, moderation denials, and inbound DLP hits.
+async fn write_rt_event(
+    s: &AppState,
+    ak: &AkInfo,
+    user: &str,
+    rule: &str,
+    action: &str,
+    hits: i64,
+) {
+    let event = gw_state::SecurityEvent {
+        created_at_epoch_secs: gw_state::epoch_secs(),
+        request_id: String::new(),
+        ak: ak.ak.clone(),
+        user_id: user.to_owned(),
+        tenant: ak.tenant.clone(),
+        surface: "realtime".to_owned(),
+        rule: rule.to_owned(),
+        action: action.to_owned(),
+        hits,
+    };
+    if let Err(e) = s.handler.state().store.security_event_add(&event).await {
+        tracing::warn!(error = %e, "realtime security event write failed");
+    }
+}
+
 /// Record a realtime frame's content-safety hits to the security-event stream
-/// (parity with the REST surfaces). Per-frame DLP redactions are not recorded —
-/// too hot.
+/// (parity with the REST surfaces).
 async fn emit_rt_hits(
     s: &AppState,
     ak: &AkInfo,
     hits: &[gw_handler::plugins::RuleHit],
     hint: &str,
 ) {
+    let user = ak.attributed_user(hint).to_owned();
     for hit in hits {
-        let event = gw_state::SecurityEvent {
-            created_at_epoch_secs: gw_state::epoch_secs(),
-            request_id: String::new(),
-            ak: ak.ak.clone(),
-            user_id: ak.attributed_user(hint).to_owned(),
-            tenant: ak.tenant.clone(),
-            surface: "realtime".to_owned(),
-            rule: hit.rule.clone(),
-            action: hit.action.as_str().to_owned(),
-            hits: hit.count,
-        };
-        if let Err(e) = s.handler.state().store.security_event_add(&event).await {
-            tracing::warn!(error = %e, "realtime security event write failed");
-        }
+        write_rt_event(s, ak, &user, &hit.rule, hit.action.as_str(), hit.count).await;
     }
+}
+
+/// All inbound text a realtime frame carries, for moderation.
+fn realtime_frame_text(frame: &mut Value) -> String {
+    let mut text = String::new();
+    gw_engines::realtime::visit_frame_text(frame, &mut |s| {
+        if !s.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(s);
+        }
+        0
+    });
+    text
+}
+
+/// Moderate a realtime frame's inbound text via the wired moderator — parity
+/// with the REST surface, so a moderated tenant can't be bypassed over the
+/// WebSocket. `Some(reason)` denies the frame; records a moderation event.
+async fn realtime_moderate(
+    s: &AppState,
+    sec: &gw_config::SecurityConf,
+    ak: &AkInfo,
+    hint: &str,
+    frame: &mut Value,
+) -> Option<String> {
+    if !sec.moderate {
+        return None;
+    }
+    let text = realtime_frame_text(frame);
+    if text.is_empty() {
+        return None;
+    }
+    let reason = s.handler.moderate_text(sec, &text).await?;
+    write_rt_event(s, ak, ak.attributed_user(hint), "moderation", "block", 1).await;
+    Some(reason)
 }
 
 /// The connecting peer's socket address, read from the connect-info extension.
@@ -1036,12 +1116,14 @@ fn source_ip(peer: Option<std::net::SocketAddr>, headers: &HeaderMap, trust_prox
 }
 
 /// Record one admin-plane mutation to the audit trail (who/what/when/where).
+/// `source` is resolved by the caller at request entry — before any config
+/// mutation — so the op that flips `trust_proxy_headers` is audited under the
+/// policy in effect when it arrived, not the one it just installed.
 /// Best-effort: a store failure is logged, never fails the operation.
 async fn audit_admin(
     s: &AppState,
     scope: &AdminScope,
-    headers: &HeaderMap,
-    peer: Option<std::net::SocketAddr>,
+    source: String,
     action: &str,
     target: &str,
     summary: String,
@@ -1054,7 +1136,7 @@ async fn audit_admin(
         action: action.to_owned(),
         target: target.to_owned(),
         summary,
-        source_ip: source_ip(peer, headers, s.handler.cfg().trust_proxy_headers),
+        source_ip: source,
     };
     if let Err(e) = s.handler.state().store.admin_audit_add(&entry).await {
         tracing::warn!(error = %e, action, "admin audit write failed");
@@ -1163,6 +1245,8 @@ async fn admin_reload(
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
+    // freeze the source IP under the pre-reload policy
+    let source = source_ip(peer, &headers, s.handler.cfg().trust_proxy_headers);
     match s.reload().await {
         Ok(()) => {
             let cfg = s.handler.cfg();
@@ -1172,16 +1256,7 @@ async fn admin_reload(
                 accounts = cfg.accounts.len(),
                 "config reloaded"
             );
-            audit_admin(
-                &s,
-                &AdminScope::Global,
-                &headers,
-                peer,
-                "reload",
-                "",
-                String::new(),
-            )
-            .await;
+            audit_admin(&s, &AdminScope::Global, source, "reload", "", String::new()).await;
             (
                 StatusCode::OK,
                 Json(json!({
@@ -1209,6 +1284,7 @@ async fn admin_key_create(
         Ok(scope) => scope,
         Err(r) => return r,
     };
+    let source = source_ip(peer, &headers, s.handler.cfg().trust_proxy_headers);
     let (Some(ak), Some(product)) = (body["ak"].as_str(), body["product"].as_str()) else {
         return error_response(400, "ak and product are required");
     };
@@ -1263,8 +1339,7 @@ async fn admin_key_create(
     audit_admin(
         &s,
         &scope,
-        &headers,
-        peer,
+        source,
         "key_create",
         ak,
         format!("tenant={tenant}"),
@@ -1289,6 +1364,7 @@ async fn admin_key_patch(
         Ok(scope) => scope,
         Err(r) => return r,
     };
+    let source = source_ip(peer, &headers, s.handler.cfg().trust_proxy_headers);
     if let Err(r) = scoped_key(&s, &scope, &ak).await {
         return r;
     }
@@ -1309,7 +1385,7 @@ async fn admin_key_patch(
     match patched {
         Err(e) => gateway_error(e),
         Ok(Some(info)) => {
-            audit_admin(&s, &scope, &headers, peer, "key_patch", &ak, String::new()).await;
+            audit_admin(&s, &scope, source, "key_patch", &ak, String::new()).await;
             (StatusCode::OK, Json(ak_public_json(&info))).into_response()
         }
         Ok(None) => error_response(404, format!("key {ak} not found")),
@@ -1327,13 +1403,14 @@ async fn admin_key_delete(
         Ok(scope) => scope,
         Err(r) => return r,
     };
+    let source = source_ip(peer, &headers, s.handler.cfg().trust_proxy_headers);
     if let Err(r) = scoped_key(&s, &scope, &ak).await {
         return r;
     }
     match s.handler.state().auth.revoke(&ak).await {
         Err(e) => gateway_error(e),
         Ok(true) => {
-            audit_admin(&s, &scope, &headers, peer, "key_delete", &ak, String::new()).await;
+            audit_admin(&s, &scope, source, "key_delete", &ak, String::new()).await;
             (
                 StatusCode::OK,
                 Json(json!({ "ak": ak, "status": "revoked" })),
@@ -1355,6 +1432,9 @@ async fn admin_config_put(
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
+    // freeze the source IP under the pre-publish policy: this very op may be the
+    // one enabling trust_proxy_headers, and must not be audited under it
+    let source = source_ip(peer, &headers, s.handler.cfg().trust_proxy_headers);
     let Some(store) = &s.config_store else {
         return error_response(
             400,
@@ -1379,8 +1459,7 @@ async fn admin_config_put(
     audit_admin(
         &s,
         &AdminScope::Global,
-        &headers,
-        peer,
+        source,
         "config_publish",
         &version.to_string(),
         detail,
@@ -3154,6 +3233,70 @@ mod tests {
                 c.content
             );
         }
+    }
+
+    #[derive(Debug)]
+    struct DenyModerator;
+
+    #[async_trait::async_trait]
+    impl gw_handler::moderation::Moderator for DenyModerator {
+        async fn review(&self, _text: &str) -> Result<gw_handler::moderation::Verdict, String> {
+            Ok(gw_handler::moderation::Verdict::Deny(
+                "blocked by moderator".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn realtime_moderates_and_records_inbound_dlp() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {moderate: true, detect_secrets: true}\nmodels: [{name: rt, protocol: realtime}]\naccess_keys: [{ak: k1, product: p, qps: 10, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let handler = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
+        .with_moderator(Arc::new(DenyModerator));
+        let offline = OfflineHandler::new(handler.clone());
+        let app = AppState {
+            handler,
+            offline,
+            loader: None,
+            config_store: None,
+        };
+        let ak = app.handler.state().auth.authenticate("k1").await.unwrap();
+        let cfg = app.handler.cfg();
+        let sec = cfg.security_for(&ak.tenant);
+
+        // moderation denies over realtime, not just REST
+        let mut frame = json!({"type":"input_text","text":"hello there"});
+        assert_eq!(
+            realtime_moderate(&app, sec, &ak, "", &mut frame)
+                .await
+                .as_deref(),
+            Some("blocked by moderator")
+        );
+        // inbound realtime DLP redaction is recorded (the sink both WS paths use)
+        let mut secret = json!({"type":"input_text","text":"sk-abcdefghijklmnopqrstuvwxyz012345"});
+        let n = gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut secret);
+        assert!(n > 0);
+        write_rt_event(&app, &ak, ak.attributed_user(""), "dlp", "redact", n as i64).await;
+
+        let events = app
+            .handler
+            .state()
+            .store
+            .security_events(None, 10)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|e| e.rule == "moderation"),
+            "moderation event"
+        );
+        assert!(
+            events.iter().any(|e| e.rule == "dlp"),
+            "inbound realtime DLP event"
+        );
     }
 
     #[tokio::test]

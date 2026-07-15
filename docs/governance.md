@@ -122,6 +122,13 @@ Set `moderate: true` to route inbound text through an external moderator wired
 into the handler (`moderation_fail_open` picks the posture on a moderator
 error).
 
+The same policy applies on every surface, realtime included: a `/v1/realtime`
+WebSocket runs the blocklist, regex rules, DLP redaction, and the external
+moderator on inbound frames, so it is not a bypass. One deliberate exception:
+per-*delta* outbound DLP redactions on the streaming relay are not written as
+individual security events (a store write per token is too hot) — inbound
+redactions and every block/flag/moderation hit still are.
+
 ## Audit trails
 
 - **Content-safety events** (`/admin/audit/events`): who/which-rule/what-action,

@@ -344,6 +344,21 @@ impl OnlineHandler {
         Ok(ctx)
     }
 
+    /// Run the wired moderator over raw text; `Some(reason)` to deny, `None` to
+    /// allow. A moderator error resolves per `moderation_fail_open`. The seam
+    /// the realtime surface uses (it has no `DagContext`); the caller records
+    /// the security event on its own surface.
+    pub async fn moderate_text(&self, sec: &gw_config::SecurityConf, text: &str) -> Option<String> {
+        match self.moderator.review(text).await {
+            Ok(moderation::Verdict::Allow) => None,
+            Ok(moderation::Verdict::Deny(reason)) => Some(reason),
+            Err(e) => {
+                tracing::warn!(error = %e, fail_open = sec.moderation_fail_open, "moderator error");
+                (!sec.moderation_fail_open).then(|| "content moderation is unavailable".to_owned())
+            }
+        }
+    }
+
     /// Run the wired moderator over the request's inbound text; `Some(Block)` to
     /// deny. A moderator error resolves per `moderation_fail_open`. Records a
     /// security event on a deny.
@@ -474,6 +489,42 @@ mod tests {
                 .1
                 .is_empty(),
             "a moderated deny bills nothing"
+        );
+    }
+
+    #[derive(Debug)]
+    struct ErrModerator;
+
+    #[async_trait::async_trait]
+    impl moderation::Moderator for ErrModerator {
+        async fn review(&self, _text: &str) -> Result<moderation::Verdict, String> {
+            Err("moderator upstream down".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn moderate_text_allow_deny_and_failure_posture() {
+        let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let base = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let mut sec = gw_config::SecurityConf::default();
+        assert_eq!(base.moderate_text(&sec, "x").await, None, "default allows");
+        let deny = base.clone().with_moderator(Arc::new(DenyModerator));
+        assert_eq!(deny.moderate_text(&sec, "x").await.as_deref(), Some("nope"));
+        let err = base.with_moderator(Arc::new(ErrModerator));
+        sec.moderation_fail_open = true;
+        assert_eq!(
+            err.moderate_text(&sec, "x").await,
+            None,
+            "error + fail-open allows"
+        );
+        sec.moderation_fail_open = false;
+        assert!(
+            err.moderate_text(&sec, "x").await.is_some(),
+            "error + fail-closed denies"
         );
     }
 
