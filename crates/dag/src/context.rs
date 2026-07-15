@@ -71,6 +71,16 @@ impl DagContext {
         self.decisions.push((node, what.into()));
     }
 
+    /// The effective end user: the key's `owner` (authoritative) else request
+    /// metadata; `""` when neither is present.
+    pub fn effective_user_id(&self) -> &str {
+        self.ak
+            .owner
+            .as_deref()
+            .or(self.request.user_id.as_deref())
+            .unwrap_or_default()
+    }
+
     /// The decision trail as `"stage: detail"` lines.
     pub fn decision_lines(&self) -> impl Iterator<Item = String> + '_ {
         self.decisions.iter().map(|(n, w)| format!("{n}: {w}"))

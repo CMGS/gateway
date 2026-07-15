@@ -749,9 +749,11 @@ name = "gw-config"
 version = "0.1.0"
 dependencies = [
  "gw-consts",
+ "regex",
  "serde",
  "serde_yaml",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

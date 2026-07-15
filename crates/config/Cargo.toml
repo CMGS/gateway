@@ -11,6 +11,8 @@ gw-consts = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

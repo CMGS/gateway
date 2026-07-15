@@ -752,12 +752,7 @@ fn log_access(surface: &str, ctx: &DagContext, started: Instant) {
         })
         .unwrap_or_default();
     let latency = started.elapsed();
-    let user_id = ctx
-        .ak
-        .owner
-        .as_deref()
-        .or(ctx.request.user_id.as_deref())
-        .unwrap_or("");
+    let user_id = ctx.effective_user_id();
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(pt.max(0) as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ct.max(0) as u64);
     tracing::info!(
@@ -842,10 +837,8 @@ async fn accounts(State(s): State<AppState>) -> Json<Value> {
     Json(resp)
 }
 
-/// End-user attribution hint from `x-gw-user` — the stable user id a trusted
-/// backend (the toC case) sets. Surfaces fall back to the body's own field
-/// (OpenAI `user` / Anthropic `metadata.user_id`). A key's `owner` overrides
-/// both at billing, so this is only trusted for shared keys.
+/// The `x-gw-user` attribution hint; surfaces fall back to the body's own user
+/// field. See [`gw_models::GatewayRequest::user_id`] for the trust model.
 fn user_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-gw-user")
@@ -920,6 +913,24 @@ impl AdminScope {
             AdminScope::Tenant(t) => (t.as_str(), "tenant"),
         }
     }
+
+    /// The tenant a scoped read is confined to: a tenant admin sees only its
+    /// own; the global admin may narrow with `?tenant=`.
+    fn tenant_filter(&self, q: &std::collections::HashMap<String, String>) -> Option<String> {
+        match self {
+            AdminScope::Tenant(t) => Some(t.clone()),
+            AdminScope::Global => q.get("tenant").cloned(),
+        }
+    }
+}
+
+/// A numeric query param, or `default` when absent/unparseable.
+fn q_num<T: std::str::FromStr>(
+    q: &std::collections::HashMap<String, String>,
+    key: &str,
+    default: T,
+) -> T {
+    q.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 /// Record a realtime blocklist block to the security-event stream (parity with
@@ -936,7 +947,9 @@ async fn emit_rt_block(s: &AppState, ak: &AkInfo) {
         action: "block".to_owned(),
         hits: 1,
     };
-    let _ = s.handler.state().store.security_event_add(&event).await;
+    if let Err(e) = s.handler.state().store.security_event_add(&event).await {
+        tracing::warn!(error = %e, "realtime security event write failed");
+    }
 }
 
 /// The caller IP for the audit trail, from the LB's forwarding headers.
@@ -1303,11 +1316,8 @@ async fn admin_key_list(
         Ok(scope) => scope,
         Err(r) => return r,
     };
-    let offset = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let limit = q
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(KEY_PAGE_DEFAULT);
+    let offset = q_num(&q, "offset", 0);
+    let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT);
     let listed = match s.handler.state().auth.list(offset, limit).await {
         Ok(v) => v,
         Err(e) => return gateway_error(e),
@@ -1333,10 +1343,7 @@ async fn admin_usage(
         Ok(scope) => scope,
         Err(r) => return r,
     };
-    let filter = match &scope {
-        AdminScope::Tenant(t) => Some(t.clone()),
-        AdminScope::Global => q.get("tenant").cloned(),
-    };
+    let filter = scope.tenant_filter(&q);
     let usage = match s
         .handler
         .state()
@@ -1362,15 +1369,9 @@ async fn admin_usage_users(
         Ok(scope) => scope,
         Err(r) => return r,
     };
-    let tenant = match &scope {
-        AdminScope::Tenant(t) => Some(t.clone()),
-        AdminScope::Global => q.get("tenant").cloned(),
-    };
-    let since = q.get("since").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let until = q
-        .get("until")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(i64::MAX);
+    let tenant = scope.tenant_filter(&q);
+    let since = q_num(&q, "since", 0);
+    let until = q_num(&q, "until", i64::MAX);
     let usage = match s
         .handler
         .state()
@@ -1400,14 +1401,8 @@ async fn admin_security_events(
         Ok(scope) => scope,
         Err(r) => return r,
     };
-    let tenant = match &scope {
-        AdminScope::Tenant(t) => Some(t.clone()),
-        AdminScope::Global => q.get("tenant").cloned(),
-    };
-    let limit = q
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(LEDGER_PAGE_DEFAULT);
+    let tenant = scope.tenant_filter(&q);
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
     match s
         .handler
         .state()
@@ -1430,10 +1425,7 @@ async fn admin_audit_ops(
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    let limit = q
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(LEDGER_PAGE_DEFAULT);
+    let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
     match s.handler.state().store.admin_audit_list(limit).await {
         Ok(entries) => Json(json!({ "entries": entries })).into_response(),
         Err(e) => gateway_error(e),

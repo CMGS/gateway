@@ -27,13 +27,7 @@ static REQ_SEQ: AtomicU64 = AtomicU64::new(0);
 /// key/user/tenant. Best-effort: a store failure is logged, never fails the
 /// request. Surface = the request protocol, or "batch" for offline items.
 async fn emit_security_event(ctx: &DagContext, rule: &str, action: &str, hits: i64) {
-    let user_id = ctx
-        .ak
-        .owner
-        .as_deref()
-        .or(ctx.request.user_id.as_deref())
-        .unwrap_or_default()
-        .to_owned();
+    let user_id = ctx.effective_user_id().to_owned();
     let surface = if ctx.request.is_online {
         ctx.request
             .model_param_v2

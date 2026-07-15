@@ -286,7 +286,6 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         limit: usize,
     ) -> GResult<Vec<SecurityEvent>>;
 
-    /// Append an admin-operation audit entry.
     async fn admin_audit_add(&self, e: &AdminAudit) -> GResult<()>;
     /// The most recent `limit` admin-audit entries, newest first.
     async fn admin_audit_list(&self, limit: usize) -> GResult<Vec<AdminAudit>>;

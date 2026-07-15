@@ -583,13 +583,13 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
     let requested = param
         .and_then(|p| p.fallback_from.as_deref())
         .unwrap_or(served);
-    // effective user: the key's owner wins (authoritative), else request metadata
-    let user_id = ctx
-        .ak
-        .owner
-        .as_deref()
-        .or(ctx.request.user_id.as_deref())
-        .unwrap_or_default();
+    // take the reserves into locals first so the whole-ctx borrow that
+    // `effective_user_id` needs can't clash with these mutable field takes
+    let (reserved, tpm_reserved, model_quota_key) = (
+        ctx.quota_reserved.take().unwrap_or(0),
+        ctx.tpm_reserved.take(),
+        ctx.model_quota_key.take(),
+    );
     let record = admission::settle_and_bill(
         ctx.state.governance.as_ref(),
         ctx.state.store.as_ref(),
@@ -599,7 +599,7 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
                 ak: &ctx.ak.ak,
                 product: &ctx.ak.product,
                 tenant: &ctx.ak.tenant,
-                user_id,
+                user_id: ctx.effective_user_id(),
                 request_id: &ctx.request.request_id,
                 requested_model: requested,
                 served_model: served,
@@ -610,10 +610,10 @@ async fn bill(ctx: &mut DagContext, prompt: i64, completion: i64, total: i64) ->
                 total,
                 ptu_spillover,
             },
-            reserved: ctx.quota_reserved.take().unwrap_or(0),
-            tpm_reserved: ctx.tpm_reserved.take(),
+            reserved,
+            tpm_reserved,
             reserved_at: ctx.quota_at,
-            model_quota_key: ctx.model_quota_key.take(),
+            model_quota_key,
         },
     )
     .await;

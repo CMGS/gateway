@@ -35,8 +35,7 @@ pub struct AkInfo {
     pub product: String,
     /// Tenant this key belongs to (`gw_config::DEFAULT_TENANT` when undeclared).
     pub tenant: String,
-    /// End user this key is issued to; `Some` = authoritative user attribution
-    /// (one key per user), `None` = shared key, attribute from request metadata.
+    /// End user this key is issued to (one key = one user); `None` = shared key.
     pub owner: Option<String>,
     pub qps: f64,
     pub daily_token_quota: i64,

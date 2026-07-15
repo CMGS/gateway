@@ -297,6 +297,7 @@ mod tests {
         SecurityConf {
             blocklist: vec!["forbiddenword".into()],
             dlp_redact: true,
+            ..Default::default()
         }
     }
 
@@ -317,6 +318,7 @@ mod tests {
         let s = SecurityConf {
             blocklist: vec!["forbiddenword".into(), "禁词".into()],
             dlp_redact: false,
+            ..Default::default()
         };
         let mut req = GatewayRequest {
             message: vec![ChatMsg::text("user", "前文 FORBIDDENWORD 后文")],
