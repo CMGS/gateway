@@ -43,7 +43,6 @@ pub fn extract_common_usage(raw: &[u8], messages_protocol: bool) -> Option<Commo
             reason: 0,
         }
     } else {
-        // OpenAI: prompt/completion/total (+ details)
         let prompt = get(&v, &["prompt_tokens"]).max(0);
         let completion = get(&v, &["completion_tokens"]).max(0);
         // cached ⊆ prompt and reasoning ⊆ completion by the vendor contract,

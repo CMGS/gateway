@@ -144,7 +144,6 @@ impl MockTransport {
         })
     }
 
-    /// image_url parts in the last user message (multimodal detection).
     fn image_count(messages: &[Value]) -> usize {
         messages
             .iter()
@@ -169,7 +168,6 @@ impl MockTransport {
         let reply = format!("[mock-openai:{model}] {img_note}you said: {user}");
         let (pt, ct) = (Self::tokens(&user) + 3, Self::tokens(&reply));
 
-        // tools present → the model requests a call to the first tool
         let tools = body["tools"].as_array().cloned().unwrap_or_default();
         if let Some(first_tool) = tools.first() {
             let name = first_tool["function"]["name"]
@@ -263,7 +261,6 @@ impl MockTransport {
         let reply = format!("[mock-anthropic:{model}] {sys_note}you said: {user}");
         let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
 
-        // tools present → tool_use block reply
         let tools = body["tools"].as_array().cloned().unwrap_or_default();
         if let Some(first_tool) = tools.first() {
             let name = first_tool["name"].as_str().unwrap_or("tool").to_owned();
@@ -276,7 +273,6 @@ impl MockTransport {
         }
 
         if req.stream {
-            // standard anthropic streaming event sequence
             let (a, b) = Self::split_half(&reply);
             let frames = [
                 json!({"type":"message_start","message":{"id":"msg-mock","type":"message",
@@ -560,7 +556,6 @@ impl MockTransport {
             "output_tokens_details": {"reasoning_tokens": 0},
         });
         if req.stream {
-            // Responses streaming event sequence: text deltas, then completed.
             let (a, b) = Self::split_half(&reply);
             let frames = [
                 json!({"type": "response.created", "response": {"model": model, "status": "in_progress"}}),

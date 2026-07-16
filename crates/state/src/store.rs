@@ -2846,7 +2846,6 @@ mod tests {
         a.user_id = "alice".into();
         a.created_at_epoch_secs = 400;
         store.ledger_add(&a).await.unwrap();
-        // an advance long after the row must trail back to the empty watermark
         store.usage_rollup_advance(400 + 3 * 20 * 60).await.unwrap();
         let usage = store.usage_by_user(None, None, 0, i64::MAX).await.unwrap();
         assert_eq!(
@@ -2873,8 +2872,8 @@ mod tests {
         let mut b = record("m1");
         b.user_id = "bob".into();
         b.created_at_epoch_secs = 1_250;
-        store.ledger_add(&b).await.unwrap(); // cap=2 prunes one alice row
-        store.usage_rollup_advance(1_260).await.unwrap(); // recomputes alice's minute from a pruned ledger
+        store.ledger_add(&b).await.unwrap();
+        store.usage_rollup_advance(1_260).await.unwrap();
         let usage = store.usage_by_user(None, None, 0, i64::MAX).await.unwrap();
         assert_eq!(
             usage
@@ -3015,7 +3014,6 @@ mod tests {
         exercise_rollup(&store, &ns).await;
         exercise_erase(&store, &ns).await;
 
-        // erasure reaches a still-pending batch's inputs by the persisted effective user
         let (t1, erika) = (format!("t1{ns}"), format!("erika{ns}"));
         let items = vec![
             gw_models::BatchItem {
@@ -3158,7 +3156,6 @@ mod tests {
 
     #[tokio::test]
     async fn ledger_retention_caps_both_stores() {
-        // rows only prune once rolled: an advance past the settle window re-arms the cap
         let mem = MemoryStore::with_ledger_cap(2);
         for m in ["a", "b"] {
             mem.ledger_add(&record(m)).await.unwrap();
@@ -3167,7 +3164,6 @@ mod tests {
         let (total, _) = mem.ledger_snapshot(usize::MAX).await.unwrap();
         assert_eq!(total, 3, "unrolled rows are spared from the cap");
         mem.usage_rollup_advance(1_000 + 3 * 60).await.unwrap();
-        // a live write always postdates the watermark (settle window)
         let mut c = record("c");
         c.created_at_epoch_secs = 1_200;
         mem.ledger_add(&c).await.unwrap();
