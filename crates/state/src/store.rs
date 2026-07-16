@@ -2463,6 +2463,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pg_rollup_and_erase_roundtrip() {
+        let Ok(url) = std::env::var("GW_TEST_PG_URL") else {
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("pg connect");
+        sqlx::query("TRUNCATE billing, usage_rollup, request_content")
+            .execute(&store.pool)
+            .await
+            .expect("truncate");
+        exercise_rollup(&store).await;
+        exercise_erase(&store).await;
+    }
+
+    #[tokio::test]
     async fn sqlite_erase_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(dir.path().join("erase.db").to_str().unwrap())
