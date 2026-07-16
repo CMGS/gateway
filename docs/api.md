@@ -70,6 +70,7 @@ sequence (`message_start` → `content_block_*` → `message_delta` →
 | POST | `/v1/files` | upload JSONL: `{"purpose":"batch","file":"<content>"}` |
 | GET | `/v1/files/{id}` | file metadata |
 | GET | `/v1/files/{id}/content` | raw content |
+| DELETE | `/v1/files/{id}` | delete an uploaded file (tenant-owned) |
 | POST | `/v1/batches` | `{"input_file_id":"..."}` or inline `{"items":[...]}` |
 | GET | `/v1/batches/{id}` | status (`pending`/`running`/`completed`/`failed`) + results |
 
@@ -138,6 +139,7 @@ surface on a private network regardless.
 | GET | `/admin/audit/events` | content-safety hits (blocklist / regex / DLP / moderation) recorded without prompt text; `?limit=`; tenant-scoped |
 | GET | `/admin/audit/ops` | admin-operation trail (key CRUD, config publish, reload) with actor, target, and source IP; `?limit=`; global token only |
 | GET | `/admin/audit/content/{request_id}` | retained prompt/response for one request, unsealed when `GW_CONTENT_KEY` is set (sealed rows without it return `content: null`); tenant-scoped |
+| DELETE | `/admin/audit/content?user=` | erase all retained content for one end user — retained rows, batch result messages, leftover batch inputs (GDPR/PIPL); tenant-scoped, audited atomically as `content_erase` |
 
 Two token tiers: the global token (`admin.token_env`) manages everything; a
 tenant's `admin_token_env` token manages only that tenant's keys, usage, and

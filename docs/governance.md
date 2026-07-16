@@ -110,6 +110,18 @@ so a fleet drainer still attributes and budgets it). `GET /admin/usage/users?use
 returns per-(user, model) cost over a billing period (add `format=csv` for
 export). `TenantConf.user_daily_token_quota` sets a soft per-user daily cap.
 
+A background task folds completed ledger minutes into durable per-(minute,
+tenant, user, model) rollup buckets. Each pass recomputes from the rollup
+watermark or the trailing 20-minute window, whichever reaches further back —
+the first run rolls a pre-existing ledger whole, and a stalled task catches up
+on its own. Buckets only ever grow (a recompute over a partially pruned ledger
+keeps the more complete aggregate), and on Postgres a fleet elects one replica
+per pass via an advisory lock. Usage queries are served from those buckets plus
+the raw ledger tail, so per-user cost stays correct after
+`storage.ledger_max_rows` prunes old billing rows. `since`/`until` bounds are
+minute-aligned, so a repeated query returns the same result whether a minute is
+served from its bucket or still raw.
+
 ## Enterprise content policy
 
 `security:` is global by default; a tenant may override it whole with
@@ -150,3 +162,19 @@ only its audit is aggregated (a store write per token would be too hot).
   expiry; an hourly purge deletes elapsed content. Read back with
   `GET /admin/audit/content/{request_id}` (tenant-scoped; sealed rows are
   unsealed when the key is present, else returned as `content: null`).
+  `DELETE /admin/audit/content?user=` erases every retained trace of one end
+  user's content (the GDPR/PIPL right-to-erasure hook): retained rows, batch
+  result messages, and queued batch inputs — a pending/running item belonging
+  to the user is blanked in place and fails at execution instead of running
+  erased content. Tenant-scoped, and the `content_erase` audit entry commits
+  with the deletion so a recorded success can't separate from it. Erasure
+  reaches only attributed content: a batch item submitted without any
+  `user`/`x-gw-user` has no erasure subject (shared-key anonymous submission
+  opts out of per-user erasure by construction). Erasure is a point-in-time
+  operation: a request already in flight may persist content just after it, so
+  quiesce the user's traffic first or simply repeat the call. Ledger rows and
+  security events carry no content and are kept (billing/audit legal basis).
+  Uploaded files are tenant-owned assets with no per-user dimension — the
+  tenant deletes them via `DELETE /v1/files/{id}`. A batch's input rows are
+  deleted as soon as the batch reaches a terminal status, so submitted prompt
+  text does not outlive the run.

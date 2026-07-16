@@ -981,6 +981,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_submitted_after_an_erasure_still_runs() {
+        let h = handler();
+        let off = OfflineHandler::new(h.clone());
+        let key = ak(&h).await;
+        let audit = gw_state::AdminAudit {
+            created_at_epoch_secs: 1,
+            actor: "global".into(),
+            scope: "global".into(),
+            action: "content_erase".into(),
+            target: "user-42".into(),
+            summary: String::new(),
+            source_ip: String::new(),
+        };
+        h.state()
+            .store
+            .content_erase_user(None, "user-42", audit)
+            .await
+            .unwrap();
+        // millisecond markers: a resubmit moments later must already pass
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let job = off
+            .submit(
+                key,
+                "gpt-4o".into(),
+                vec![BatchItem {
+                    messages: vec![ChatMsg::text("user", "new content after erasure")],
+                    user: "user-42".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        wait_terminal(&h, &job.id).await;
+        let done = h.state().store.batch_get(&job.id).await.unwrap().unwrap();
+        assert!(
+            done.results[0].ok,
+            "a past erasure must not fail the user's future batches: {}",
+            done.results[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn erased_batch_item_fails_instead_of_running() {
+        let h = handler();
+        let off = OfflineHandler::new(h.clone());
+        let key = ak(&h).await;
+        let job = off
+            .submit(
+                key,
+                "gpt-4o".into(),
+                vec![BatchItem {
+                    messages: Vec::new(),
+                    user: "u1".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        wait_terminal(&h, &job.id).await;
+        let done = h.state().store.batch_get(&job.id).await.unwrap().unwrap();
+        assert!(!done.results[0].ok, "an erased item must not execute");
+        assert_eq!(done.results[0].message, "item content erased");
+        assert_eq!(done.results[0].total_tokens, 0, "nothing billed");
+    }
+
+    #[tokio::test]
     async fn batch_attributes_each_item_to_its_user() {
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
@@ -1015,6 +1079,20 @@ mod tests {
         assert!(
             users.contains("alice") && users.contains("bob"),
             "each shared-key batch item bills to its own user: {users:?}"
+        );
+        let results = h
+            .state()
+            .store
+            .batch_get(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .results;
+        let owners: std::collections::HashSet<&str> =
+            results.iter().map(|r| r.user.as_str()).collect();
+        assert!(
+            owners.contains("alice") && owners.contains("bob"),
+            "each generated result carries its owner: {owners:?}"
         );
     }
 
@@ -1085,6 +1163,15 @@ mod tests {
         assert!(
             users.contains("alice") && users.contains("bob"),
             "distributed batch preserved per-item user attribution: {users:?}"
+        );
+        assert!(
+            state
+                .store
+                .batch_load_items(&job.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a terminal batch's input rows are pruned"
         );
     }
 }

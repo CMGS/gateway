@@ -29,6 +29,15 @@ impl OfflineHandler {
     ) -> gw_models::GResult<BatchJob> {
         let store = self.online.state().store.clone();
         if store.distributed_batches() {
+            // persist the EFFECTIVE user (owner overrides the hint): execution,
+            // billing, and erasure must all key on the same identity
+            let items: Vec<BatchItem> = items
+                .into_iter()
+                .map(|mut i| {
+                    i.user = ak.attributed_user(&i.user).to_owned();
+                    i
+                })
+                .collect();
             // atomic: the job becomes claimable only once all items are saved
             store
                 .batch_enqueue(&ak.ak, &ak.tenant, &model, &items)
@@ -39,8 +48,14 @@ impl OfflineHandler {
                 .await?;
             let this = self.clone();
             let (id, model) = (job.id.clone(), model.clone());
+            // items are captured HERE: an erasure landing after this instant
+            // must stop them, so the marker comparison point is submission,
+            // not the spawned executor's first poll
+            let captured_at = gw_state::epoch_millis();
             // claim 0: non-distributed store — no fence, the heartbeat is a no-op
-            tokio::spawn(async move { this.execute(&id, &ak, &model, items, 0).await });
+            tokio::spawn(
+                async move { this.execute(&id, &ak, &model, items, 0, captured_at).await },
+            );
             Ok(job)
         }
     }
@@ -49,7 +64,15 @@ impl OfflineHandler {
     /// the terminal status, heartbeating between items. `claim` is the fence
     /// token (0 for the in-process path); once a heartbeat reports the batch
     /// reclaimed, this executor stops rather than double-running items.
-    async fn execute(&self, id: &str, ak: &AkInfo, model: &str, items: Vec<BatchItem>, claim: i64) {
+    async fn execute(
+        &self,
+        id: &str,
+        ak: &AkInfo,
+        model: &str,
+        items: Vec<BatchItem>,
+        claim: i64,
+        captured_at: i64,
+    ) {
         let store = self.online.state().store.clone();
         // the distributed claim already set status=running with the fence bump;
         // only the in-process path needs this write — unfenced on the distributed
@@ -96,7 +119,7 @@ impl OfflineHandler {
                 }
             })
         };
-        for (index, item) in items.into_iter().enumerate() {
+        for (index, mut item) in items.into_iter().enumerate() {
             if lost.load(Relaxed) {
                 break; // reclaimed by another instance; stop running new items
             }
@@ -110,6 +133,51 @@ impl OfflineHandler {
             if claim != 0 && !matches!(store.batch_touch(id, claim).await, Ok(true)) {
                 lost.store(true, Relaxed);
                 break;
+            }
+            // re-read the stored copy just before dispatch: an erasure that
+            // landed while this batch sat queued blanks the persisted item.
+            // Fail CLOSED — a read error or vanished row can't prove the item
+            // wasn't erased, so the stale pre-load copy never dispatches
+            if store.distributed_batches() {
+                match store.batch_item_snapshot(id, index).await {
+                    Ok(Some(fresh)) => item = fresh,
+                    Ok(None) | Err(_) => {
+                        let result = BatchItemResult {
+                            index,
+                            ok: false,
+                            message: "item unavailable at dispatch".into(),
+                            total_tokens: 0,
+                            user: ak.attributed_user(&item.user).to_owned(),
+                        };
+                        if let Err(e) = store.batch_push_result(id, result).await {
+                            tracing::error!(error = %e, batch = %id, "batch result write failed");
+                        }
+                        continue;
+                    }
+                }
+            }
+            let user = ak.attributed_user(&item.user).to_owned();
+            // local backends don't persist items, so a mid-batch erasure can't
+            // blank them — the erasure marker stops the user's remaining items
+            // (fail closed on a marker read error). An erased item must not
+            // run: fail it instead of sending an erased prompt upstream
+            let erased_mid_batch = !store.distributed_batches()
+                && store
+                    .user_erased_since(&ak.tenant, &user, captured_at)
+                    .await
+                    .unwrap_or(true);
+            if erased_mid_batch || item.messages.is_empty() {
+                let result = BatchItemResult {
+                    index,
+                    ok: false,
+                    message: "item content erased".into(),
+                    total_tokens: 0,
+                    user,
+                };
+                if let Err(e) = store.batch_push_result(id, result).await {
+                    tracing::error!(error = %e, batch = %id, "batch result write failed");
+                }
+                continue;
             }
             let request = GatewayRequest {
                 is_online: false,
@@ -132,6 +200,7 @@ impl OfflineHandler {
                 ok: false,
                 message,
                 total_tokens: 0,
+                user: user.clone(),
             };
             let result = match ran {
                 Ok(Ok(ctx)) => match ctx.outcome {
@@ -140,6 +209,7 @@ impl OfflineHandler {
                         ok: true,
                         message: out.response.message,
                         total_tokens: out.response.total_tokens,
+                        user: user.clone(),
                     },
                     None => fail("pipeline produced no outcome".into()),
                 },
@@ -199,7 +269,15 @@ impl OfflineHandler {
                             continue;
                         }
                     };
-                    self.execute(&job.id, &ak, &job.model, items, claim).await;
+                    self.execute(
+                        &job.id,
+                        &ak,
+                        &job.model,
+                        items,
+                        claim,
+                        gw_state::epoch_millis(),
+                    )
+                    .await;
                 }
                 Ok(None) => tokio::time::sleep(poll).await,
                 Err(e) => {
