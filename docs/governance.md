@@ -158,3 +158,7 @@ only its audit is aggregated (a store write per token would be too hot).
   expiry; an hourly purge deletes elapsed content. Read back with
   `GET /admin/audit/content/{request_id}` (tenant-scoped; sealed rows are
   unsealed when the key is present, else returned as `content: null`).
+  `DELETE /admin/audit/content?user=` erases every retained row for one end
+  user (the GDPR/PIPL right-to-erasure hook), tenant-scoped and itself
+  recorded in the admin-op trail; ledger rows and security events carry no
+  content and are kept (billing/audit legal basis).

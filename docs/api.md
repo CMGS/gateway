@@ -138,6 +138,7 @@ surface on a private network regardless.
 | GET | `/admin/audit/events` | content-safety hits (blocklist / regex / DLP / moderation) recorded without prompt text; `?limit=`; tenant-scoped |
 | GET | `/admin/audit/ops` | admin-operation trail (key CRUD, config publish, reload) with actor, target, and source IP; `?limit=`; global token only |
 | GET | `/admin/audit/content/{request_id}` | retained prompt/response for one request, unsealed when `GW_CONTENT_KEY` is set (sealed rows without it return `content: null`); tenant-scoped |
+| DELETE | `/admin/audit/content?user=` | erase all retained content for one end user (GDPR/PIPL); tenant-scoped, audited as `content_erase` |
 
 Two token tiers: the global token (`admin.token_env`) manages everything; a
 tenant's `admin_token_env` token manages only that tenant's keys, usage, and

@@ -127,6 +127,10 @@ pub fn app(state: AppState) -> Router {
         .route("/admin/audit/ops", get(admin_audit_ops))
         .route("/admin/audit/content/{request_id}", get(admin_content_get))
         .route(
+            "/admin/audit/content",
+            axum::routing::delete(admin_content_erase),
+        )
+        .route(
             "/admin/keys/{ak}",
             axum::routing::patch(admin_key_patch).delete(admin_key_delete),
         )
@@ -1695,6 +1699,47 @@ async fn admin_content_get(
     Json(json!({ "request_id": request_id, "entries": entries })).into_response()
 }
 
+/// DELETE /admin/audit/content?user= — erase every retained content row for
+/// one end user (the GDPR/PIPL right-to-erasure hook). Tenant-scoped like the
+/// other content reads; recorded in the admin-op trail as `content_erase`.
+/// Ledger rows and security events carry no content and are kept.
+async fn admin_content_erase(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    AuditSourceIp(source): AuditSourceIp,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let scope = match admin_auth(&s, &headers) {
+        Ok(scope) => scope,
+        Err(r) => return r,
+    };
+    let Some(user) = q.get("user").filter(|u| !u.is_empty()) else {
+        return error_response(400, "user is required");
+    };
+    let tenant = scope.tenant_filter(&q);
+    match s
+        .handler
+        .state()
+        .store
+        .content_erase_user(tenant.as_deref(), user)
+        .await
+    {
+        Ok(deleted) => {
+            audit_admin(
+                &s,
+                &scope,
+                source,
+                "content_erase",
+                user,
+                format!("rows={deleted}"),
+            )
+            .await;
+            Json(json!({ "user": user, "deleted": deleted })).into_response()
+        }
+        Err(e) => gateway_error(e),
+    }
+}
+
 fn gateway_error(e: GatewayError) -> Response {
     let code = StatusCode::from_u16(e.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     // OpenAI's error schema types `code` as string-or-null, never a number.
@@ -3230,6 +3275,93 @@ mod tests {
             events.iter().any(|e| e.rule == "dlp"),
             "an inbound PII redaction was recorded, no prompt text stored"
         );
+    }
+
+    #[tokio::test]
+    async fn content_erase_is_tenant_scoped_and_audited() {
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_ERASE_ADMIN}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\ntenants: [{name: t1}, {name: t2, admin_token_env: GW_TEST_ERASE_T2}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 10, daily_token_quota: 1000}]";
+        // SAFETY: unique var names for this test; no concurrent reader of them.
+        unsafe {
+            std::env::set_var("GW_TEST_ERASE_ADMIN", "root-tok");
+            std::env::set_var("GW_TEST_ERASE_T2", "t2-tok");
+        }
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let store = app_state.handler.state().store.clone();
+        let rec = |req: &str, tenant: &str| gw_state::ContentRecord {
+            created_at_epoch_secs: 100,
+            request_id: req.into(),
+            ak: "k1".into(),
+            user_id: "u1".into(),
+            tenant: tenant.into(),
+            kind: "prompt".into(),
+            content: "hello".into(),
+            sealed: false,
+            expires_at_epoch_secs: 0,
+        };
+        store.content_add(&rec("r1", "t1")).await.unwrap();
+        store.content_add(&rec("r2", "t2")).await.unwrap();
+        let router = app(app_state);
+
+        let erase = |token: &'static str| {
+            Request::builder()
+                .method("DELETE")
+                .uri("/admin/audit/content?user=u1")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = router.clone().oneshot(erase("t2-tok")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["deleted"], 1, "tenant admin erases only its own tenant");
+        assert_eq!(
+            store.content_for("r1").await.unwrap().len(),
+            1,
+            "the other tenant's row is untouched"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/audit/content")
+                    .header("authorization", "Bearer root-tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "user is required");
+
+        let resp = router.clone().oneshot(erase("root-tok")).await.unwrap();
+        assert_eq!(
+            body_json(resp).await["deleted"],
+            1,
+            "global erase gets the rest"
+        );
+
+        let ops = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/audit/ops")
+                    .header("authorization", "Bearer root-tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let j = body_json(ops).await;
+        let erases: Vec<_> = j["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"] == "content_erase" && e["target"] == "u1")
+            .collect();
+        assert_eq!(erases.len(), 2, "both erasures audited");
     }
 
     #[tokio::test]

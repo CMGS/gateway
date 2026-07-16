@@ -384,6 +384,10 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// Delete content whose `expires_at_epoch_secs` is in `(0, now]`; returns the
     /// number deleted. Rows with `expires_at = 0` are kept until manual purge.
     async fn content_purge(&self, now_epoch_secs: i64) -> GResult<u64>;
+    /// Delete every retained content row for `user`, optionally confined to one
+    /// tenant (a tenant admin's scope); rows deleted. The GDPR/PIPL erasure
+    /// hook — security events and ledger rows carry no content and are kept.
+    async fn content_erase_user(&self, tenant: Option<&str>, user: &str) -> GResult<u64>;
     /// The retained content for one request (both prompt and response rows).
     async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>>;
 
@@ -683,6 +687,16 @@ impl Store for MemoryStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = content.len();
         content.retain(|r| r.expires_at_epoch_secs == 0 || r.expires_at_epoch_secs > now);
+        Ok((before - content.len()) as u64)
+    }
+
+    async fn content_erase_user(&self, tenant: Option<&str>, user: &str) -> GResult<u64> {
+        let mut content = self
+            .content
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = content.len();
+        content.retain(|r| r.user_id != user || tenant.is_some_and(|t| t != r.tenant));
         Ok((before - content.len()) as u64)
     }
 
@@ -1217,6 +1231,18 @@ impl Store for SqliteStore {
         Ok(r.rows_affected())
     }
 
+    async fn content_erase_user(&self, tenant: Option<&str>, user: &str) -> GResult<u64> {
+        let r = sqlx::query(
+            "DELETE FROM request_content WHERE user_id = ?1 AND (?2 IS NULL OR tenant = ?2)",
+        )
+        .bind(user)
+        .bind(tenant)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("erase user content", e))?;
+        Ok(r.rows_affected())
+    }
+
     async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
         let rows = sqlx::query(
             "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
@@ -1747,6 +1773,19 @@ impl Store for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("purge content", e))?;
+        Ok(r.rows_affected())
+    }
+
+    async fn content_erase_user(&self, tenant: Option<&str>, user: &str) -> GResult<u64> {
+        let r = sqlx::query(
+            "DELETE FROM request_content
+             WHERE user_id = $1 AND ($2::text IS NULL OR tenant = $2)",
+        )
+        .bind(user)
+        .bind(tenant)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("erase user content", e))?;
         Ok(r.rows_affected())
     }
 
@@ -2382,6 +2421,54 @@ mod tests {
             usage.iter().any(|r| r.user_id == "bob"),
             "unrolled tail served from the raw ledger"
         );
+    }
+
+    async fn exercise_erase(store: &dyn Store) {
+        let rec = |req: &str, user: &str, tenant: &str| crate::ContentRecord {
+            created_at_epoch_secs: 100,
+            request_id: req.into(),
+            ak: "ak".into(),
+            user_id: user.into(),
+            tenant: tenant.into(),
+            kind: "prompt".into(),
+            content: "hello".into(),
+            sealed: false,
+            expires_at_epoch_secs: 0,
+        };
+        store.content_add(&rec("r1", "u1", "t1")).await.unwrap();
+        store.content_add(&rec("r2", "u1", "t2")).await.unwrap();
+        store.content_add(&rec("r3", "u2", "t1")).await.unwrap();
+
+        assert_eq!(
+            store.content_erase_user(Some("t1"), "u1").await.unwrap(),
+            1,
+            "tenant-scoped erase touches only that tenant's rows"
+        );
+        assert_eq!(store.content_for("r2").await.unwrap().len(), 1);
+        assert_eq!(
+            store.content_erase_user(None, "u1").await.unwrap(),
+            1,
+            "global erase removes the remaining tenant's row"
+        );
+        assert_eq!(
+            store.content_for("r3").await.unwrap().len(),
+            1,
+            "other users' content is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_erase_roundtrip() {
+        exercise_erase(&MemoryStore::default()).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_erase_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("erase.db").to_str().unwrap())
+            .await
+            .unwrap();
+        exercise_erase(&store).await;
     }
 
     #[tokio::test]
