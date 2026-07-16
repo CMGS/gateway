@@ -1016,6 +1016,20 @@ mod tests {
             users.contains("alice") && users.contains("bob"),
             "each shared-key batch item bills to its own user: {users:?}"
         );
+        let results = h
+            .state()
+            .store
+            .batch_get(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .results;
+        let owners: std::collections::HashSet<&str> =
+            results.iter().map(|r| r.user.as_str()).collect();
+        assert!(
+            owners.contains("alice") && owners.contains("bob"),
+            "each generated result carries its owner: {owners:?}"
+        );
     }
 
     #[tokio::test]
@@ -1085,6 +1099,15 @@ mod tests {
         assert!(
             users.contains("alice") && users.contains("bob"),
             "distributed batch preserved per-item user attribution: {users:?}"
+        );
+        assert!(
+            state
+                .store
+                .batch_load_items(&job.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a terminal batch's input rows are pruned"
         );
     }
 }

@@ -111,6 +111,7 @@ impl OfflineHandler {
                 lost.store(true, Relaxed);
                 break;
             }
+            let user = ak.attributed_user(&item.user).to_owned();
             let request = GatewayRequest {
                 is_online: false,
                 ak: ak.ak.clone(),
@@ -132,6 +133,7 @@ impl OfflineHandler {
                 ok: false,
                 message,
                 total_tokens: 0,
+                user: user.clone(),
             };
             let result = match ran {
                 Ok(Ok(ctx)) => match ctx.outcome {
@@ -140,6 +142,7 @@ impl OfflineHandler {
                         ok: true,
                         message: out.response.message,
                         total_tokens: out.response.total_tokens,
+                        user: user.clone(),
                     },
                     None => fail("pipeline produced no outcome".into()),
                 },

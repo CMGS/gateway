@@ -22,6 +22,7 @@ pub fn spawn_quota_reset(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // first tick fires immediately; skip it
         loop {
             tick.tick().await;
@@ -39,6 +40,7 @@ pub fn spawn_content_purge(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await;
         loop {
             tick.tick().await;
@@ -61,6 +63,7 @@ pub fn spawn_usage_rollup(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await;
         loop {
             tick.tick().await;
