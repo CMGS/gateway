@@ -35,6 +35,13 @@ const ROLLUP_BUCKET_SECS: i64 = 60;
 /// catches up whole), so late rows and missed ticks self-heal.
 const ROLLUP_BACKFILL_SECS: i64 = 20 * 60;
 
+/// A minute is rolled only once it has been closed for at least this long, so
+/// an in-flight billing write (or a replica whose clock trails by less than a
+/// minute) can never land a row in an already-rolled minute — which is what
+/// makes the max-upsert sound: a rolled minute's source set can only shrink
+/// (pruning), never grow.
+const ROLLUP_SETTLE_SECS: i64 = ROLLUP_BUCKET_SECS;
+
 /// Postgres advisory-lock key serializing the fleet's rollup: one replica
 /// advances per tick, the rest skip (the upsert is idempotent either way —
 /// the lock only avoids N replicas repeating the same scan).
@@ -435,8 +442,9 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     /// Store `content` under a fresh id owned by `tenant`; returns the metadata.
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile>;
     async fn file_get(&self, id: &str) -> GResult<Option<StoredFile>>;
-    /// Delete an uploaded file outright; whether it existed.
-    async fn file_delete(&self, id: &str) -> GResult<bool>;
+    /// Delete `tenant`'s uploaded file in one guarded statement (no
+    /// check-then-delete window); whether it existed under that tenant.
+    async fn file_delete(&self, id: &str, tenant: &str) -> GResult<bool>;
 
     async fn batch_create(
         &self,
@@ -643,7 +651,7 @@ impl Store for MemoryStore {
     }
 
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
-        let hi = bucket_floor(now);
+        let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let mut rollup = self
             .rollup
             .lock()
@@ -807,8 +815,11 @@ impl Store for MemoryStore {
         Ok(self.files.get(id).map(|f| f.value().clone()))
     }
 
-    async fn file_delete(&self, id: &str) -> GResult<bool> {
-        Ok(self.files.remove(id).is_some())
+    async fn file_delete(&self, id: &str, tenant: &str) -> GResult<bool> {
+        Ok(self
+            .files
+            .remove_if(id, |_, f| f.tenant == tenant)
+            .is_some())
     }
 
     async fn batch_create(
@@ -929,6 +940,25 @@ where
         total_tokens: row.get(3),
         user: row.get(4),
     }
+}
+
+/// A terminal batch's input rows have served their purpose — delete them in
+/// the same transaction as the status write, so submitted prompt text cannot
+/// outlive the run even across a crash between statements.
+async fn prune_terminal_items(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    status: BatchStatus,
+) -> GResult<()> {
+    if !matches!(status, BatchStatus::Completed | BatchStatus::Failed) {
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM batch_items WHERE batch_id = $1")
+        .bind(id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| crate::sqlx_err("prune batch items", e))?;
+    Ok(())
 }
 
 /// SQLite-backed store (WAL): ledger, files, and batch jobs in one database
@@ -1190,7 +1220,7 @@ impl Store for SqliteStore {
     }
 
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
-        let hi = bucket_floor(now);
+        let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let watermark: i64 =
             sqlx::query_scalar("SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup")
                 .fetch_one(&self.pool)
@@ -1384,10 +1414,13 @@ impl Store for SqliteStore {
 
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
         let bytes = content.len();
-        // SQLite serializes writers, so the MAX(n)+1 subselect is atomic with the insert
+        // ids derive from the AUTOINCREMENT sequence (sqlite_sequence), which a
+        // delete never rewinds — MAX(n)+1 would recycle a deleted file's id
         let id: String = sqlx::query_scalar(
             "INSERT INTO files (id, tenant, purpose, bytes, content)
-             VALUES ('file-' || (SELECT COALESCE(MAX(n), 0) + 1 FROM files), ?, ?, ?, ?)
+             VALUES ('file-' || (SELECT COALESCE(
+                       (SELECT seq FROM sqlite_sequence WHERE name = 'files'), 0) + 1),
+                     ?, ?, ?, ?)
              RETURNING id",
         )
         .bind(tenant)
@@ -1421,9 +1454,10 @@ impl Store for SqliteStore {
         }))
     }
 
-    async fn file_delete(&self, id: &str) -> GResult<bool> {
-        let r = sqlx::query("DELETE FROM files WHERE id = ?")
+    async fn file_delete(&self, id: &str, tenant: &str) -> GResult<bool> {
+        let r = sqlx::query("DELETE FROM files WHERE id = ? AND tenant = ?")
             .bind(id)
+            .bind(tenant)
             .execute(&self.pool)
             .await
             .map_err(|e| crate::sqlx_err("delete file", e))?;
@@ -1534,20 +1568,6 @@ pub struct PostgresStore {
 impl PostgresStore {
     pub async fn connect(url: &str) -> GResult<Self> {
         Self::connect_with_cap(url, 0).await
-    }
-
-    /// A terminal batch's input rows have served their purpose — delete them so
-    /// submitted prompt text does not outlive the run.
-    async fn prune_terminal_items(&self, id: &str, status: BatchStatus) -> GResult<()> {
-        if !matches!(status, BatchStatus::Completed | BatchStatus::Failed) {
-            return Ok(());
-        }
-        sqlx::query("DELETE FROM batch_items WHERE batch_id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("prune batch items", e))?;
-        Ok(())
     }
 
     /// `ledger_max_rows` > 0 prunes the oldest billing rows past the cap on write.
@@ -1804,7 +1824,7 @@ impl Store for PostgresStore {
     }
 
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
-        let hi = bucket_floor(now);
+        let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let mut tx = self
             .pool
             .begin()
@@ -1985,12 +2005,12 @@ impl Store for PostgresStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| crate::sqlx_err("erase batch results", e))?;
-        // leftovers from batches that went terminal before item pruning shipped
+        // pending/running batches included: the emptied item fails at execution
+        // instead of running erased content (terminal batches already pruned)
         let i = sqlx::query(
-            "DELETE FROM batch_items i USING batches b
-             WHERE i.batch_id = b.id AND i.user_id = $1
-               AND ($2::text IS NULL OR b.tenant = $2)
-               AND b.status IN ('completed', 'failed')",
+            "UPDATE batch_items i SET messages = '[]' FROM batches b
+             WHERE i.batch_id = b.id AND i.user_id = $1 AND i.messages <> '[]'
+               AND ($2::text IS NULL OR b.tenant = $2)",
         )
         .bind(user)
         .bind(tenant)
@@ -2071,9 +2091,10 @@ impl Store for PostgresStore {
         }))
     }
 
-    async fn file_delete(&self, id: &str) -> GResult<bool> {
-        let r = sqlx::query("DELETE FROM files WHERE id = $1")
+    async fn file_delete(&self, id: &str, tenant: &str) -> GResult<bool> {
+        let r = sqlx::query("DELETE FROM files WHERE id = $1 AND tenant = $2")
             .bind(id)
+            .bind(tenant)
             .execute(&self.pool)
             .await
             .map_err(|e| crate::sqlx_err("delete file", e))?;
@@ -2136,13 +2157,21 @@ impl Store for PostgresStore {
     }
 
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("begin status", e))?;
         sqlx::query("UPDATE batches SET status = $1 WHERE id = $2")
             .bind(status.as_str())
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| crate::sqlx_err("update batch status", e))?;
-        self.prune_terminal_items(id, status).await
+        prune_terminal_items(&mut tx, id, status).await?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit status", e))
     }
 
     async fn batch_set_status_owned(
@@ -2151,17 +2180,25 @@ impl Store for PostgresStore {
         status: BatchStatus,
         claim: i64,
     ) -> GResult<bool> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| crate::sqlx_err("begin status", e))?;
         let r = sqlx::query("UPDATE batches SET status = $1 WHERE id = $2 AND claim_seq = $3")
             .bind(status.as_str())
             .bind(id)
             .bind(claim)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| crate::sqlx_err("update batch status (fenced)", e))?;
         let applied = r.rows_affected() > 0;
         if applied {
-            self.prune_terminal_items(id, status).await?;
+            prune_terminal_items(&mut tx, id, status).await?;
         }
+        tx.commit()
+            .await
+            .map_err(|e| crate::sqlx_err("commit status", e))?;
         Ok(applied)
     }
 
@@ -2815,6 +2852,48 @@ mod tests {
         .expect("truncate");
         exercise_rollup(&store).await;
         exercise_erase(&store).await;
+
+        // erasure reaches a still-pending batch's inputs (PG-only store)
+        let items = vec![
+            gw_models::BatchItem {
+                messages: vec![gw_models::ChatMsg::text("user", "erase me")],
+                user: "u1".into(),
+            },
+            gw_models::BatchItem {
+                messages: vec![gw_models::ChatMsg::text("user", "keep me")],
+                user: "u2".into(),
+            },
+        ];
+        let pending = store
+            .batch_enqueue("ak", "t1", "gpt-4o", &items)
+            .await
+            .unwrap();
+        let audit2 = AdminAudit {
+            created_at_epoch_secs: 21,
+            actor: "global".into(),
+            scope: "global".into(),
+            action: "content_erase".into(),
+            target: "u1".into(),
+            summary: String::new(),
+            source_ip: "10.0.0.1".into(),
+        };
+        assert_eq!(
+            store
+                .content_erase_user(Some("t1"), "u1", audit2)
+                .await
+                .unwrap(),
+            1,
+            "the pending item's prompt is blanked"
+        );
+        let loaded = store.batch_load_items(&pending.id).await.unwrap();
+        assert!(
+            loaded[0].messages.is_empty(),
+            "u1's queued prompt erased before any drainer ran"
+        );
+        assert_eq!(
+            loaded[1].messages[0].content, "keep me",
+            "other users' queued items untouched"
+        );
     }
 
     #[tokio::test]
@@ -2824,6 +2903,26 @@ mod tests {
             .await
             .unwrap();
         exercise_erase(&store).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_file_ids_never_recycle_after_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("files.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let a = store.file_put("t1", "batch", "one".into()).await.unwrap();
+        assert!(store.file_delete(&a.id, "t1").await.unwrap());
+        let b = store.file_put("t1", "batch", "two".into()).await.unwrap();
+        assert_ne!(
+            a.id, b.id,
+            "a deleted file's id must not be handed to a new upload"
+        );
+        assert!(
+            !store.file_delete(&b.id, "t2").await.unwrap(),
+            "a foreign tenant's delete is a guarded no-op"
+        );
+        assert!(store.file_get(&b.id).await.unwrap().is_some());
     }
 
     #[tokio::test]

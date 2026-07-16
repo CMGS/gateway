@@ -981,6 +981,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn erased_batch_item_fails_instead_of_running() {
+        let h = handler();
+        let off = OfflineHandler::new(h.clone());
+        let key = ak(&h).await;
+        let job = off
+            .submit(
+                key,
+                "gpt-4o".into(),
+                vec![BatchItem {
+                    messages: Vec::new(),
+                    user: "u1".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        wait_terminal(&h, &job.id).await;
+        let done = h.state().store.batch_get(&job.id).await.unwrap().unwrap();
+        assert!(!done.results[0].ok, "an erased item must not execute");
+        assert_eq!(done.results[0].message, "item content erased");
+        assert_eq!(done.results[0].total_tokens, 0, "nothing billed");
+    }
+
+    #[tokio::test]
     async fn batch_attributes_each_item_to_its_user() {
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());

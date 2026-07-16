@@ -112,6 +112,21 @@ impl OfflineHandler {
                 break;
             }
             let user = ak.attributed_user(&item.user).to_owned();
+            // an erased item (messages blanked by content_erase_user) must not
+            // run: fail it instead of sending an empty prompt upstream
+            if item.messages.is_empty() {
+                let result = BatchItemResult {
+                    index,
+                    ok: false,
+                    message: "item content erased".into(),
+                    total_tokens: 0,
+                    user,
+                };
+                if let Err(e) = store.batch_push_result(id, result).await {
+                    tracing::error!(error = %e, batch = %id, "batch result write failed");
+                }
+                continue;
+            }
             let request = GatewayRequest {
                 is_online: false,
                 ak: ak.ak.clone(),

@@ -3111,12 +3111,11 @@ async fn files_delete(
         Ok(ak) => ak,
         Err((st, msg)) => return error_response(st, msg),
     };
-    let found = s.handler.state().store.file_get(&id).await;
-    if let Err(resp) = tenant_owned(found, |f| &f.tenant, &ak.tenant, "file", &id) {
-        return resp;
-    }
-    match s.handler.state().store.file_delete(&id).await {
-        Ok(_) => Json(json!({"id": id, "object": "file", "deleted": true})).into_response(),
+    // one guarded delete — a check-then-delete pair would race a concurrent
+    // delete + id reuse into removing another tenant's file
+    match s.handler.state().store.file_delete(&id, &ak.tenant).await {
+        Ok(true) => Json(json!({"id": id, "object": "file", "deleted": true})).into_response(),
+        Ok(false) => error_response(404, format!("file {id} not found")),
         Err(e) => gateway_error(e),
     }
 }

@@ -164,13 +164,17 @@ only its audit is aggregated (a store write per token would be too hot).
   unsealed when the key is present, else returned as `content: null`).
   `DELETE /admin/audit/content?user=` erases every retained trace of one end
   user's content (the GDPR/PIPL right-to-erasure hook): retained rows, batch
-  result messages, and any leftover terminal batch inputs — tenant-scoped, and
-  the `content_erase` audit entry commits with the deletion so a recorded
-  success can't separate from it. Erasure is a point-in-time operation: a
-  request already in flight may persist content just after it, so quiesce the
-  user's traffic first or simply repeat the call. Ledger rows and security
-  events carry no content and are kept (billing/audit legal basis). Uploaded
-  files are tenant-owned assets with no per-user dimension — the tenant deletes
-  them via `DELETE /v1/files/{id}`. A batch's input rows are deleted as soon as
-  the batch reaches a terminal status, so submitted prompt text does not
-  outlive the run.
+  result messages, and queued batch inputs — a pending/running item belonging
+  to the user is blanked in place and fails at execution instead of running
+  erased content. Tenant-scoped, and the `content_erase` audit entry commits
+  with the deletion so a recorded success can't separate from it. Erasure
+  reaches only attributed content: a batch item submitted without any
+  `user`/`x-gw-user` has no erasure subject (shared-key anonymous submission
+  opts out of per-user erasure by construction). Erasure is a point-in-time
+  operation: a request already in flight may persist content just after it, so
+  quiesce the user's traffic first or simply repeat the call. Ledger rows and
+  security events carry no content and are kept (billing/audit legal basis).
+  Uploaded files are tenant-owned assets with no per-user dimension — the
+  tenant deletes them via `DELETE /v1/files/{id}`. A batch's input rows are
+  deleted as soon as the batch reaches a terminal status, so submitted prompt
+  text does not outlive the run.
