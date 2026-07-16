@@ -251,10 +251,12 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     /// Take one permit. qps >= 1: replenish/burst = round(qps); 0 < qps < 1: one
-    /// permit per 1/qps seconds (burst 1); qps <= 0: always denied. A bucket whose
-    /// stored qps differs is rebuilt (starts full) so limit changes apply at once.
+    /// permit per 1/qps seconds (burst 1); qps <= 0 or non-finite: always denied
+    /// (a NaN never equals the stored qps, so it would rebuild a full bucket
+    /// every call — an unlimited bypass). A bucket whose stored qps differs is
+    /// rebuilt (starts full) so limit changes apply at once.
     pub fn allow(&self, key: &str, qps: f64) -> bool {
-        if qps <= 0.0 {
+        if !qps.is_finite() || qps <= 0.0 {
             return false;
         }
         let mut e = slot_mut(&self.buckets, key, || (qps, new_bucket(qps)));
@@ -946,6 +948,18 @@ mod tests {
         assert!(!rl.allow("frac", 0.5));
         assert!(!rl.allow("zero", 0.0));
         assert!(!rl.allow("neg", -1.0));
+    }
+
+    #[test]
+    fn non_finite_qps_is_denied() {
+        let rl = RateLimiter::default();
+        for _ in 0..3 {
+            assert!(
+                !rl.allow("nan", f64::NAN),
+                "NaN must fail closed, not rebuild a full bucket per call"
+            );
+        }
+        assert!(!rl.allow("inf", f64::INFINITY));
     }
 
     #[tokio::test]

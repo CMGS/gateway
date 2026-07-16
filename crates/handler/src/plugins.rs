@@ -5,7 +5,7 @@
 //! surfaces buffer and replay the redacted text when outbound DLP is on.
 
 use gw_config::{Action, SecurityConf};
-use gw_models::{Block, ChatMsg, GatewayRequest, GatewayResponse};
+use gw_models::{Block, ChatMsg, GatewayRequest, GatewayResponse, ModelParamV2};
 
 const BLOCKED_MSG: &str = "this content cannot be answered, please try a different request";
 
@@ -38,10 +38,7 @@ pub fn security_check(sec: &SecurityConf, request: &mut GatewayRequest) -> ScanO
         for_each_message_text(msg, &mut visit);
     }
     if let Some(param) = request.model_param_v2.as_mut() {
-        walk_json_strings(&mut param.raw, &mut visit);
-        if let Some(typed) = param.typed.as_mut() {
-            for_each_typed_text(typed, &mut visit);
-        }
+        for_each_param_text(param, &mut visit);
     }
     counts.outcome()
 }
@@ -115,10 +112,7 @@ pub fn inbound_text(request: &mut GatewayRequest) -> String {
         for_each_message_text(m, &mut collect);
     }
     if let Some(param) = request.model_param_v2.as_mut() {
-        walk_json_strings(&mut param.raw, &mut collect);
-        if let Some(typed) = param.typed.as_mut() {
-            for_each_typed_text(typed, &mut collect);
-        }
+        for_each_param_text(param, &mut collect);
     }
     out
 }
@@ -175,6 +169,27 @@ fn for_each_message_text(msg: &mut ChatMsg, f: &mut impl FnMut(&mut String) -> u
     }
     if let Some(tc) = &mut msg.tool_calls {
         n += walk_json_strings(tc, f);
+    }
+    n
+}
+
+/// The text-bearing fields of the request tail — the raw native body plus the
+/// family typed params — the ONE tail field list all three scans traverse.
+/// `raw` is a content-block tree only on Responses (the whole wire body, where
+/// the media-skip walker keeps base64 out of the scan); Chat/Messages put a
+/// flat vendor `extra` passthrough there, whose keys are arbitrary and may be
+/// prose (e.g. Anthropic `metadata`), so every string leaf must be visited.
+fn for_each_param_text(
+    param: &mut ModelParamV2,
+    f: &mut impl FnMut(&mut String) -> usize,
+) -> usize {
+    let mut n = if matches!(param.protocol, gw_consts::Protocol::Responses) {
+        walk_part_text(&mut param.raw, f)
+    } else {
+        walk_json_strings(&mut param.raw, f)
+    };
+    if let Some(typed) = param.typed.as_mut() {
+        n += for_each_typed_text(typed, f);
     }
     n
 }
@@ -302,13 +317,8 @@ pub fn dlp_redact_request(sec: &SecurityConf, request: &mut GatewayRequest) -> u
     for msg in &mut request.message {
         hits += for_each_message_text(msg, &mut redact_field);
     }
-    // non-chat surfaces carry user text outside `message` (Responses raw body,
-    // family typed params) — scrub those too or they reach the vendor unredacted
     if let Some(param) = request.model_param_v2.as_mut() {
-        hits += walk_json_strings(&mut param.raw, &mut redact_field);
-        if let Some(typed) = param.typed.as_mut() {
-            hits += for_each_typed_text(typed, &mut redact_field);
-        }
+        hits += for_each_param_text(param, &mut redact_field);
     }
     hits
 }
@@ -747,6 +757,82 @@ mod tests {
             security_check(&sec(), &mut req).block.is_none(),
             "base64 image data must not be scanned for blocklist terms"
         );
+    }
+
+    #[test]
+    fn responses_raw_skips_media_but_scans_text() {
+        let noise = format!("data:image/png;base64,AAAA{}BBBB", "forbiddenword");
+        let mut param = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Responses, "m");
+        param.raw = serde_json::json!({"model":"m","input":[{"role":"user","content":[
+            {"type":"input_image","image_url": noise},
+            {"type":"input_text","text":"hello"}]}]});
+        let mut req = GatewayRequest {
+            model_param_v2: Some(param),
+            ..Default::default()
+        };
+        assert!(
+            security_check(&sec(), &mut req).block.is_none(),
+            "base64 image_url in the raw body must not match the blocklist"
+        );
+
+        let mut param = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Responses, "m");
+        param.raw = serde_json::json!({"input":[{"role":"user","content":[
+            {"type":"input_text","text":"say forbiddenword"}]}]});
+        let mut req = GatewayRequest {
+            model_param_v2: Some(param),
+            ..Default::default()
+        };
+        assert!(
+            security_check(&sec(), &mut req).block.is_some(),
+            "raw input_text is still scanned"
+        );
+    }
+
+    #[test]
+    fn dlp_leaves_raw_file_data_intact() {
+        let s = SecurityConf {
+            detect_secrets: true,
+            dlp_redact: false,
+            ..Default::default()
+        };
+        let blob = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        let mut param = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Responses, "m");
+        param.raw = serde_json::json!({"input":[{"role":"user","content":[
+            {"type":"input_file","filename":"a.pdf","file_data": blob}]}]});
+        let mut req = GatewayRequest {
+            model_param_v2: Some(param),
+            ..Default::default()
+        };
+        dlp_redact_request(&s, &mut req);
+        assert!(
+            req.model_param_v2.unwrap().raw.to_string().contains(blob),
+            "secret-shaped base64 noise inside file_data must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn flat_extra_bag_is_fully_scanned_not_content_block_skipped() {
+        // Chat/Messages `raw` is a flat vendor passthrough: keys named like a
+        // media/id field (`type`, `*_id`, Anthropic `metadata.user_id`) are
+        // still prose and must not be exempted the way content blocks are.
+        for proto in [
+            gw_consts::Protocol::OpenaiChat,
+            gw_consts::Protocol::AnthropicMessages,
+        ] {
+            let mut param = gw_models::ModelParamV2::with_name(proto, "m");
+            param.raw = serde_json::json!({
+                "type":"say forbiddenword",
+                "metadata":{"user_id":"forbiddenword"}
+            });
+            let mut req = GatewayRequest {
+                model_param_v2: Some(param),
+                ..Default::default()
+            };
+            assert!(
+                security_check(&sec(), &mut req).block.is_some(),
+                "flat extra prose under media-like keys must be scanned ({proto:?})"
+            );
+        }
     }
 
     #[test]

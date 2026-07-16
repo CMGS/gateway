@@ -50,7 +50,7 @@ pub enum ConfigError {
     BadFallbackModel { tenant: String, model: String },
     #[error("`{owner}` sets a negative price")]
     NegativePrice { owner: String },
-    #[error("`{owner}` sets a negative limit")]
+    #[error("`{owner}` sets a negative or non-finite limit")]
     NegativeLimit { owner: String },
     #[error("storage.shared_cache needs storage.redis_url")]
     SharedCacheNeedsRedis,
@@ -637,10 +637,11 @@ impl GatewayConfig {
             }
         }
         // a negative quota/qps is a typo that would silently deny (or never
-        // limit) — reject at load like negative prices
+        // limit); a NaN qps would bypass the rate bucket — reject both at load
         let neg_limit = |owner: String| ConfigError::NegativeLimit { owner };
+        let bad_qps = |v: f64| !v.is_finite() || v < 0.0;
         for k in &self.access_keys {
-            if k.qps < 0.0
+            if bad_qps(k.qps)
                 || k.daily_token_quota < 0
                 || k.tokens_per_minute.is_some_and(|v| v < 0)
                 || k.model_quotas.values().any(|v| *v < 0)
@@ -649,7 +650,7 @@ impl GatewayConfig {
             }
         }
         for t in &self.tenants {
-            if t.qps.is_some_and(|v| v < 0.0)
+            if t.qps.is_some_and(bad_qps)
                 || t.user_daily_token_quota.is_some_and(|v| v < 0)
                 || t.model_quotas.values().any(|v| *v < 0)
             {
@@ -1176,6 +1177,19 @@ tenants: [{name: t1}, {name: t1}]
         let neg_tenant_qps = "listen: {host: h, port: 1}\ntenants: [{name: t1, qps: -1}]";
         assert!(matches!(
             GatewayConfig::from_yaml(neg_tenant_qps),
+            Err(ConfigError::NegativeLimit { .. })
+        ));
+        let nan_qps = "listen: {host: h, port: 1}\naccess_keys: [{ak: k1, product: p, qps: .nan, daily_token_quota: 10}]";
+        assert!(
+            matches!(
+                GatewayConfig::from_yaml(nan_qps),
+                Err(ConfigError::NegativeLimit { .. })
+            ),
+            "a NaN qps would rebuild a full rate bucket per request"
+        );
+        let nan_tenant_qps = "listen: {host: h, port: 1}\ntenants: [{name: t1, qps: .inf}]";
+        assert!(matches!(
+            GatewayConfig::from_yaml(nan_tenant_qps),
             Err(ConfigError::NegativeLimit { .. })
         ));
         let neg_qpm =
