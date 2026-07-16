@@ -241,14 +241,23 @@ fn is_media_block(ty: &str) -> bool {
     )
 }
 
-/// A media block's binary payload keys: base64/URL leaves a rewrite would
-/// corrupt and base64 noise could false-match a blocklist term. Skipped only
-/// inside a [`is_media_block`] object; the same name in a tool argument, a JSON
-/// Schema, or a metadata bag is prose and stays scanned.
+/// A media block's payload keys: base64/URL leaves a rewrite would corrupt or
+/// noise could false-match, the nested media containers (`image_url`,
+/// `input_audio`, Chat's `file`), and file-handle references (`file_id`).
+/// Skipped only inside a [`is_media_block`] object; the same name in a tool
+/// argument, a JSON Schema, or a metadata bag is prose and stays scanned.
 fn is_media_payload_key(k: &str) -> bool {
     matches!(
         k,
-        "image_url" | "input_audio" | "source" | "data" | "url" | "file_data" | "file_url"
+        "image_url"
+            | "input_audio"
+            | "source"
+            | "data"
+            | "url"
+            | "file"
+            | "file_id"
+            | "file_data"
+            | "file_url"
     )
 }
 
@@ -823,6 +832,55 @@ mod tests {
         assert!(
             req.model_param_v2.unwrap().raw.to_string().contains(blob),
             "secret-shaped base64 noise inside file_data must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn media_file_handles_and_nested_containers_are_skipped() {
+        // file references (input_image/input_file by file_id) and the Chat
+        // `file` container hold no prose — a blocklist term or base64 noise in
+        // them must not block, mirroring the image_url/input_audio containers.
+        let mut img = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Responses, "m");
+        img.raw = serde_json::json!({"input":[{"role":"user","content":[
+            {"type":"input_image","file_id":"file-forbiddenword"}]}]});
+        let mut file = gw_models::ModelParamV2::with_name(gw_consts::Protocol::Responses, "m");
+        file.raw = serde_json::json!({"input":[{"role":"user","content":[
+            {"type":"input_file","file_id":"file-forbiddenword"}]}]});
+        for param in [img, file] {
+            let mut req = GatewayRequest {
+                model_param_v2: Some(param),
+                ..Default::default()
+            };
+            assert!(
+                security_check(&sec(), &mut req).block.is_none(),
+                "a file_id handle is a reference, not content"
+            );
+        }
+
+        let mut msg = ChatMsg::text("user", String::new());
+        msg.parts = Some(serde_json::json!([
+            {"type":"file","file":{"filename":"a.pdf","file_data":"JVBERforbiddenword"}}]));
+        let mut req = GatewayRequest {
+            message: vec![msg],
+            ..Default::default()
+        };
+        assert!(
+            security_check(&sec(), &mut req).block.is_none(),
+            "base64 inside a Chat `file` container must not block"
+        );
+
+        // the type-gating still holds: a `file_id` in a tool argument (no media
+        // block) is prose and stays scanned
+        let mut msg = ChatMsg::text("user", String::new());
+        msg.parts = Some(serde_json::json!([
+            {"type":"tool_use","id":"t","name":"q","input":{"file_id":"forbiddenword"}}]));
+        let mut req = GatewayRequest {
+            message: vec![msg],
+            ..Default::default()
+        };
+        assert!(
+            security_check(&sec(), &mut req).block.is_some(),
+            "file_id in a tool argument is not a media handle"
         );
     }
 
