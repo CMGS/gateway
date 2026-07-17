@@ -590,10 +590,13 @@ impl DagNode for CallEngine {
                 let retry = gw_engines::get_engine(ctx.request.clone(), ctx.transport.clone())?;
                 match retry.run().await {
                     Ok(mut outcome) => {
-                        ctx.state
-                            .avail
-                            .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
-                        ctx.state.health.record_success(&next.name).await;
+                        // same aborted-stream exclusion as the first attempt
+                        if !outcome.response.aborted {
+                            ctx.state
+                                .avail
+                                .record(requested_model(ctx.request.model_param_v2.as_ref()), true);
+                            ctx.state.health.record_success(&next.name).await;
+                        }
                         outcome.response.ptu_spillover = spillover;
                         ctx.outcome = Some(outcome);
                         Ok(())
