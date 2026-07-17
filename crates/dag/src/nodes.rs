@@ -354,14 +354,18 @@ impl DagNode for SelectAccount {
             .state
             .pool
             .select_healthy(mt, provider, &[], ctx.state.health.as_ref())
-            .await
-            .ok_or_else(|| {
-                GatewayError::new(
-                    ErrCode::SYSTEM_ERROR,
-                    503,
-                    format!("no healthy upstream account serves model type `{mt}`"),
-                )
-            })?;
+            .await;
+        let Some(account) = account else {
+            // an exhausted pool (all accounts cooling, or none configured) is a
+            // client-visible model failure; without this sample a sustained
+            // outage sits below min_samples and reads as no_data forever
+            ctx.state.avail.record(requested_model(ctx), false);
+            return Err(GatewayError::new(
+                ErrCode::SYSTEM_ERROR,
+                503,
+                format!("no healthy upstream account serves model type `{mt}`"),
+            ));
+        };
         ctx.decide("select_account", account.name.clone());
         ctx.request.account = Some(account);
         Ok(())

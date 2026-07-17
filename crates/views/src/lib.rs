@@ -3466,6 +3466,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sustained_pool_exhaustion_converges_to_unavailable() {
+        // low threshold: requests past the 2nd die in SelectAccount during the
+        // cooldown — those 503s must sample too, or the outage reads no_data
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_OUT_ADMIN}\nmodels: [{name: m-out, protocol: openai-chat, provider: downp}]\naccounts: [{name: a-down, provider: downp, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]\nstability: {failure_threshold: 2, cooldown_seconds: 300, availability_min_samples: 5}";
+        // SAFETY: unique var name for this test; no concurrent reader of it.
+        unsafe {
+            std::env::set_var("GW_TEST_OUT_ADMIN", "out-tok");
+        }
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let avail = app_state.handler.state().avail.clone();
+        let router = app(app_state);
+        for _ in 0..6 {
+            let resp = router
+                .clone()
+                .oneshot(chat_req(
+                    Some("k1"),
+                    r#"{"model":"m-out","messages":[{"role":"user","content":"x"}]}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        avail.flush().await;
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/models/status")
+                    .header("authorization", "Bearer out-tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let j = body_json(resp).await;
+        let row = &j["models"][0];
+        assert_eq!(row["model"], "m-out");
+        assert_eq!(row["errors"], 6, "cooldown-era 503s sample too");
+        assert_eq!(row["state"], "unavailable");
+    }
+
+    #[tokio::test]
     async fn content_erase_is_tenant_scoped_and_audited() {
         let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_ERASE_ADMIN}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\ntenants: [{name: t1}, {name: t2, admin_token_env: GW_TEST_ERASE_T2}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 10, daily_token_quota: 1000}]";
         // SAFETY: unique var names for this test; no concurrent reader of them.
