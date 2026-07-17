@@ -493,6 +493,9 @@ impl DagNode for UserBudgetGate {
 /// model_access/call_engine: factory dispatch + engine execution + failover.
 /// On an upstream 5xx the failed account is excluded and reselected once (a
 /// PTU → paygo spill sets `ptu_spillover`); a second failure propagates as-is.
+/// Availability samples record the client-visible terminal outcome only — an
+/// attempt recovered by failover is the account health layer's business, not
+/// a model error.
 pub struct CallEngine;
 
 #[async_trait::async_trait]
@@ -527,7 +530,6 @@ impl DagNode for CallEngine {
                 Ok(())
             }
             Err(first_err) if first_err.http_status >= 500 => {
-                ctx.state.avail.record(served_model(ctx), false);
                 let mt = ctx
                     .request
                     .protocol()
@@ -564,6 +566,7 @@ impl DagNode for CallEngine {
                     )
                     .await;
                 let Some(next) = next else {
+                    ctx.state.avail.record(served_model(ctx), false);
                     return Err(first_err);
                 };
                 let spillover = failed.is_ptu() && !next.is_ptu();
@@ -585,9 +588,7 @@ impl DagNode for CallEngine {
                         Ok(())
                     }
                     Err(e) => {
-                        if e.http_status >= 500 {
-                            ctx.state.avail.record(served_model(ctx), false);
-                        }
+                        ctx.state.avail.record(served_model(ctx), false);
                         ctx.state
                             .health
                             .record_failure(&next.name, threshold, cooldown)
@@ -654,9 +655,12 @@ impl DagNode for CostCalc {
                 gw_models::estimate_prompt_tokens(&ctx.request.message, tools, model_name, enc)
             };
             let ct = enc.encode_len(&resp.message) as i64;
+            let rate = gw_state::model_token_rate(&ctx.cfg, served_model(ctx));
+            let tokens = BillTokens::weighted(pt, ct, &rate);
             ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
-            return bill(ctx, BillTokens::flat(pt, ct), true).await;
+            return bill(ctx, tokens, true).await;
         }
+        let rate = gw_state::model_token_rate(&ctx.cfg, served_model(ctx));
         // saturating sums so a malformed usage subtree can't overflow the totals
         let tokens = match &resp.common_usage {
             Some(u) => {
@@ -667,13 +671,6 @@ impl DagNode for CostCalc {
                     completion: u.completion,
                     reasoning: u.reason,
                 };
-                let served = ctx
-                    .request
-                    .model_param_v2
-                    .as_ref()
-                    .map(|p| p.model_name.as_str())
-                    .unwrap_or_default();
-                let rate = token_rate(&ctx.cfg, served);
                 BillTokens {
                     prompt: u.prompt_total(),
                     completion: u.completion_total(),
@@ -681,25 +678,9 @@ impl DagNode for CostCalc {
                     billable_completion: gw_models::weighted_completion(&ti, &rate),
                 }
             }
-            None => BillTokens::flat(resp.prompt_tokens, resp.completion_tokens),
+            None => BillTokens::weighted(resp.prompt_tokens, resp.completion_tokens, &rate),
         };
         bill(ctx, tokens, false).await
-    }
-}
-
-/// The served model's billing weights; identity when unconfigured. The
-/// `prompt_includes_cache` normalization already happened at usage extraction.
-fn token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_models::TokenRate {
-    match cfg.find_model(model).and_then(|m| m.token_rate) {
-        Some(r) => gw_models::TokenRate {
-            prompt_includes_cache: false,
-            prompt_weight: r.prompt,
-            read_cache_weight: r.read_cache,
-            write_cache_weight: r.write_cache,
-            completion_weight: r.completion,
-            reasoning_weight: r.reasoning,
-        },
-        None => gw_models::TokenRate::default(),
     }
 }
 
@@ -714,13 +695,20 @@ struct BillTokens {
 }
 
 impl BillTokens {
-    /// Unweighted counts: billable equals reported.
-    fn flat(prompt: i64, completion: i64) -> Self {
+    /// Prompt/completion-only counts with the model's weights applied — the
+    /// paths without a usage payload (estimates, malformed usage) must price
+    /// identically to the happy path or a cut stream changes effective pricing.
+    fn weighted(prompt: i64, completion: i64, rate: &gw_models::TokenRate) -> Self {
+        let ti = gw_models::TokenInput {
+            prompt,
+            completion,
+            ..Default::default()
+        };
         Self {
             prompt,
             completion,
-            billable_prompt: prompt,
-            billable_completion: completion,
+            billable_prompt: gw_models::weighted_prompt(&ti, rate),
+            billable_completion: gw_models::weighted_completion(&ti, rate),
         }
     }
 
@@ -906,19 +894,15 @@ fn served_model(ctx: &DagContext) -> &str {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn token_rate_maps_config_weights() {
-        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, token_rate: {read_cache: 0.1, write_cache: 1.25}}]";
-        let cfg = gw_config::GatewayConfig::from_yaml(yaml).unwrap();
-        let rate = super::token_rate(&cfg, "m");
-        assert_eq!(
-            (rate.read_cache_weight, rate.write_cache_weight),
-            (0.1, 1.25)
-        );
-        assert!(!rate.prompt_includes_cache);
-        assert_eq!(
-            super::token_rate(&cfg, "absent"),
-            gw_models::TokenRate::default()
-        );
+    fn bill_tokens_weighted_prices_estimate_paths() {
+        let rate = gw_models::TokenRate {
+            prompt_weight: 0.5,
+            ..Default::default()
+        };
+        let t = super::BillTokens::weighted(100, 50, &rate);
+        assert_eq!((t.prompt, t.completion), (100, 50));
+        assert_eq!((t.billable_prompt, t.billable_completion), (50, 50));
+        assert_eq!(t.total(), 100);
     }
 
     #[test]

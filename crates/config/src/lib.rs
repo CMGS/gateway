@@ -124,7 +124,8 @@ pub struct ModelConf {
     pub token_rate: Option<TokenRateConf>,
     /// Weighted routing split across other declared models (canary/gray);
     /// empty = this name serves itself. A self-referencing entry keeps a
-    /// share on this model.
+    /// share on this model. Once routed, the variant's own qpm/cache/
+    /// token_rate apply — model-level limits guard backend capacity.
     #[serde(default)]
     pub variants: Vec<VariantConf>,
 }
@@ -160,7 +161,7 @@ pub struct TokenRateConf {
 
 impl TokenRateConf {
     /// `(field name, value)` pairs for validation.
-    pub fn fields(&self) -> [(&'static str, f64); 5] {
+    fn fields(&self) -> [(&'static str, f64); 5] {
         [
             ("prompt", self.prompt),
             ("read_cache", self.read_cache),
@@ -308,6 +309,7 @@ pub struct StabilityConf {
     #[serde(default = "default_cooldown_seconds")]
     pub cooldown_seconds: u64,
     /// Minutes of per-model success/error counts the status API judges over.
+    /// Capped at 60: the availability store retains one hour of buckets.
     #[serde(default = "default_availability_window_minutes")]
     pub availability_window_minutes: i64,
     /// Window error rate at or above which a model reports `unstable`.
@@ -710,7 +712,7 @@ impl GatewayConfig {
                     }
                 }
             }
-            for v in &m.variants {
+            for (i, v) in m.variants.iter().enumerate() {
                 let bad = |reason| ConfigError::BadVariant {
                     model: m.name.clone(),
                     variant: v.model.clone(),
@@ -718,6 +720,10 @@ impl GatewayConfig {
                 };
                 if v.weight == 0 {
                     return Err(bad("weight must be >= 1"));
+                }
+                // a duplicate would silently double the target's share
+                if m.variants[..i].iter().any(|p| p.model == v.model) {
+                    return Err(bad("duplicate target"));
                 }
                 let Some(target) = self.models.iter().find(|t| t.name == v.model) else {
                     return Err(bad("unknown model"));
@@ -783,9 +789,11 @@ impl GatewayConfig {
         }
         let st = &self.stability;
         let bad_rate = |v: f64| !v.is_finite() || !(0.0..=1.0).contains(&v);
-        if st.availability_window_minutes < 1 {
+        // upper bound mirrors the store's one-hour retention — a longer window
+        // would silently judge over already-evicted buckets
+        if !(1..=60).contains(&st.availability_window_minutes) {
             return Err(ConfigError::BadStability {
-                field: "availability_window_minutes",
+                field: "availability_window_minutes (1..=60)",
             });
         }
         if bad_rate(st.unstable_error_rate) || bad_rate(st.unavailable_error_rate) {
@@ -1321,6 +1329,10 @@ tenants: [{name: t1}, {name: t1}]
             ("[{model: m2, weight: 0}]", "zero weight"),
             ("[{model: emb, weight: 1}]", "cross-protocol"),
             ("[{model: nested, weight: 1}]", "nested variants"),
+            (
+                "[{model: m2, weight: 5}, {model: m2, weight: 5}]",
+                "duplicate target",
+            ),
         ] {
             let bad = format!(
                 "listen: {{host: h, port: 1}}\nmodels: [{{name: m1, protocol: openai-chat, variants: {variants}}}, {{name: m2, protocol: openai-chat}}, {{name: emb, protocol: embeddings}}, {{name: nested, protocol: openai-chat, variants: [{{model: m2, weight: 1}}]}}]"

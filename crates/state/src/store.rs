@@ -78,6 +78,8 @@ pub struct BillingRecord {
     pub account: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    /// Weighted platform total (what quota metering consumed); equals
+    /// prompt + completion only when the served model has no `token_rate`.
     pub total_tokens: i64,
     pub cost_micros: i64,
     /// What the serving account's vendor charged us (zero = untracked).
@@ -197,11 +199,28 @@ pub fn clamp_tokens(n: i64) -> i64 {
     n.clamp(0, MAX_METERED_TOKENS)
 }
 
+/// The served model's billing weights; identity when unconfigured. The
+/// `prompt_includes_cache` normalization already happened at usage extraction.
+pub fn model_token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_models::TokenRate {
+    match cfg.find_model(model).and_then(|m| m.token_rate) {
+        Some(r) => gw_models::TokenRate {
+            prompt_includes_cache: false,
+            prompt_weight: r.prompt,
+            read_cache_weight: r.read_cache,
+            write_cache_weight: r.write_cache,
+            completion_weight: r.completion,
+            reasoning_weight: r.reasoning,
+        },
+        None => gw_models::TokenRate::default(),
+    }
+}
+
 /// Price one call into a [`BillingRecord`]: the tenant's price for the served
 /// model, vendor cost from the serving account. Shared by the request pipeline
 /// and the realtime surface so the two can't drift; token counts are clamped.
-/// Cost multiplies the weighted billable sides; the token columns keep the
-/// vendor-reported counts so usage stays truthful.
+/// Cost multiplies the weighted billable sides; the prompt/completion columns
+/// keep the vendor-reported counts, while `total_tokens` is the weighted
+/// platform total that quota metering consumed.
 pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
     let (prompt, completion, total) = (
         clamp_tokens(b.prompt),
@@ -2379,6 +2398,22 @@ mod tests {
             "a = $1 AND b IN ($2, $3)"
         );
         assert_eq!(pg_numbered("no placeholders"), "no placeholders");
+    }
+
+    #[test]
+    fn model_token_rate_maps_config_weights() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, token_rate: {read_cache: 0.1, write_cache: 1.25}}]";
+        let cfg = gw_config::GatewayConfig::from_yaml(yaml).unwrap();
+        let rate = model_token_rate(&cfg, "m");
+        assert_eq!(
+            (rate.read_cache_weight, rate.write_cache_weight),
+            (0.1, 1.25)
+        );
+        assert!(!rate.prompt_includes_cache);
+        assert_eq!(
+            model_token_rate(&cfg, "absent"),
+            gw_models::TokenRate::default()
+        );
     }
 
     #[test]

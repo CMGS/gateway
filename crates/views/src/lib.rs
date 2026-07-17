@@ -359,12 +359,24 @@ async fn bill_realtime_turn(
     let ak = &admit.ak;
     // clamp parts and total so a hostile count can't overflow shared counters
     let (it, ot) = (gw_state::clamp_tokens(it), gw_state::clamp_tokens(ot));
-    let total = gw_state::clamp_tokens(it.saturating_add(ot));
-    if total == 0 {
+    if it.saturating_add(ot) == 0 {
         admit.refund().await;
         return;
     }
     let (cfg, state) = (&admit.snap.cfg, &admit.snap.state);
+    // same weights as the request pipeline; realtime usage carries no cache
+    // components, so only the prompt/completion weights can bite
+    let rate = gw_state::model_token_rate(cfg, model);
+    let ti = gw_models::TokenInput {
+        prompt: it,
+        completion: ot,
+        ..Default::default()
+    };
+    let (bp, bc) = (
+        gw_models::weighted_prompt(&ti, &rate),
+        gw_models::weighted_completion(&ti, &rate),
+    );
+    let total = gw_state::clamp_tokens(bp.saturating_add(bc));
     let model_quota_key = admission::model_quota_limit(cfg, ak, model)
         .map(|_| admission::model_quota_key(&ak.ak, model));
     admission::settle_and_bill(
@@ -384,8 +396,8 @@ async fn bill_realtime_turn(
                 account,
                 prompt: it,
                 completion: ot,
-                billable_prompt: it,
-                billable_completion: ot,
+                billable_prompt: bp,
+                billable_completion: bc,
                 total,
                 ptu_spillover: false,
                 estimated: false,
@@ -1535,30 +1547,35 @@ async fn admin_models_status(State(s): State<AppState>, scope: AdminScope) -> Re
     let st = &cfg.stability;
     let until = gw_state::epoch_secs() / 60;
     let since = until - (st.availability_window_minutes - 1);
-    let avail = &s.handler.state().avail;
-    let mut rows = Vec::new();
-    for m in &cfg.models {
-        if let AdminScope::Tenant(t) = &scope
-            && !cfg.tenant_allows_model(t, &m.name)
-        {
-            continue;
-        }
-        let (ok, err) = avail.window(&m.name, since, until).await;
-        let state = gw_state::classify(
-            ok,
-            err,
-            st.availability_min_samples,
-            st.unstable_error_rate,
-            st.unavailable_error_rate,
-        );
-        rows.push(json!({
-            "model": m.name,
-            "state": state,
-            "requests": ok + err,
-            "errors": err,
-            "window_minutes": st.availability_window_minutes,
-        }));
-    }
+    let state = s.handler.state();
+    let entitled = cfg.models.iter().filter(|m| match &scope {
+        AdminScope::Tenant(t) => cfg.tenant_allows_model(t, &m.name),
+        AdminScope::Global => true,
+    });
+    let avail = &state.avail;
+    let counts = futures::future::join_all(
+        entitled.map(|m| async move { (&m.name, avail.window(&m.name, since, until).await) }),
+    )
+    .await;
+    let rows: Vec<Value> = counts
+        .into_iter()
+        .map(|(name, (ok, err))| {
+            let verdict = gw_state::classify(
+                ok,
+                err,
+                st.availability_min_samples,
+                st.unstable_error_rate,
+                st.unavailable_error_rate,
+            );
+            json!({
+                "model": name,
+                "state": verdict,
+                "requests": ok + err,
+                "errors": err,
+                "window_minutes": st.availability_window_minutes,
+            })
+        })
+        .collect();
     Json(json!({ "models": rows })).into_response()
 }
 
@@ -3379,8 +3396,7 @@ mod tests {
 
     #[tokio::test]
     async fn models_status_classifies_and_scopes() {
-        // failure_threshold high so account cooldown never blocks a sample;
-        // models bound to disjoint providers so round-robin can't cross-route
+        // high threshold + disjoint providers: cooldown/round-robin must not skew samples
         let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_AVAIL_ADMIN}\nmodels: [{name: m-ok, protocol: openai-chat, provider: openai}, {name: m-bad, protocol: openai-chat, provider: downp}]\naccounts: [{name: a-up, provider: openai, protocols: ['openai-chat']}, {name: a-down, provider: downp, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [m-ok], admin_token_env: GW_TEST_AVAIL_T1}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]\nstability: {availability_min_samples: 3, failure_threshold: 100}";
         // SAFETY: unique var names for this test; no concurrent reader of them.
         unsafe {
@@ -3730,6 +3746,34 @@ mod tests {
         assert_eq!(
             ledger_before, ledger_after,
             "zero-usage turn writes no ledger row"
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_billing_applies_token_rate() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: rt-m, protocol: realtime, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 1000, token_rate: {completion: 0.5}}]\naccounts: [{name: a1, provider: openai, protocols: ['realtime']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let ak = s.handler.state().auth.authenticate("k1").await.unwrap();
+        let a = realtime_gate(&s, &ak, "rt-m", "").await.expect("admit");
+        bill_realtime_turn(&a, "rt-m", gw_consts::Protocol::Realtime, "acc", 100, 100).await;
+        let (_, ledger) = s
+            .handler
+            .state()
+            .store
+            .ledger_snapshot(usize::MAX)
+            .await
+            .unwrap();
+        let rec = &ledger[0];
+        assert_eq!(rec.prompt_tokens, 100);
+        assert_eq!(rec.completion_tokens, 100);
+        assert_eq!(rec.total_tokens, 150, "100 + 100*0.5 weighted");
+        assert_eq!(rec.cost_micros, 150, "billable 100+50 at 1000/1k each");
+        assert_eq!(
+            s.handler.state().governance.quota_used(&ak.ak).await,
+            150,
+            "quota settles the weighted total"
         );
     }
 

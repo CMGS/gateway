@@ -495,17 +495,17 @@ mod tests {
         h.run(chat_req("m-cache", "hi"), key).await.unwrap();
         let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
         let rec = &ledger[0];
-        // raw usage stays truthful: 20 fresh + 80 cached
-        assert_eq!(rec.prompt_tokens, 100);
-        // billable prompt = 20 + 80*0.1 = 28 at 1000 micros/1k input
-        assert_eq!(rec.cost_micros, 28);
+        assert_eq!(rec.prompt_tokens, 100, "raw column: 20 fresh + 80 cached");
+        assert_eq!(
+            rec.cost_micros, 28,
+            "20 + 80*0.1 billable at 1000 micros/1k"
+        );
         assert_eq!(rec.total_tokens, 28 + rec.completion_tokens);
     }
 
     #[tokio::test]
     async fn variant_split_bills_requested_serves_target() {
-        // tenant entitled only to the public name — proves entitlement is
-        // judged before the variant swap
+        // tenant entitled only to the public name: entitlement precedes the swap
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: openai-chat, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m]}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
         let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));

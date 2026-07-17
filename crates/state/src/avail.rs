@@ -211,11 +211,8 @@ impl AvailStore for RedisAvail {
                     return (0, 0);
                 }
             };
-        vals.chunks(2).fold((0, 0), |(o, e), pair| {
-            (
-                o + pair.first().copied().flatten().unwrap_or(0),
-                e + pair.get(1).copied().flatten().unwrap_or(0),
-            )
+        vals.chunks_exact(2).fold((0, 0), |(o, e), pair| {
+            (o + pair[0].unwrap_or(0), e + pair[1].unwrap_or(0))
         })
     }
 }
@@ -236,7 +233,6 @@ mod tests {
         assert_eq!(classify(18, 2, 20, 0.1, 0.5), AvailState::Unstable);
         assert_eq!(classify(10, 10, 20, 0.1, 0.5), AvailState::Unavailable);
         assert_eq!(classify(0, 20, 20, 0.1, 0.5), AvailState::Unavailable);
-        // min_samples 0 still needs at least one sample
         assert_eq!(classify(0, 0, 0, 0.1, 0.5), AvailState::NoData);
     }
 
@@ -251,9 +247,12 @@ mod tests {
         assert_eq!(tracker.window("m", minute - 5, minute).await, (0, 0));
         tracker.flush().await;
         assert_eq!(tracker.window("m", minute - 5, minute).await, (3, 1));
-        // second flush with an empty buffer adds nothing
         tracker.flush().await;
-        assert_eq!(tracker.window("m", minute - 5, minute).await, (3, 1));
+        assert_eq!(
+            tracker.window("m", minute - 5, minute).await,
+            (3, 1),
+            "empty-buffer flush adds nothing"
+        );
     }
 
     #[tokio::test]
