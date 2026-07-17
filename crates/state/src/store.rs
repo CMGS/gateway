@@ -1134,75 +1134,283 @@ impl SqliteStore {
     }
 }
 
-#[async_trait::async_trait]
-impl Store for SqliteStore {
-    async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
-        sqlx::query(
-            "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
-             prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
-             estimated)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&r.ak)
-        .bind(&r.product)
-        .bind(&r.tenant)
-        .bind(&r.model)
-        .bind(&r.served_model)
-        .bind(&r.protocol)
-        .bind(&r.account)
-        .bind(r.prompt_tokens)
-        .bind(r.completion_tokens)
-        .bind(r.total_tokens)
-        .bind(r.cost_micros)
-        .bind(r.vendor_cost_micros)
-        .bind(r.ptu_spillover)
-        .bind(&r.user_id)
-        .bind(&r.request_id)
-        .bind(r.created_at_epoch_secs)
-        .bind(r.estimated)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("insert billing record", e))?;
-        if self.ledger_max_rows > 0
-            && self
-                .prune_seq
-                .fetch_add(1, Ordering::Relaxed)
-                .is_multiple_of(LEDGER_PRUNE_EVERY)
-        {
-            sqlx::query(
-                "DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - ?
-                 AND created_at_epoch_secs <
-                  (SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup)",
-            )
-            .bind(self.ledger_max_rows as i64)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("prune billing records", e))?;
+/// Rewrite `?` placeholders to Postgres `$1..$N`. Only used on the shared
+/// queries below, none of which carries a literal `?`.
+fn pg_numbered(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut n = 0;
+    for ch in sql.chars() {
+        if ch == '?' {
+            n += 1;
+            out.push('$');
+            out.push_str(&n.to_string());
+        } else {
+            out.push(ch);
         }
-        Ok(())
     }
+    out
+}
 
-    async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)> {
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM billing")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("count billing records", e))?;
-        let mut rows = sqlx::query(
-            "SELECT ak, product, tenant, model, served_model, protocol, account,
-             prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
-             estimated
-             FROM billing ORDER BY n DESC LIMIT ?",
-        )
-        .bind(limit.min(i64::MAX as usize) as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read billing records", e))?;
-        rows.reverse();
-        Ok((total as usize, rows.iter().map(row_to_billing).collect()))
-    }
+/// The shared query text for one backend: SQLite takes the `?`-placeholder
+/// literal as-is; Postgres rewrites it to `$N` once and caches it.
+macro_rules! dialect_sql {
+    (sqlite, $s:expr) => {
+        $s
+    };
+    (postgres, $s:expr) => {{
+        static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| pg_numbered($s));
+        SQL.as_str()
+    }};
+}
 
+/// One `impl Store` per SQL backend. The methods in the macro body are
+/// dialect-independent (placeholder syntax aside) and expand once per backend
+/// from this single source; `$specific` carries the genuinely dialect-bound
+/// methods (id generation, rollup locking, batch fencing, erasure shape,
+/// NULL-parameter and SUM casts).
+macro_rules! sql_store_impl {
+    ($T:ty, $dialect:ident, { $($specific:item)* }) => {
+        #[async_trait::async_trait]
+        impl Store for $T {
+            $($specific)*
+
+            async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
+                sqlx::query(dialect_sql!(
+                    $dialect,
+                    "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
+                     prompt_tokens, completion_tokens, total_tokens, cost_micros,
+                     vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
+                     estimated)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .bind(&r.ak)
+                .bind(&r.product)
+                .bind(&r.tenant)
+                .bind(&r.model)
+                .bind(&r.served_model)
+                .bind(&r.protocol)
+                .bind(&r.account)
+                .bind(r.prompt_tokens)
+                .bind(r.completion_tokens)
+                .bind(r.total_tokens)
+                .bind(r.cost_micros)
+                .bind(r.vendor_cost_micros)
+                .bind(r.ptu_spillover)
+                .bind(&r.user_id)
+                .bind(&r.request_id)
+                .bind(r.created_at_epoch_secs)
+                .bind(r.estimated)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("insert billing record", e))?;
+                if self.ledger_max_rows > 0
+                    && self
+                        .prune_seq
+                        .fetch_add(1, Ordering::Relaxed)
+                        .is_multiple_of(LEDGER_PRUNE_EVERY)
+                {
+                    sqlx::query(dialect_sql!(
+                        $dialect,
+                        "DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - ?
+                         AND created_at_epoch_secs <
+                          (SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup)"
+                    ))
+                    .bind(self.ledger_max_rows as i64)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| crate::sqlx_err("prune billing records", e))?;
+                }
+                Ok(())
+            }
+
+            async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)> {
+                let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM billing")
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| crate::sqlx_err("count billing records", e))?;
+                let mut rows = sqlx::query(dialect_sql!(
+                    $dialect,
+                    "SELECT ak, product, tenant, model, served_model, protocol, account,
+                     prompt_tokens, completion_tokens, total_tokens, cost_micros,
+                     vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
+                     estimated
+                     FROM billing ORDER BY n DESC LIMIT ?"
+                ))
+                .bind(limit.min(i64::MAX as usize) as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read billing records", e))?;
+                rows.reverse();
+                Ok((total as usize, rows.iter().map(row_to_billing).collect()))
+            }
+
+            async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()> {
+                sqlx::query(dialect_sql!(
+                    $dialect,
+                    "INSERT INTO security_events (created_at_epoch_secs, request_id, ak, user_id,
+                     tenant, surface, rule, action, hits) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .bind(e.created_at_epoch_secs)
+                .bind(&e.request_id)
+                .bind(&e.ak)
+                .bind(&e.user_id)
+                .bind(&e.tenant)
+                .bind(&e.surface)
+                .bind(&e.rule)
+                .bind(&e.action)
+                .bind(e.hits)
+                .execute(&self.pool)
+                .await
+                .map_err(|err| crate::sqlx_err("insert security event", err))?;
+                Ok(())
+            }
+
+            async fn admin_audit_add(&self, e: &AdminAudit) -> GResult<()> {
+                sqlx::query(dialect_sql!(
+                    $dialect,
+                    "INSERT INTO admin_audit (created_at_epoch_secs, actor, scope, action, target,
+                     summary, source_ip) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .bind(e.created_at_epoch_secs)
+                .bind(&e.actor)
+                .bind(&e.scope)
+                .bind(&e.action)
+                .bind(&e.target)
+                .bind(&e.summary)
+                .bind(&e.source_ip)
+                .execute(&self.pool)
+                .await
+                .map_err(|err| crate::sqlx_err("insert admin audit", err))?;
+                Ok(())
+            }
+
+            async fn admin_audit_list(&self, limit: usize) -> GResult<Vec<AdminAudit>> {
+                let rows = sqlx::query(dialect_sql!(
+                    $dialect,
+                    "SELECT created_at_epoch_secs, actor, scope, action, target, summary, source_ip
+                     FROM admin_audit ORDER BY n DESC LIMIT ?"
+                ))
+                .bind(limit.min(i64::MAX as usize) as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read admin audit", e))?;
+                Ok(rows.iter().map(admin_audit_row).collect())
+            }
+
+            async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()> {
+                sqlx::query(dialect_sql!(
+                    $dialect,
+                    "INSERT INTO request_content (created_at_epoch_secs, request_id, ak, user_id,
+                     tenant, kind, content, sealed, expires_at_epoch_secs)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                ))
+                .bind(r.created_at_epoch_secs)
+                .bind(&r.request_id)
+                .bind(&r.ak)
+                .bind(&r.user_id)
+                .bind(&r.tenant)
+                .bind(&r.kind)
+                .bind(&r.content)
+                .bind(r.sealed)
+                .bind(r.expires_at_epoch_secs)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("insert content", e))?;
+                Ok(())
+            }
+
+            async fn content_purge(&self, now: i64) -> GResult<u64> {
+                let r = sqlx::query(dialect_sql!(
+                    $dialect,
+                    "DELETE FROM request_content
+                     WHERE expires_at_epoch_secs > 0 AND expires_at_epoch_secs <= ?"
+                ))
+                .bind(now)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("purge content", e))?;
+                Ok(r.rows_affected())
+            }
+
+            async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
+                let rows = sqlx::query(dialect_sql!(
+                    $dialect,
+                    "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
+                     sealed, expires_at_epoch_secs FROM request_content WHERE request_id = ? ORDER BY n"
+                ))
+                .bind(request_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read content", e))?;
+                Ok(rows.iter().map(content_row).collect())
+            }
+
+            async fn file_get(&self, id: &str) -> GResult<Option<StoredFile>> {
+                let row = sqlx::query(dialect_sql!(
+                    $dialect,
+                    "SELECT id, tenant, purpose, bytes, content FROM files WHERE id = ?"
+                ))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read file", e))?;
+                Ok(row.map(|row| StoredFile {
+                    id: row.get(0),
+                    tenant: row.get(1),
+                    purpose: row.get(2),
+                    bytes: row.get::<i64, _>(3) as usize,
+                    content: row.get(4),
+                }))
+            }
+
+            async fn file_delete(&self, id: &str, tenant: &str) -> GResult<bool> {
+                let r = sqlx::query(dialect_sql!(
+                    $dialect,
+                    "DELETE FROM files WHERE id = ? AND tenant = ?"
+                ))
+                .bind(id)
+                .bind(tenant)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("delete file", e))?;
+                Ok(r.rows_affected() > 0)
+            }
+
+            async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>> {
+                let row = sqlx::query(dialect_sql!(
+                    $dialect,
+                    "SELECT id, ak, tenant, model, status, total FROM batches WHERE id = ?"
+                ))
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read batch", e))?;
+                let Some(row) = row else { return Ok(None) };
+                let results = sqlx::query(dialect_sql!(
+                    $dialect,
+                    "SELECT idx, ok, message, total_tokens, user_id FROM batch_results
+                     WHERE batch_id = ? ORDER BY idx"
+                ))
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| crate::sqlx_err("read batch results", e))?;
+                let status_text: String = row.get(4);
+                Ok(Some(BatchJob {
+                    id: row.get(0),
+                    ak: row.get(1),
+                    tenant: row.get(2),
+                    model: row.get(3),
+                    status: BatchStatus::parse(&status_text).unwrap_or(BatchStatus::Failed),
+                    total: row.get::<i64, _>(5) as usize,
+                    results: results.iter().map(batch_item_row).collect(),
+                }))
+            }
+        }
+    };
+}
+
+sql_store_impl!(SqliteStore, sqlite, {
     async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
         // sqlx's SqlSafeStr guard wants static SQL, so the two variants stay spelled out
         let rows =
@@ -1308,26 +1516,6 @@ impl Store for SqliteStore {
         Ok(r.rows_affected())
     }
 
-    async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()> {
-        sqlx::query(
-            "INSERT INTO security_events (created_at_epoch_secs, request_id, ak, user_id,
-             tenant, surface, rule, action, hits) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(e.created_at_epoch_secs)
-        .bind(&e.request_id)
-        .bind(&e.ak)
-        .bind(&e.user_id)
-        .bind(&e.tenant)
-        .bind(&e.surface)
-        .bind(&e.rule)
-        .bind(&e.action)
-        .bind(e.hits)
-        .execute(&self.pool)
-        .await
-        .map_err(|err| crate::sqlx_err("insert security event", err))?;
-        Ok(())
-    }
-
     async fn security_events(
         &self,
         tenant: Option<&str>,
@@ -1344,69 +1532,6 @@ impl Store for SqliteStore {
         .await
         .map_err(|e| crate::sqlx_err("read security events", e))?;
         Ok(rows.iter().map(security_event_row).collect())
-    }
-
-    async fn admin_audit_add(&self, e: &AdminAudit) -> GResult<()> {
-        sqlx::query(
-            "INSERT INTO admin_audit (created_at_epoch_secs, actor, scope, action, target,
-             summary, source_ip) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(e.created_at_epoch_secs)
-        .bind(&e.actor)
-        .bind(&e.scope)
-        .bind(&e.action)
-        .bind(&e.target)
-        .bind(&e.summary)
-        .bind(&e.source_ip)
-        .execute(&self.pool)
-        .await
-        .map_err(|err| crate::sqlx_err("insert admin audit", err))?;
-        Ok(())
-    }
-
-    async fn admin_audit_list(&self, limit: usize) -> GResult<Vec<AdminAudit>> {
-        let rows = sqlx::query(
-            "SELECT created_at_epoch_secs, actor, scope, action, target, summary, source_ip
-             FROM admin_audit ORDER BY n DESC LIMIT ?",
-        )
-        .bind(limit.min(i64::MAX as usize) as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read admin audit", e))?;
-        Ok(rows.iter().map(admin_audit_row).collect())
-    }
-
-    async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()> {
-        sqlx::query(
-            "INSERT INTO request_content (created_at_epoch_secs, request_id, ak, user_id,
-             tenant, kind, content, sealed, expires_at_epoch_secs)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(r.created_at_epoch_secs)
-        .bind(&r.request_id)
-        .bind(&r.ak)
-        .bind(&r.user_id)
-        .bind(&r.tenant)
-        .bind(&r.kind)
-        .bind(&r.content)
-        .bind(r.sealed)
-        .bind(r.expires_at_epoch_secs)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("insert content", e))?;
-        Ok(())
-    }
-
-    async fn content_purge(&self, now: i64) -> GResult<u64> {
-        let r = sqlx::query(
-            "DELETE FROM request_content
-             WHERE expires_at_epoch_secs > 0 AND expires_at_epoch_secs <= ?",
-        )
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("purge content", e))?;
-        Ok(r.rows_affected())
     }
 
     async fn content_erase_user(
@@ -1469,18 +1594,6 @@ impl Store for SqliteStore {
         Ok(erased)
     }
 
-    async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
-        let rows = sqlx::query(
-            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
-             sealed, expires_at_epoch_secs FROM request_content WHERE request_id = ? ORDER BY n",
-        )
-        .bind(request_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read content", e))?;
-        Ok(rows.iter().map(content_row).collect())
-    }
-
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
         let bytes = content.len();
         // ids derive from the AUTOINCREMENT sequence (sqlite_sequence), which a
@@ -1508,21 +1621,6 @@ impl Store for SqliteStore {
         })
     }
 
-    async fn file_get(&self, id: &str) -> GResult<Option<StoredFile>> {
-        let row = sqlx::query("SELECT id, tenant, purpose, bytes, content FROM files WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("read file", e))?;
-        Ok(row.map(|row| StoredFile {
-            id: row.get(0),
-            tenant: row.get(1),
-            purpose: row.get(2),
-            bytes: row.get::<i64, _>(3) as usize,
-            content: row.get(4),
-        }))
-    }
-
     async fn user_erased_since(&self, tenant: &str, user: &str, since: i64) -> GResult<bool> {
         let hit: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM erasures
@@ -1536,16 +1634,6 @@ impl Store for SqliteStore {
         .await
         .map_err(|e| crate::sqlx_err("read erasure marker", e))?;
         Ok(hit)
-    }
-
-    async fn file_delete(&self, id: &str, tenant: &str) -> GResult<bool> {
-        let r = sqlx::query("DELETE FROM files WHERE id = ? AND tenant = ?")
-            .bind(id)
-            .bind(tenant)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("delete file", e))?;
-        Ok(r.rows_affected() > 0)
     }
 
     async fn batch_create(
@@ -1579,34 +1667,6 @@ impl Store for SqliteStore {
         })
     }
 
-    async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>> {
-        let row =
-            sqlx::query("SELECT id, ak, tenant, model, status, total FROM batches WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| crate::sqlx_err("read batch", e))?;
-        let Some(row) = row else { return Ok(None) };
-        let results = sqlx::query(
-            "SELECT idx, ok, message, total_tokens, user_id FROM batch_results
-             WHERE batch_id = ? ORDER BY idx",
-        )
-        .bind(id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read batch results", e))?;
-        let status_text: String = row.get(4);
-        Ok(Some(BatchJob {
-            id: row.get(0),
-            ak: row.get(1),
-            tenant: row.get(2),
-            model: row.get(3),
-            status: BatchStatus::parse(&status_text).unwrap_or(BatchStatus::Failed),
-            total: row.get::<i64, _>(5) as usize,
-            results: results.iter().map(batch_item_row).collect(),
-        }))
-    }
-
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()> {
         sqlx::query("UPDATE batches SET status = ? WHERE id = ?")
             .bind(status.as_str())
@@ -1637,7 +1697,7 @@ impl Store for SqliteStore {
         .map_err(|e| crate::sqlx_err("insert batch result", e))?;
         Ok(())
     }
-}
+});
 
 /// A terminal batch's input rows have served their purpose — delete them in
 /// the same transaction as the status write, so submitted prompt text cannot
@@ -1775,75 +1835,7 @@ impl PostgresStore {
     }
 }
 
-#[async_trait::async_trait]
-impl Store for PostgresStore {
-    async fn ledger_add(&self, r: &BillingRecord) -> GResult<()> {
-        sqlx::query(
-            "INSERT INTO billing (ak, product, tenant, model, served_model, protocol, account,
-             prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
-             estimated)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
-        )
-        .bind(&r.ak)
-        .bind(&r.product)
-        .bind(&r.tenant)
-        .bind(&r.model)
-        .bind(&r.served_model)
-        .bind(&r.protocol)
-        .bind(&r.account)
-        .bind(r.prompt_tokens)
-        .bind(r.completion_tokens)
-        .bind(r.total_tokens)
-        .bind(r.cost_micros)
-        .bind(r.vendor_cost_micros)
-        .bind(r.ptu_spillover)
-        .bind(&r.user_id)
-        .bind(&r.request_id)
-        .bind(r.created_at_epoch_secs)
-        .bind(r.estimated)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("insert billing record", e))?;
-        if self.ledger_max_rows > 0
-            && self
-                .prune_seq
-                .fetch_add(1, Ordering::Relaxed)
-                .is_multiple_of(LEDGER_PRUNE_EVERY)
-        {
-            sqlx::query(
-                "DELETE FROM billing WHERE n <= (SELECT MAX(n) FROM billing) - $1
-                 AND created_at_epoch_secs <
-                  (SELECT COALESCE(MAX(minute_epoch), -60) + 60 FROM usage_rollup)",
-            )
-            .bind(self.ledger_max_rows as i64)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("prune billing records", e))?;
-        }
-        Ok(())
-    }
-
-    async fn ledger_snapshot(&self, limit: usize) -> GResult<(usize, Vec<BillingRecord>)> {
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM billing")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("count billing records", e))?;
-        let mut rows = sqlx::query(
-            "SELECT ak, product, tenant, model, served_model, protocol, account,
-             prompt_tokens, completion_tokens, total_tokens, cost_micros,
-             vendor_cost_micros, ptu_spillover, user_id, request_id, created_at_epoch_secs,
-             estimated
-             FROM billing ORDER BY n DESC LIMIT $1",
-        )
-        .bind(limit.min(i64::MAX as usize) as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read billing records", e))?;
-        rows.reverse();
-        Ok((total as usize, rows.iter().map(row_to_billing).collect()))
-    }
-
+sql_store_impl!(PostgresStore, postgres, {
     async fn ledger_usage(&self, tenant: Option<&str>) -> GResult<Vec<UsageRow>> {
         // sqlx's SqlSafeStr guard wants static SQL, so the two variants stay spelled out
         let rows = match tenant {
@@ -1977,27 +1969,6 @@ impl Store for PostgresStore {
         Ok(r.rows_affected())
     }
 
-    async fn security_event_add(&self, e: &SecurityEvent) -> GResult<()> {
-        sqlx::query(
-            "INSERT INTO security_events (created_at_epoch_secs, request_id, ak, user_id,
-             tenant, surface, rule, action, hits)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        )
-        .bind(e.created_at_epoch_secs)
-        .bind(&e.request_id)
-        .bind(&e.ak)
-        .bind(&e.user_id)
-        .bind(&e.tenant)
-        .bind(&e.surface)
-        .bind(&e.rule)
-        .bind(&e.action)
-        .bind(e.hits)
-        .execute(&self.pool)
-        .await
-        .map_err(|err| crate::sqlx_err("insert security event", err))?;
-        Ok(())
-    }
-
     async fn security_events(
         &self,
         tenant: Option<&str>,
@@ -2014,69 +1985,6 @@ impl Store for PostgresStore {
         .await
         .map_err(|e| crate::sqlx_err("read security events", e))?;
         Ok(rows.iter().map(security_event_row).collect())
-    }
-
-    async fn admin_audit_add(&self, e: &AdminAudit) -> GResult<()> {
-        sqlx::query(
-            "INSERT INTO admin_audit (created_at_epoch_secs, actor, scope, action, target,
-             summary, source_ip) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(e.created_at_epoch_secs)
-        .bind(&e.actor)
-        .bind(&e.scope)
-        .bind(&e.action)
-        .bind(&e.target)
-        .bind(&e.summary)
-        .bind(&e.source_ip)
-        .execute(&self.pool)
-        .await
-        .map_err(|err| crate::sqlx_err("insert admin audit", err))?;
-        Ok(())
-    }
-
-    async fn admin_audit_list(&self, limit: usize) -> GResult<Vec<AdminAudit>> {
-        let rows = sqlx::query(
-            "SELECT created_at_epoch_secs, actor, scope, action, target, summary, source_ip
-             FROM admin_audit ORDER BY n DESC LIMIT $1",
-        )
-        .bind(limit.min(i64::MAX as usize) as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read admin audit", e))?;
-        Ok(rows.iter().map(admin_audit_row).collect())
-    }
-
-    async fn content_add(&self, r: &crate::ContentRecord) -> GResult<()> {
-        sqlx::query(
-            "INSERT INTO request_content (created_at_epoch_secs, request_id, ak, user_id,
-             tenant, kind, content, sealed, expires_at_epoch_secs)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        )
-        .bind(r.created_at_epoch_secs)
-        .bind(&r.request_id)
-        .bind(&r.ak)
-        .bind(&r.user_id)
-        .bind(&r.tenant)
-        .bind(&r.kind)
-        .bind(&r.content)
-        .bind(r.sealed)
-        .bind(r.expires_at_epoch_secs)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("insert content", e))?;
-        Ok(())
-    }
-
-    async fn content_purge(&self, now: i64) -> GResult<u64> {
-        let r = sqlx::query(
-            "DELETE FROM request_content
-             WHERE expires_at_epoch_secs > 0 AND expires_at_epoch_secs <= $1",
-        )
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("purge content", e))?;
-        Ok(r.rows_affected())
     }
 
     async fn content_erase_user(
@@ -2142,18 +2050,6 @@ impl Store for PostgresStore {
         Ok(erased)
     }
 
-    async fn content_for(&self, request_id: &str) -> GResult<Vec<crate::ContentRecord>> {
-        let rows = sqlx::query(
-            "SELECT created_at_epoch_secs, request_id, ak, user_id, tenant, kind, content,
-             sealed, expires_at_epoch_secs FROM request_content WHERE request_id = $1 ORDER BY n",
-        )
-        .bind(request_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read content", e))?;
-        Ok(rows.iter().map(content_row).collect())
-    }
-
     async fn file_put(&self, tenant: &str, purpose: &str, content: String) -> GResult<StoredFile> {
         let bytes = content.len();
         // consume the sequence explicitly — concurrent writers race a MAX(n)+1 subselect
@@ -2177,32 +2073,6 @@ impl Store for PostgresStore {
             purpose: purpose.to_owned(),
             content,
         })
-    }
-
-    async fn file_get(&self, id: &str) -> GResult<Option<StoredFile>> {
-        let row =
-            sqlx::query("SELECT id, tenant, purpose, bytes, content FROM files WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| crate::sqlx_err("read file", e))?;
-        Ok(row.map(|row| StoredFile {
-            id: row.get(0),
-            tenant: row.get(1),
-            purpose: row.get(2),
-            bytes: row.get::<i64, _>(3) as usize,
-            content: row.get(4),
-        }))
-    }
-
-    async fn file_delete(&self, id: &str, tenant: &str) -> GResult<bool> {
-        let r = sqlx::query("DELETE FROM files WHERE id = $1 AND tenant = $2")
-            .bind(id)
-            .bind(tenant)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| crate::sqlx_err("delete file", e))?;
-        Ok(r.rows_affected() > 0)
     }
 
     async fn batch_create(
@@ -2230,34 +2100,6 @@ impl Store for PostgresStore {
             total,
             results: Vec::new(),
         })
-    }
-
-    async fn batch_get(&self, id: &str) -> GResult<Option<BatchJob>> {
-        let row =
-            sqlx::query("SELECT id, ak, tenant, model, status, total FROM batches WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| crate::sqlx_err("read batch", e))?;
-        let Some(row) = row else { return Ok(None) };
-        let results = sqlx::query(
-            "SELECT idx, ok, message, total_tokens, user_id FROM batch_results
-             WHERE batch_id = $1 ORDER BY idx",
-        )
-        .bind(id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| crate::sqlx_err("read batch results", e))?;
-        let status_text: String = row.get(4);
-        Ok(Some(BatchJob {
-            id: row.get(0),
-            ak: row.get(1),
-            tenant: row.get(2),
-            model: row.get(3),
-            status: BatchStatus::parse(&status_text).unwrap_or(BatchStatus::Failed),
-            total: row.get::<i64, _>(5) as usize,
-            results: results.iter().map(batch_item_row).collect(),
-        }))
     }
 
     async fn batch_set_status(&self, id: &str, status: BatchStatus) -> GResult<()> {
@@ -2514,11 +2356,20 @@ impl Store for PostgresStore {
                 .map_err(|e| crate::sqlx_err("heartbeat batch", e))?;
         Ok(r.rows_affected() > 0)
     }
-}
+});
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pg_numbered_rewrites_placeholders_in_order() {
+        assert_eq!(
+            pg_numbered("a = ? AND b IN (?, ?)"),
+            "a = $1 AND b IN ($2, $3)"
+        );
+        assert_eq!(pg_numbered("no placeholders"), "no placeholders");
+    }
 
     #[test]
     fn billing_record_clamps_hostile_usage() {
