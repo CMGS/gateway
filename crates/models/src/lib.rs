@@ -13,7 +13,9 @@ pub mod token_estimate;
 pub mod usage;
 
 pub use block::Block;
-pub use cost::{TokenInput, TokenRate, cost_micros, platform_total};
+pub use cost::{
+    TokenInput, TokenRate, cost_micros, platform_total, weighted_completion, weighted_prompt,
+};
 pub use error::{GResult, GatewayError};
 pub use params::{
     ChatParams, EmbeddingParams, ImageParams, SearchParams, SttParams, TtsParams, TypedParams,

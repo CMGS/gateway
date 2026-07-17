@@ -383,6 +383,8 @@ async fn bill_realtime_turn(
                 account,
                 prompt: it,
                 completion: ot,
+                billable_prompt: it,
+                billable_completion: ot,
                 total,
                 ptu_spillover: false,
                 estimated: false,

@@ -59,15 +59,29 @@ pub fn cost_micros(prompt: i64, completion: i64, price_per_1k: (i64, i64)) -> i6
         .saturating_add(completion.saturating_mul(price_per_1k.1) / 1000)
 }
 
-/// Weighted platform-total token count.
-pub fn platform_total(input: &TokenInput, rate: &TokenRate) -> i64 {
-    let prompt = normalize_prompt(input, rate) as f64;
-    let total = prompt * rate.prompt_weight
+/// Weighted input-side tokens: prompt plus cache reads/writes.
+pub fn weighted_prompt(input: &TokenInput, rate: &TokenRate) -> i64 {
+    let sum = normalize_prompt(input, rate) as f64 * rate.prompt_weight
         + input.read_cache as f64 * rate.read_cache_weight
-        + input.write_cache as f64 * rate.write_cache_weight
-        + input.completion as f64 * rate.completion_weight
+        + input.write_cache as f64 * rate.write_cache_weight;
+    round_tokens(sum)
+}
+
+/// Weighted output-side tokens: completion plus reasoning.
+pub fn weighted_completion(input: &TokenInput, rate: &TokenRate) -> i64 {
+    let sum = input.completion as f64 * rate.completion_weight
         + input.reasoning as f64 * rate.reasoning_weight;
-    if total < 0.0 { 0 } else { total.round() as i64 }
+    round_tokens(sum)
+}
+
+/// Weighted platform-total token count; always the sum of the two sides so
+/// quota consumption and per-side billing cannot drift.
+pub fn platform_total(input: &TokenInput, rate: &TokenRate) -> i64 {
+    weighted_prompt(input, rate).saturating_add(weighted_completion(input, rate))
+}
+
+fn round_tokens(sum: f64) -> i64 {
+    if sum < 0.0 { 0 } else { sum.round() as i64 }
 }
 
 #[cfg(test)]
@@ -106,6 +120,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(platform_total(&sample(), &rate), 23);
+    }
+
+    #[test]
+    fn cache_discount_weights_bill_each_side() {
+        let rate = TokenRate {
+            read_cache_weight: 0.1,
+            write_cache_weight: 1.25,
+            ..Default::default()
+        };
+        let input = TokenInput {
+            prompt: 100,
+            read_cache: 1000,
+            write_cache: 40,
+            completion: 50,
+            reasoning: 10,
+        };
+        assert_eq!(weighted_prompt(&input, &rate), 250);
+        assert_eq!(weighted_completion(&input, &rate), 60);
+        assert_eq!(platform_total(&input, &rate), 310);
+    }
+
+    #[test]
+    fn total_is_sum_of_sides() {
+        let rate = TokenRate {
+            prompt_weight: 1.5,
+            completion_weight: 0.5,
+            ..Default::default()
+        };
+        let input = sample();
+        assert_eq!(
+            platform_total(&input, &rate),
+            weighted_prompt(&input, &rate) + weighted_completion(&input, &rate)
+        );
     }
 
     #[test]

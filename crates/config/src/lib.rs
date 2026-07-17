@@ -50,6 +50,8 @@ pub enum ConfigError {
     BadFallbackModel { tenant: String, model: String },
     #[error("`{owner}` sets a negative price")]
     NegativePrice { owner: String },
+    #[error("model `{model}` token_rate `{field}` must be finite and >= 0")]
+    BadTokenRate { model: String, field: &'static str },
     #[error("`{owner}` sets a negative or non-finite limit")]
     NegativeLimit { owner: String },
     #[error("storage.shared_cache needs storage.redis_url")]
@@ -109,12 +111,48 @@ pub struct ModelConf {
     /// Request-level cache TTL; None = this model isn't cached.
     #[serde(default)]
     pub cache_ttl_seconds: Option<u64>,
+    /// Billing weights per token component; None = every component at 1.0.
+    #[serde(default)]
+    pub token_rate: Option<TokenRateConf>,
 }
 
 impl ModelConf {
     pub fn protocol(&self) -> Option<Protocol> {
         Protocol::from_wire(&self.protocol)
     }
+}
+
+/// Per-component billing weights relative to the model's unit prices
+/// (e.g. cache reads at 0.1, cache writes at 1.25). Missing fields stay 1.0.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct TokenRateConf {
+    #[serde(default = "weight_one")]
+    pub prompt: f64,
+    #[serde(default = "weight_one")]
+    pub read_cache: f64,
+    #[serde(default = "weight_one")]
+    pub write_cache: f64,
+    #[serde(default = "weight_one")]
+    pub completion: f64,
+    #[serde(default = "weight_one")]
+    pub reasoning: f64,
+}
+
+impl TokenRateConf {
+    /// `(field name, value)` pairs for validation.
+    pub fn fields(&self) -> [(&'static str, f64); 5] {
+        [
+            ("prompt", self.prompt),
+            ("read_cache", self.read_cache),
+            ("write_cache", self.write_cache),
+            ("completion", self.completion),
+            ("reasoning", self.reasoning),
+        ]
+    }
+}
+
+fn weight_one() -> f64 {
+    1.0
 }
 
 /// Upstream account slot (mock credentials unless a live endpoint is configured).
@@ -612,6 +650,17 @@ impl GatewayConfig {
                 return Err(ConfigError::NegativePrice {
                     owner: format!("model {}", m.name),
                 });
+            }
+            // a NaN weight would poison every downstream cost computation
+            if let Some(rate) = &m.token_rate {
+                for (field, v) in rate.fields() {
+                    if !v.is_finite() || v < 0.0 {
+                        return Err(ConfigError::BadTokenRate {
+                            model: m.name.clone(),
+                            field,
+                        });
+                    }
+                }
             }
         }
         for a in &self.accounts {
@@ -1159,6 +1208,28 @@ tenants: [{name: t1}, {name: t1}]
             ),
             "negative prices are rejected at load"
         );
+
+        for bad in [".nan", "-0.5"] {
+            let bad_rate = format!(
+                "listen: {{host: h, port: 1}}\nmodels: [{{name: m1, protocol: openai-chat, token_rate: {{read_cache: {bad}}}}}]"
+            );
+            assert!(
+                matches!(
+                    GatewayConfig::from_yaml(&bad_rate),
+                    Err(ConfigError::BadTokenRate {
+                        field: "read_cache",
+                        ..
+                    })
+                ),
+                "token_rate `{bad}` is rejected at load"
+            );
+        }
+
+        let rate = "listen: {host: h, port: 1}\nmodels: [{name: m1, protocol: openai-chat, token_rate: {read_cache: 0.1, write_cache: 1.25}}]";
+        let cfg = GatewayConfig::from_yaml(rate).unwrap();
+        let tr = cfg.find_model("m1").unwrap().token_rate.unwrap();
+        assert_eq!((tr.read_cache, tr.write_cache), (0.1, 1.25));
+        assert_eq!((tr.prompt, tr.completion, tr.reasoning), (1.0, 1.0, 1.0));
 
         let neg_quota = "listen: {host: h, port: 1}\naccess_keys: [{ak: k1, product: p, qps: 1, daily_token_quota: -5}]";
         assert!(

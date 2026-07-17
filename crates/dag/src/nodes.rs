@@ -573,11 +573,10 @@ impl DagNode for CostCalc {
             };
             let ct = enc.encode_len(&resp.message) as i64;
             ctx.decide("cost_calc", format!("aborted stream, billed {pt}+{ct}"));
-            return bill(ctx, pt, ct, pt.saturating_add(ct), true).await;
+            return bill(ctx, BillTokens::flat(pt, ct), true).await;
         }
-        // default rate is 1:1; the formula carries future weighted rates.
         // saturating sums so a malformed usage subtree can't overflow the totals
-        let (prompt, completion, total) = match &resp.common_usage {
+        let tokens = match &resp.common_usage {
             Some(u) => {
                 let ti = gw_models::TokenInput {
                     prompt: u.platform_input,
@@ -586,33 +585,73 @@ impl DagNode for CostCalc {
                     completion: u.completion,
                     reasoning: u.reason,
                 };
-                let rate = gw_models::TokenRate::default();
-                (
-                    u.prompt_total(),
-                    u.completion_total(),
-                    gw_models::platform_total(&ti, &rate),
-                )
+                let served = ctx
+                    .request
+                    .model_param_v2
+                    .as_ref()
+                    .map(|p| p.model_name.as_str())
+                    .unwrap_or_default();
+                let rate = token_rate(&ctx.cfg, served);
+                BillTokens {
+                    prompt: u.prompt_total(),
+                    completion: u.completion_total(),
+                    billable_prompt: gw_models::weighted_prompt(&ti, &rate),
+                    billable_completion: gw_models::weighted_completion(&ti, &rate),
+                }
             }
-            None => (
-                resp.prompt_tokens,
-                resp.completion_tokens,
-                resp.prompt_tokens.saturating_add(resp.completion_tokens),
-            ),
+            None => BillTokens::flat(resp.prompt_tokens, resp.completion_tokens),
         };
-        bill(ctx, prompt, completion, total, false).await
+        bill(ctx, tokens, false).await
+    }
+}
+
+/// The served model's billing weights; identity when unconfigured. The
+/// `prompt_includes_cache` normalization already happened at usage extraction.
+fn token_rate(cfg: &gw_config::GatewayConfig, model: &str) -> gw_models::TokenRate {
+    match cfg.find_model(model).and_then(|m| m.token_rate) {
+        Some(r) => gw_models::TokenRate {
+            prompt_includes_cache: false,
+            prompt_weight: r.prompt,
+            read_cache_weight: r.read_cache,
+            write_cache_weight: r.write_cache,
+            completion_weight: r.completion,
+            reasoning_weight: r.reasoning,
+        },
+        None => gw_models::TokenRate::default(),
+    }
+}
+
+/// Token counts for one bill: vendor-reported sides plus the weighted billable
+/// sides; the platform total is always the billable sum, so quota consumption
+/// and cost cannot drift.
+struct BillTokens {
+    prompt: i64,
+    completion: i64,
+    billable_prompt: i64,
+    billable_completion: i64,
+}
+
+impl BillTokens {
+    /// Unweighted counts: billable equals reported.
+    fn flat(prompt: i64, completion: i64) -> Self {
+        Self {
+            prompt,
+            completion,
+            billable_prompt: prompt,
+            billable_completion: completion,
+        }
+    }
+
+    fn total(&self) -> i64 {
+        self.billable_prompt
+            .saturating_add(self.billable_completion)
     }
 }
 
 /// Settle reserves and write the ledger for one served request via the shared
 /// [`admission::settle_and_bill`] orchestration. `estimated` marks a bill from
 /// an aborted stream's estimated counts rather than a vendor usage payload.
-async fn bill(
-    ctx: &mut DagContext,
-    prompt: i64,
-    completion: i64,
-    total: i64,
-    estimated: bool,
-) -> GResult<()> {
+async fn bill(ctx: &mut DagContext, tokens: BillTokens, estimated: bool) -> GResult<()> {
     let ptu_spillover = ctx
         .outcome
         .as_ref()
@@ -646,9 +685,11 @@ async fn bill(
                 served_model: served,
                 protocol: param.map(|p| p.protocol.as_str()).unwrap_or_default(),
                 account: ctx.request.account_name(),
-                prompt,
-                completion,
-                total,
+                prompt: tokens.prompt,
+                completion: tokens.completion,
+                billable_prompt: tokens.billable_prompt,
+                billable_completion: tokens.billable_completion,
+                total: tokens.total(),
                 ptu_spillover,
                 estimated,
             },
@@ -772,6 +813,22 @@ fn model_provider(ctx: &DagContext) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn token_rate_maps_config_weights() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, token_rate: {read_cache: 0.1, write_cache: 1.25}}]";
+        let cfg = gw_config::GatewayConfig::from_yaml(yaml).unwrap();
+        let rate = super::token_rate(&cfg, "m");
+        assert_eq!(
+            (rate.read_cache_weight, rate.write_cache_weight),
+            (0.1, 1.25)
+        );
+        assert!(!rate.prompt_includes_cache);
+        assert_eq!(
+            super::token_rate(&cfg, "absent"),
+            gw_models::TokenRate::default()
+        );
+    }
+
     #[test]
     fn reserve_estimate_saturates_on_hostile_max_tokens() {
         use gw_models::params::ChatParams;

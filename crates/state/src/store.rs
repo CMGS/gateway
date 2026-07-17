@@ -182,6 +182,10 @@ pub struct BillingInput<'a> {
     pub account: &'a str,
     pub prompt: i64,
     pub completion: i64,
+    /// Weighted billable sides (the served model's token_rate applied); equal
+    /// to `prompt`/`completion` when the model has no rate configured.
+    pub billable_prompt: i64,
+    pub billable_completion: i64,
     pub total: i64,
     pub ptu_spillover: bool,
     /// Counts are estimated (aborted stream), not vendor-reported.
@@ -196,11 +200,17 @@ pub fn clamp_tokens(n: i64) -> i64 {
 /// Price one call into a [`BillingRecord`]: the tenant's price for the served
 /// model, vendor cost from the serving account. Shared by the request pipeline
 /// and the realtime surface so the two can't drift; token counts are clamped.
+/// Cost multiplies the weighted billable sides; the token columns keep the
+/// vendor-reported counts so usage stays truthful.
 pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> BillingRecord {
     let (prompt, completion, total) = (
         clamp_tokens(b.prompt),
         clamp_tokens(b.completion),
         clamp_tokens(b.total),
+    );
+    let (billable_prompt, billable_completion) = (
+        clamp_tokens(b.billable_prompt),
+        clamp_tokens(b.billable_completion),
     );
     let charged = cfg.prices_for_tenant(b.tenant, b.served_model);
     let vendor = cfg
@@ -228,8 +238,8 @@ pub fn billing_record(cfg: &gw_config::GatewayConfig, b: &BillingInput) -> Billi
         prompt_tokens: prompt,
         completion_tokens: completion,
         total_tokens: total,
-        cost_micros: gw_models::cost_micros(prompt, completion, charged),
-        vendor_cost_micros: gw_models::cost_micros(prompt, completion, vendor),
+        cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, charged),
+        vendor_cost_micros: gw_models::cost_micros(billable_prompt, billable_completion, vendor),
         ptu_spillover: b.ptu_spillover,
         estimated: b.estimated,
     }
@@ -2372,6 +2382,37 @@ mod tests {
     }
 
     #[test]
+    fn billing_record_bills_weighted_sides_keeps_raw_columns() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat, input_price_per_1k_micros: 1000, output_price_per_1k_micros: 2000}]";
+        let cfg = gw_config::GatewayConfig::from_yaml(yaml).unwrap();
+        let rec = billing_record(
+            &cfg,
+            &BillingInput {
+                ak: "k",
+                product: "demo",
+                tenant: "default",
+                user_id: "u1",
+                request_id: "req-1",
+                requested_model: "m",
+                served_model: "m",
+                protocol: "openai-chat",
+                account: "acc",
+                prompt: 1140,
+                completion: 60,
+                billable_prompt: 250,
+                billable_completion: 60,
+                total: 310,
+                ptu_spillover: false,
+                estimated: false,
+            },
+        );
+        assert_eq!(rec.prompt_tokens, 1140);
+        assert_eq!(rec.completion_tokens, 60);
+        assert_eq!(rec.total_tokens, 310);
+        assert_eq!(rec.cost_micros, 250 + 120);
+    }
+
+    #[test]
     fn billing_record_clamps_hostile_usage() {
         let cfg = gw_config::GatewayConfig::embedded_default().unwrap();
         let rec = billing_record(
@@ -2388,6 +2429,8 @@ mod tests {
                 account: "acc",
                 prompt: i64::MAX,
                 completion: i64::MAX,
+                billable_prompt: i64::MAX,
+                billable_completion: i64::MAX,
                 total: i64::MAX,
                 ptu_spillover: false,
                 estimated: false,

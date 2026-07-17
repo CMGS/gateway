@@ -461,6 +461,47 @@ mod tests {
         }
     }
 
+    /// MockTransport with the usage rewritten to 100 prompt tokens, 80 cached.
+    #[derive(Debug)]
+    struct CachedUsageTransport;
+
+    #[async_trait::async_trait]
+    impl gw_engines::Transport for CachedUsageTransport {
+        async fn send(
+            &self,
+            req: gw_engines::UpstreamRequest,
+        ) -> GResult<gw_engines::UpstreamResponse> {
+            let mut resp = gw_engines::MockTransport.send(req).await?;
+            if let gw_engines::UpstreamBody::Json(b) = &mut resp.body {
+                let mut v: serde_json::Value = serde_json::from_slice(b).unwrap();
+                v["usage"]["prompt_tokens"] = 100.into();
+                v["usage"]["prompt_tokens_details"] = serde_json::json!({"cached_tokens": 80});
+                *b = serde_json::to_vec(&v).unwrap();
+            }
+            Ok(resp)
+        }
+    }
+
+    #[tokio::test]
+    async fn token_rate_discounts_cached_prompt_cost() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m-cache, protocol: openai-chat, input_price_per_1k_micros: 1000, token_rate: {read_cache: 0.1}}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(CachedUsageTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        h.run(chat_req("m-cache", "hi"), key).await.unwrap();
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        let rec = &ledger[0];
+        // raw usage stays truthful: 20 fresh + 80 cached
+        assert_eq!(rec.prompt_tokens, 100);
+        // billable prompt = 20 + 80*0.1 = 28 at 1000 micros/1k input
+        assert_eq!(rec.cost_micros, 28);
+        assert_eq!(rec.total_tokens, 28 + rec.completion_tokens);
+    }
+
     #[derive(Debug)]
     struct DenyModerator;
 
