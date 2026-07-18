@@ -60,12 +60,16 @@ impl DagNode for ModelQuotaGate {
             .request
             .model_param_v2
             .as_mut()
-            .and_then(|p| admission::swap_to_fallback(cfg, tenant, p));
+            .map(|p| admission::swap_to_fallback(cfg, tenant, p));
         match swapped {
-            Some((from, fb)) => {
+            Some(admission::FallbackSwap::Swapped(from, fb)) => {
                 ctx.decide("model_quota", format!("{from} over {limit}, serving {fb}"))
             }
-            None => ctx.decide(
+            Some(admission::FallbackSwap::AlreadyServing) => ctx.decide(
+                "model_quota",
+                format!("{requested} over {limit}, already the fallback"),
+            ),
+            _ => ctx.decide(
                 "model_quota",
                 format!("{requested} over {limit}, no fallback"),
             ),
@@ -579,10 +583,28 @@ impl DagNode for CallEngine {
                         ctx.state
                             .avail
                             .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
-                        ctx.state
+                        if ctx
+                            .state
                             .health
                             .record_failure(&next.name, threshold, cooldown)
-                            .await;
+                            .await
+                        {
+                            ctx.state.alerts.emit(
+                                "account_cooldown",
+                                next.name.clone(),
+                                format!(
+                                    "{} consecutive failures; cooling {}s",
+                                    threshold, ctx.cfg.stability.cooldown_seconds
+                                ),
+                            );
+                            ctx.decide(
+                                "account_health",
+                                format!(
+                                    "{} entered cooldown ({}s)",
+                                    next.name, ctx.cfg.stability.cooldown_seconds
+                                ),
+                            );
+                        }
                         Err(e)
                     }
                 }

@@ -148,13 +148,17 @@ impl OnlineHandler {
                         .request
                         .model_param_v2
                         .as_mut()
-                        .and_then(|p| admission::swap_to_fallback(&snap.cfg, tenant, p));
+                        .map(|p| admission::swap_to_fallback(&snap.cfg, tenant, p));
                     match swapped {
-                        Some((from, fb)) => {
+                        Some(admission::FallbackSwap::Swapped(from, fb)) => {
                             ctx.decide("moderation", format!("degraded {from} -> {fb}"));
                             emit_security_event(&ctx, "moderation", "degrade", 1).await;
                         }
-                        None => {
+                        Some(admission::FallbackSwap::AlreadyServing) => {
+                            ctx.decide("moderation", "already serving the fallback");
+                            emit_security_event(&ctx, "moderation", "degrade", 1).await;
+                        }
+                        _ => {
                             emit_security_event(&ctx, "moderation", "block", 1).await;
                             deny_moderation(
                                 &mut ctx,
@@ -836,6 +840,33 @@ mod tests {
             events
                 .iter()
                 .any(|e| e.rule == "moderation" && e.action == "degrade")
+        );
+    }
+
+    #[tokio::test]
+    async fn moderation_degrade_serves_when_already_on_the_fallback() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {moderate: true}\nmodels: [{name: pub-m, protocol: openai-chat}, {name: fb-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m, fb-m], fallback_model: fb-m}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
+        .with_moderator(Arc::new(DegradeModerator));
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(chat_req("fb-m", "hi"), key).await.unwrap();
+        let out = ctx.outcome.expect("outcome");
+        assert_eq!(
+            out.response.finish_reason, "stop",
+            "a request already on the fallback serves, not denies: {}",
+            out.response.message
+        );
+        assert!(
+            ctx.decisions
+                .iter()
+                .any(|(n, w)| *n == "moderation" && w.contains("already serving")),
+            "{:?}",
+            ctx.decisions
         );
     }
 

@@ -624,12 +624,23 @@ impl ModelEngine for RerankEngine {
             )
             .await?;
         let n = v["results"].as_array().map(Vec::len).unwrap_or(0);
-        let tokens = crate::engine::tok(&v["usage"]["total_tokens"]);
+        let tokens = rerank_tokens(&v);
         let mut out = family_outcome(format!("{n} results"), &param.model_name, v, status);
         out.response.prompt_tokens = tokens;
         out.response.total_tokens = tokens;
         Ok(out)
     }
+}
+
+/// Rerank usage across the two wire dialects: Jina-style `usage.total_tokens`,
+/// else Cohere/SiliconFlow-style `meta.tokens.{input,output}_tokens`.
+fn rerank_tokens(v: &Value) -> i64 {
+    let total = crate::engine::tok(&v["usage"]["total_tokens"]);
+    if total > 0 {
+        return total;
+    }
+    crate::engine::tok(&v["meta"]["tokens"]["input_tokens"])
+        .saturating_add(crate::engine::tok(&v["meta"]["tokens"]["output_tokens"]))
 }
 
 base_engine!(PassthroughEngine);
@@ -1119,6 +1130,17 @@ mod tests {
             let e = RerankEngine::new(req(Protocol::Rerank, "m", typed), t());
             assert_eq!(e.run().await.unwrap_err().http_status, 400);
         }
+    }
+
+    #[test]
+    fn rerank_tokens_reads_both_dialects() {
+        assert_eq!(rerank_tokens(&json!({"usage": {"total_tokens": 7}})), 7);
+        assert_eq!(
+            rerank_tokens(&json!({"meta": {"tokens": {"input_tokens": 5, "output_tokens": 2}}})),
+            7,
+            "SiliconFlow/Cohere meta.tokens shape bills too"
+        );
+        assert_eq!(rerank_tokens(&json!({})), 0);
     }
 
     #[tokio::test]

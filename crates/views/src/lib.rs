@@ -261,6 +261,7 @@ async fn realtime_ws(
     let m = RtModel {
         requested: model,
         served,
+        from_config: served_conf.is_some(),
     };
     // select "realtime" so subprotocol-offering clients get a valid handshake
     let ws = ws.protocols(["realtime"]);
@@ -290,6 +291,9 @@ async fn realtime_ws(
 struct RtModel {
     requested: String,
     served: String,
+    /// Whether `served` came from config at handshake — only then can a
+    /// reload invalidate it (wire-direct sessions have no config row).
+    from_config: bool,
 }
 
 /// A turn admitted by [`realtime_gate`]: the freshly re-authenticated key,
@@ -347,6 +351,16 @@ async fn realtime_gate(
         return Err(format!(
             "model `{}` is not entitled for tenant `{}`",
             m.requested, ak.tenant
+        ));
+    }
+    // the session pinned `served` at handshake; a reload may have removed it,
+    // and pricing an unknown model silently bills zero — deny so the client
+    // reconnects and picks against the live config. Wire-direct sessions
+    // (`?model=realtime`, never in config) are exempt: nothing to vanish.
+    if m.from_config && cfg.find_model(&m.served).is_none() {
+        return Err(format!(
+            "model `{}` is no longer configured; reconnect",
+            m.served
         ));
     }
     let gov = state.governance.as_ref();
@@ -2894,7 +2908,7 @@ async fn embeddings(
         &s,
         ak,
         model,
-        gw_consts::Protocol::OpenaiChat,
+        gw_consts::Protocol::Embeddings,
         typed,
         vec![],
         user_hint(&headers, &body["user"]),
@@ -2931,7 +2945,7 @@ async fn images_generations(
         &s,
         ak,
         model,
-        gw_consts::Protocol::OpenaiChat,
+        gw_consts::Protocol::Image,
         typed,
         vec![],
         user_hint(&headers, &body["user"]),
@@ -2971,7 +2985,7 @@ async fn images_edits(
         &s,
         ak,
         model,
-        gw_consts::Protocol::OpenaiChat,
+        gw_consts::Protocol::Image,
         typed,
         vec![],
         user_hint(&headers, &body["user"]),
@@ -3008,7 +3022,7 @@ async fn audio_speech(
         &s,
         ak,
         model,
-        gw_consts::Protocol::OpenaiChat,
+        gw_consts::Protocol::Tts,
         typed,
         vec![],
         user_hint(&headers, &body["user"]),
@@ -3065,7 +3079,7 @@ async fn audio_transcriptions(
         &s,
         ak,
         model,
-        gw_consts::Protocol::OpenaiChat,
+        gw_consts::Protocol::Stt,
         typed,
         vec![],
         user_hint(&headers, &body["user"]),
@@ -3106,7 +3120,7 @@ async fn audio_translations(
         &s,
         ak,
         model,
-        gw_consts::Protocol::OpenaiChat,
+        gw_consts::Protocol::Stt,
         typed,
         vec![],
         user_hint(&headers, &body["user"]),
@@ -3143,7 +3157,7 @@ async fn moderations(
         &s,
         ak,
         model,
-        gw_consts::Protocol::OpenaiChat,
+        gw_consts::Protocol::Moderations,
         typed,
         vec![],
         user_hint(&headers, &body["user"]),
@@ -3189,7 +3203,7 @@ async fn rerank(
         &s,
         ak,
         model,
-        gw_consts::Protocol::OpenaiChat,
+        gw_consts::Protocol::Rerank,
         typed,
         vec![],
         user_hint(&headers, &body["user"]),
@@ -3407,6 +3421,7 @@ mod tests {
         RtModel {
             requested: name.to_owned(),
             served: name.to_owned(),
+            from_config: true,
         }
     }
 
@@ -4141,6 +4156,34 @@ mod tests {
             s.handler.state().governance.quota_used(&ak.ak).await,
             150,
             "quota settles the weighted total"
+        );
+    }
+
+    #[tokio::test]
+    async fn realtime_turn_denied_when_served_model_reloaded_away() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: rt-pub, protocol: realtime, variants: [{model: rt-canary, weight: 1}]}, {name: rt-canary, protocol: realtime}]\naccounts: [{name: a1, provider: openai, protocols: ['realtime']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let ak = s.handler.state().auth.authenticate("k1").await.unwrap();
+        let pinned = RtModel {
+            requested: "rt-pub".into(),
+            served: "rt-canary".into(),
+            from_config: true,
+        };
+        assert!(realtime_gate(&s, &ak, &pinned, "").await.is_ok());
+        // canary rollback: the reload drops the variant the session pinned
+        let without = "listen: {host: h, port: 1}\nmodels: [{name: rt-pub, protocol: realtime}]\naccounts: [{name: a1, provider: openai, protocols: ['realtime']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        s.handler
+            .reload(GatewayConfig::from_yaml(without).unwrap())
+            .await
+            .unwrap();
+        let denied = realtime_gate(&s, &ak, &pinned, "").await.err();
+        assert!(
+            denied
+                .as_deref()
+                .is_some_and(|e| e.contains("no longer configured")),
+            "a pinned variant removed by reload must deny the turn, not bill zero: {denied:?}"
         );
     }
 
