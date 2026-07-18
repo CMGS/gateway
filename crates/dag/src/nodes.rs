@@ -517,28 +517,7 @@ impl DagNode for CallEngine {
                     .account
                     .clone()
                     .ok_or_else(|| GatewayError::internal("call_engine without an account"))?;
-                if ctx
-                    .state
-                    .health
-                    .record_failure(&failed.name, threshold, cooldown)
-                    .await
-                {
-                    ctx.state.alerts.emit(
-                        "account_cooldown",
-                        failed.name.clone(),
-                        format!(
-                            "{} consecutive failures; cooling {}s",
-                            threshold, ctx.cfg.stability.cooldown_seconds
-                        ),
-                    );
-                    ctx.decide(
-                        "account_health",
-                        format!(
-                            "{} entered cooldown ({}s)",
-                            failed.name, ctx.cfg.stability.cooldown_seconds
-                        ),
-                    );
-                }
+                note_failure(ctx, &failed.name, threshold, cooldown).await;
                 let provider = model_provider(ctx);
                 let next = ctx
                     .state
@@ -583,28 +562,7 @@ impl DagNode for CallEngine {
                         ctx.state
                             .avail
                             .record(requested_model(ctx.request.model_param_v2.as_ref()), false);
-                        if ctx
-                            .state
-                            .health
-                            .record_failure(&next.name, threshold, cooldown)
-                            .await
-                        {
-                            ctx.state.alerts.emit(
-                                "account_cooldown",
-                                next.name.clone(),
-                                format!(
-                                    "{} consecutive failures; cooling {}s",
-                                    threshold, ctx.cfg.stability.cooldown_seconds
-                                ),
-                            );
-                            ctx.decide(
-                                "account_health",
-                                format!(
-                                    "{} entered cooldown ({}s)",
-                                    next.name, ctx.cfg.stability.cooldown_seconds
-                                ),
-                            );
-                        }
+                        note_failure(ctx, &next.name, threshold, cooldown).await;
                         Err(e)
                     }
                 }
@@ -612,6 +570,35 @@ impl DagNode for CallEngine {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Record an account failure; on the cooldown transition, alert and note the
+/// decision — one implementation for both engine attempts, so the fleet-backed
+/// `record_failure` call and its alerting can't drift apart.
+async fn note_failure(
+    ctx: &mut DagContext,
+    account: &str,
+    threshold: usize,
+    cooldown: std::time::Duration,
+) {
+    if !ctx
+        .state
+        .health
+        .record_failure(account, threshold, cooldown)
+        .await
+    {
+        return;
+    }
+    let secs = ctx.cfg.stability.cooldown_seconds;
+    ctx.state.alerts.emit(
+        "account_cooldown",
+        account.to_owned(),
+        format!("{threshold} consecutive failures; cooling {secs}s"),
+    );
+    ctx.decide(
+        "account_health",
+        format!("{account} entered cooldown ({secs}s)"),
+    );
 }
 
 /// post_process/common_usage: RawUsageJSON -> CommonUsage.

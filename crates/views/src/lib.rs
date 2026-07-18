@@ -3064,37 +3064,7 @@ async fn audio_transcriptions(
     Authed(ak): Authed,
     Json(body): Json<Value>,
 ) -> Response {
-    let started = Instant::now();
-    let model = body["model"].as_str().unwrap_or_default().to_owned();
-    let audio = body["audio_b64"].as_str().unwrap_or_default().to_owned();
-    if model.is_empty() || audio.is_empty() {
-        return error_response(400, "model and audio_b64 are required");
-    }
-    let typed = TypedParams::AudioStt(SttParams {
-        audio_b64: audio,
-        language: body["language"].as_str().map(str::to_owned),
-        translate: false,
-    });
-    let ctx = match run_family(
-        &s,
-        ak,
-        model,
-        gw_consts::Protocol::Stt,
-        typed,
-        vec![],
-        user_hint(&headers, &body["user"]),
-    )
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(resp) => return resp,
-    };
-    log_access("audio_transcriptions", &ctx, started);
-    match ctx.outcome {
-        Some(o) if o.block.block => error_response(400, o.response.message),
-        Some(o) => (StatusCode::OK, Json(json!({ "text": o.response.message }))).into_response(),
-        None => error_response(500, "stt engine returned no outcome"),
-    }
+    audio_transcribe(s, headers, ak, body, false).await
 }
 
 /// POST /v1/audio/translations — the transcriptions shape, translated to
@@ -3105,6 +3075,18 @@ async fn audio_translations(
     Authed(ak): Authed,
     Json(body): Json<Value>,
 ) -> Response {
+    audio_transcribe(s, headers, ak, body, true).await
+}
+
+/// The shared STT body: transcriptions and translations differ only in the
+/// upstream path the `translate` flag selects.
+async fn audio_transcribe(
+    s: AppState,
+    headers: HeaderMap,
+    ak: AkInfo,
+    body: Value,
+    translate: bool,
+) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
     let audio = body["audio_b64"].as_str().unwrap_or_default().to_owned();
@@ -3114,7 +3096,7 @@ async fn audio_translations(
     let typed = TypedParams::AudioStt(SttParams {
         audio_b64: audio,
         language: body["language"].as_str().map(str::to_owned),
-        translate: true,
+        translate,
     });
     let ctx = match run_family(
         &s,
@@ -3130,7 +3112,12 @@ async fn audio_translations(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    log_access("audio_translations", &ctx, started);
+    let surface = if translate {
+        "audio_translations"
+    } else {
+        "audio_transcriptions"
+    };
+    log_access(surface, &ctx, started);
     match ctx.outcome {
         Some(o) if o.block.block => error_response(400, o.response.message),
         Some(o) => (StatusCode::OK, Json(json!({ "text": o.response.message }))).into_response(),
