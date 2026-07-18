@@ -313,6 +313,8 @@ fn for_each_typed_text(
         T::Image(p) => f(&mut p.prompt),
         T::Video(p) => f(&mut p.prompt),
         T::Search(p) => f(&mut p.query),
+        T::Moderation(p) => p.input.iter_mut().map(&mut *f).sum(),
+        T::Rerank(p) => f(&mut p.query) + p.documents.iter_mut().map(&mut *f).sum::<usize>(),
         T::AudioStt(_) => 0,
     }
 }

@@ -39,7 +39,15 @@ user. See [Governance](governance.md#per-user-attribution-and-billing).
 | POST | `/v1/images/edits` | source image + optional mask (base64) |
 | POST | `/v1/audio/speech` | TTS, returns audio bytes |
 | POST | `/v1/audio/transcriptions` | STT, JSON carries base64 audio |
+| POST | `/v1/audio/translations` | STT translated to English (same request shape) |
+| POST | `/v1/moderations` | content moderation; `input` string or array, native results pass through |
 | GET | `/v1/models` | configured public model names |
+
+## Rerank
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/v1/rerank` | Cohere/Jina-compatible: `{model, query, documents, top_n?}` → `{results: [{index, relevance_score}]}` |
 
 ### Chat completions
 

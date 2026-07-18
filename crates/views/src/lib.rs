@@ -111,6 +111,9 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/images/edits", post(images_edits))
         .route("/v1/audio/speech", post(audio_speech))
         .route("/v1/audio/transcriptions", post(audio_transcriptions))
+        .route("/v1/audio/translations", post(audio_translations))
+        .route("/v1/moderations", post(moderations))
+        .route("/v1/rerank", post(rerank))
         .route("/v1/batches", post(batches_submit))
         .route("/v1/batches/{id}", get(batches_get))
         .route("/v1/files", post(files_upload))
@@ -2642,6 +2645,22 @@ async fn run_family(
 /// A pre-stage content block answers 400 with the block message — these
 /// surfaces have no in-band content_filter shape, and falling through would
 /// misreport the block as an engine failure.
+/// An `input`-style field that may be a string or an array of strings
+/// (the OpenAI embeddings/moderations shape).
+fn string_or_string_array(v: Option<Value>) -> Vec<String> {
+    match v {
+        Some(Value::String(x)) => vec![x],
+        Some(Value::Array(a)) => a
+            .into_iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
 fn response_v2_or_500(outcome: Option<gw_engines::EngineOutcome>, engine: &str) -> Response {
     match outcome {
         Some(o) if o.block.block => error_response(400, o.response.message),
@@ -2863,17 +2882,7 @@ async fn embeddings(
 ) -> Response {
     let started = Instant::now();
     let model = body["model"].as_str().unwrap_or_default().to_owned();
-    let input: Vec<String> = match body.get_mut("input").map(Value::take) {
-        Some(Value::String(x)) => vec![x],
-        Some(Value::Array(a)) => a
-            .into_iter()
-            .filter_map(|v| match v {
-                Value::String(s) => Some(s),
-                _ => None,
-            })
-            .collect(),
-        _ => vec![],
-    };
+    let input = string_or_string_array(body.get_mut("input").map(Value::take));
     if model.is_empty() || input.is_empty() {
         return error_response(400, "model and input are required");
     }
@@ -3050,6 +3059,7 @@ async fn audio_transcriptions(
     let typed = TypedParams::AudioStt(SttParams {
         audio_b64: audio,
         language: body["language"].as_str().map(str::to_owned),
+        translate: false,
     });
     let ctx = match run_family(
         &s,
@@ -3071,6 +3081,126 @@ async fn audio_transcriptions(
         Some(o) => (StatusCode::OK, Json(json!({ "text": o.response.message }))).into_response(),
         None => error_response(500, "stt engine returned no outcome"),
     }
+}
+
+/// POST /v1/audio/translations — the transcriptions shape, translated to
+/// English by the upstream (OpenAI translations semantics).
+async fn audio_translations(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Authed(ak): Authed,
+    Json(body): Json<Value>,
+) -> Response {
+    let started = Instant::now();
+    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let audio = body["audio_b64"].as_str().unwrap_or_default().to_owned();
+    if model.is_empty() || audio.is_empty() {
+        return error_response(400, "model and audio_b64 are required");
+    }
+    let typed = TypedParams::AudioStt(SttParams {
+        audio_b64: audio,
+        language: body["language"].as_str().map(str::to_owned),
+        translate: true,
+    });
+    let ctx = match run_family(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::OpenaiChat,
+        typed,
+        vec![],
+        user_hint(&headers, &body["user"]),
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp,
+    };
+    log_access("audio_translations", &ctx, started);
+    match ctx.outcome {
+        Some(o) if o.block.block => error_response(400, o.response.message),
+        Some(o) => (StatusCode::OK, Json(json!({ "text": o.response.message }))).into_response(),
+        None => error_response(500, "stt engine returned no outcome"),
+    }
+}
+
+/// POST /v1/moderations — OpenAI moderations shape; input may be a string or
+/// an array of strings.
+async fn moderations(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Authed(ak): Authed,
+    Json(mut body): Json<Value>,
+) -> Response {
+    let started = Instant::now();
+    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let input = string_or_string_array(body.get_mut("input").map(Value::take));
+    if model.is_empty() || input.is_empty() {
+        return error_response(400, "model and input are required");
+    }
+    let typed = TypedParams::Moderation(gw_models::ModerationParams { input });
+    let ctx = match run_family(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::OpenaiChat,
+        typed,
+        vec![],
+        user_hint(&headers, &body["user"]),
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp,
+    };
+    log_access("moderations", &ctx, started);
+    response_v2_or_500(ctx.outcome, "moderations")
+}
+
+/// POST /v1/rerank — Cohere/Jina-compatible: `{model, query, documents, top_n?}`.
+async fn rerank(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Authed(ak): Authed,
+    Json(mut body): Json<Value>,
+) -> Response {
+    let started = Instant::now();
+    let model = body["model"].as_str().unwrap_or_default().to_owned();
+    let query = body["query"].as_str().unwrap_or_default().to_owned();
+    let documents: Vec<String> = match body.get_mut("documents").map(Value::take) {
+        Some(Value::Array(a)) => a
+            .into_iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    };
+    if model.is_empty() || query.is_empty() || documents.is_empty() {
+        return error_response(400, "model, query, and documents are required");
+    }
+    let typed = TypedParams::Rerank(gw_models::RerankParams {
+        query,
+        documents,
+        top_n: body["top_n"].as_i64(),
+    });
+    let ctx = match run_family(
+        &s,
+        ak,
+        model,
+        gw_consts::Protocol::OpenaiChat,
+        typed,
+        vec![],
+        user_hint(&headers, &body["user"]),
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp,
+    };
+    log_access("rerank", &ctx, started);
+    response_v2_or_500(ctx.outcome, "rerank")
 }
 
 fn parse_batch_messages(v: &Value) -> Vec<ChatMsg> {
@@ -3829,6 +3959,57 @@ mod tests {
             events
                 .iter()
                 .any(|e| e.rule == "moderation" && e.action == "mask")
+        );
+    }
+
+    #[tokio::test]
+    async fn moderations_rerank_and_translations_roundtrip() {
+        let post = |path: &str, body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(path.to_owned())
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer ak-demo-123")
+                .body(Body::from(body.to_owned()))
+                .unwrap()
+        };
+        let resp = test_app()
+            .oneshot(post(
+                "/v1/moderations",
+                r#"{"model":"text-moderation","input":["fine text","really unsafe text"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["results"][0]["flagged"], false);
+        assert_eq!(j["results"][1]["flagged"], true);
+
+        let resp = test_app()
+            .oneshot(post(
+                "/v1/rerank",
+                r#"{"model":"rerank-mini","query":"rust gateway","documents":["a rust gateway","cooking pasta"],"top_n":1}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        let results = j["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "top_n honored");
+        assert_eq!(results[0]["index"], 0, "the matching document ranks first");
+
+        let resp = test_app()
+            .oneshot(post(
+                "/v1/audio/translations",
+                r#"{"model":"whisper-1","audio_b64":"AAAA"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert!(
+            j["text"].as_str().unwrap().contains("translated"),
+            "the translations path reached the translations mock: {j}"
         );
     }
 

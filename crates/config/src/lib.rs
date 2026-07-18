@@ -29,7 +29,7 @@ pub enum ConfigError {
     #[error("model `{model}` references unknown protocol `{wire}`")]
     UnknownModelMapping { model: String, wire: String },
     #[error(
-        "provider `{provider}` has unknown kind `{kind}` (known: openai, anthropic, gemini, deepseek, openrouter)"
+        "provider `{provider}` has unknown kind `{kind}` (known: openai, anthropic, gemini, deepseek, openrouter, moonshot, siliconflow)"
     )]
     UnknownProviderKind { provider: String, kind: String },
     #[error("model `{model}` references unknown provider `{provider}`")]
@@ -588,6 +588,7 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
                 "responses",
                 "completions",
                 "realtime",
+                "moderations",
             ],
             default_model_wire: "openai-chat",
         },
@@ -610,6 +611,16 @@ fn provider_preset(kind: &str) -> Option<ProviderPreset> {
         "openrouter" => ProviderPreset {
             endpoint: "https://openrouter.ai/api",
             wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "moonshot" => ProviderPreset {
+            endpoint: "https://api.moonshot.cn",
+            wires: &["openai-chat"],
+            default_model_wire: "openai-chat",
+        },
+        "siliconflow" => ProviderPreset {
+            endpoint: "https://api.siliconflow.cn",
+            wires: &["openai-chat", "embeddings", "rerank"],
             default_model_wire: "openai-chat",
         },
         _ => return None,
@@ -1179,9 +1190,12 @@ listen: {host: 127.0.0.1, port: 0}
 providers:
   - {name: deepseek, kind: deepseek, api_key_env: DEEPSEEK_KEY}
   - {name: openrouter, kind: openrouter, api_key_env: OPENROUTER_KEY}
+  - {name: kimi, kind: moonshot, api_key_env: MOONSHOT_KEY}
+  - {name: sf, kind: siliconflow, api_key_env: SF_KEY}
 models:
   - {name: deepseek-chat, provider: deepseek}
   - {name: some-model, provider: openrouter}
+  - {name: kimi-k2, provider: kimi}
 "#;
         let cfg = GatewayConfig::from_yaml(yaml).unwrap();
         assert_eq!(
@@ -1190,6 +1204,14 @@ models:
         );
         let ds = cfg.accounts.iter().find(|a| a.name == "deepseek").unwrap();
         assert_eq!(ds.endpoint, "https://api.deepseek.com");
+        assert_eq!(
+            cfg.find_model("kimi-k2").unwrap().protocol(),
+            Some(Protocol::OpenaiChat)
+        );
+        let kimi = cfg.accounts.iter().find(|a| a.name == "kimi").unwrap();
+        assert_eq!(kimi.endpoint, "https://api.moonshot.cn");
+        let sf = cfg.accounts.iter().find(|a| a.name == "sf").unwrap();
+        assert!(sf.protocols.iter().any(|w| w == "rerank"));
         let orr = cfg
             .accounts
             .iter()

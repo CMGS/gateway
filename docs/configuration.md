@@ -126,7 +126,7 @@ its variant once at the handshake and pins it for the whole session.
 ```yaml
 providers:
   - name: openai
-    kind: openai              # openai | anthropic | gemini | deepseek | openrouter
+    kind: openai              # openai | anthropic | gemini | deepseek | openrouter | moonshot | siliconflow
     api_key_env: OPENAI_API_KEY
     # endpoint / timeout_seconds / connect_retries / secret_key_env may be
     # set here too and are inherited by the synthesized account
