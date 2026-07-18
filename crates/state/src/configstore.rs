@@ -11,6 +11,13 @@ const KEEP_VERSIONS: i64 = 20;
 /// The Postgres NOTIFY channel a publish fires on (payload = version id).
 pub const CONFIG_CHANNEL: &str = "gw_config";
 
+/// Metadata for one retained config document, newest first in list responses.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfigVersion {
+    pub id: i64,
+    pub created_at_epoch_secs: i64,
+}
+
 /// Versioned gateway config in Postgres — the source of truth when
 /// `storage.postgres_url` is set (the local file only seeds an empty store).
 #[derive(Debug)]
@@ -46,6 +53,34 @@ impl PostgresConfigStore {
         Ok(row.map(|r| (r.get(0), r.get(1))))
     }
 
+    /// Load one retained version by id.
+    pub async fn load_version(&self, id: i64) -> GResult<Option<String>> {
+        sqlx::query_scalar("SELECT yaml FROM gw_config WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("read config version", e))
+    }
+
+    /// List retained versions newest first. The store keeps at most 20.
+    pub async fn list_versions(&self, limit: usize) -> GResult<Vec<ConfigVersion>> {
+        let rows = sqlx::query(
+            "SELECT id, EXTRACT(EPOCH FROM created_at)::BIGINT
+             FROM gw_config ORDER BY id DESC LIMIT $1",
+        )
+        .bind(limit.min(KEEP_VERSIONS as usize) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("list config versions", e))?;
+        Ok(rows
+            .iter()
+            .map(|r| ConfigVersion {
+                id: r.get(0),
+                created_at_epoch_secs: r.get(1),
+            })
+            .collect())
+    }
+
     /// Store a new version and notify every listening instance. The caller
     /// validates the YAML first — the store never holds an unparsable config.
     pub async fn publish(&self, yaml: &str) -> GResult<i64> {
@@ -58,12 +93,37 @@ impl PostgresConfigStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("publish config", e))?;
+        self.prune().await?;
+        Ok(id)
+    }
+
+    /// Publish the exact document from a retained version as a new head.
+    /// Returns `None` when `source_id` has already been pruned or never existed.
+    pub async fn rollback(&self, source_id: i64) -> GResult<Option<i64>> {
+        let id = sqlx::query_scalar(
+            "WITH ins AS (
+               INSERT INTO gw_config (yaml) SELECT yaml FROM gw_config WHERE id = $1
+               RETURNING id)
+             SELECT id FROM ins, pg_notify($2, ins.id::text)",
+        )
+        .bind(source_id)
+        .bind(CONFIG_CHANNEL)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("rollback config version", e))?;
+        if id.is_some() {
+            self.prune().await?;
+        }
+        Ok(id)
+    }
+
+    async fn prune(&self) -> GResult<()> {
         sqlx::query("DELETE FROM gw_config WHERE id <= (SELECT MAX(id) FROM gw_config) - $1")
             .bind(KEEP_VERSIONS)
             .execute(&self.pool)
             .await
             .map_err(|e| crate::sqlx_err("prune config versions", e))?;
-        Ok(id)
+        Ok(())
     }
 }
 
@@ -117,6 +177,20 @@ mod tests {
         let (id, yaml) = store.load_latest().await.unwrap().expect("latest");
         assert_eq!(id, v2);
         assert!(yaml.contains("host: b"));
+
+        let versions = store.list_versions(20).await.unwrap();
+        assert_eq!(versions[0].id, v2);
+        assert_eq!(
+            store.load_version(v1).await.unwrap().as_deref(),
+            Some("listen: {host: a, port: 1}")
+        );
+
+        let v3 = store.rollback(v1).await.unwrap().expect("retained version");
+        assert!(v3 > v2);
+        let (id, yaml) = store.load_latest().await.unwrap().expect("latest");
+        assert_eq!(id, v3);
+        assert!(yaml.contains("host: a"));
+        assert!(store.rollback(i64::MAX).await.unwrap().is_none());
 
         let n = listener.recv().await.expect("notify");
         assert_eq!(n.channel(), CONFIG_CHANNEL);
