@@ -85,6 +85,26 @@ pub fn model_quota_limit(cfg: &GatewayConfig, ak: &AkInfo, model: &str) -> Optio
     })
 }
 
+/// Swap `param` to the tenant's fallback model, threading `fallback_from` so
+/// billing/echo semantics follow; `None` when no fallback is configured or it
+/// already serves. Returns `(requested, fallback)` for the caller's decision
+/// trail. The one fallback swap the quota gate and moderation degrade share.
+pub fn swap_to_fallback(
+    cfg: &GatewayConfig,
+    tenant: &str,
+    param: &mut gw_models::ModelParamV2,
+) -> Option<(String, String)> {
+    let fb = cfg
+        .find_tenant(tenant)
+        .and_then(|t| t.fallback_model.clone())?;
+    if fb == param.model_name {
+        return None;
+    }
+    let from = std::mem::replace(&mut param.model_name, fb.clone());
+    param.fallback_from = Some(from.clone());
+    Some((from, fb))
+}
+
 /// Pooled tenant QPS, when the tenant configures one.
 pub async fn check_tenant_rate(
     gov: &dyn Governance,

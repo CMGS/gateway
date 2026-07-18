@@ -1070,8 +1070,28 @@ async fn rt_inbound_policy(
     if let Some(block) = scan.block {
         return Err(block.message);
     }
-    if let Some(reason) = realtime_moderate(s, sec, ak, hint, &text).await {
-        return Err(reason);
+    if sec.moderate && !text.is_empty() {
+        match s.handler.moderate_rt(sec, &text).await {
+            gw_handler::RtModeration::Allow => {}
+            gw_handler::RtModeration::Mask(spans) => {
+                let masked = gw_handler::plugins::apply_mask_spans_frame(frame, &spans);
+                if masked > 0 {
+                    write_rt_event(
+                        s,
+                        ak,
+                        ak.attributed_user(hint),
+                        "moderation",
+                        "mask",
+                        masked as i64,
+                    )
+                    .await;
+                }
+            }
+            gw_handler::RtModeration::Deny(reason) => {
+                write_rt_event(s, ak, ak.attributed_user(hint), "moderation", "block", 1).await;
+                return Err(reason);
+            }
+        }
     }
     let redacted = gw_handler::plugins::dlp_redact_realtime_frame(sec, frame);
     if redacted > 0 {
@@ -1100,25 +1120,6 @@ async fn emit_rt_hits(
     for hit in hits {
         write_rt_event(s, ak, user, &hit.rule, hit.action.as_str(), hit.count).await;
     }
-}
-
-/// Moderate a realtime frame's inbound `text` (collected by the frame scan)
-/// via the wired moderator — parity with the REST surface, so a moderated
-/// tenant can't be bypassed over the WebSocket. `Some(reason)` denies the
-/// frame; records a moderation event.
-async fn realtime_moderate(
-    s: &AppState,
-    sec: &gw_config::SecurityConf,
-    ak: &AkInfo,
-    hint: &str,
-    text: &str,
-) -> Option<String> {
-    if !sec.moderate || text.is_empty() {
-        return None;
-    }
-    let reason = s.handler.moderate_text(sec, text).await?;
-    write_rt_event(s, ak, ak.attributed_user(hint), "moderation", "block", 1).await;
-    Some(reason)
 }
 
 /// The caller IP for the admin audit trail, resolved at request entry — before
@@ -3692,11 +3693,10 @@ mod tests {
         let cfg = app.handler.cfg();
         let sec = cfg.security_for(&ak.tenant);
 
+        let mut frame = json!({"type":"input_text","text":"hello there"});
         assert_eq!(
-            realtime_moderate(&app, sec, &ak, "", "hello there")
-                .await
-                .as_deref(),
-            Some("blocked by moderator")
+            rt_inbound_policy(&app, &ak, "", &mut frame).await,
+            Err("blocked by moderator".to_owned())
         );
         let mut secret = json!({"type":"input_text","text":"sk-abcdefghijklmnopqrstuvwxyz012345"});
         let n = gw_handler::plugins::dlp_redact_realtime_frame(sec, &mut secret);
@@ -3717,6 +3717,59 @@ mod tests {
         assert!(
             events.iter().any(|e| e.rule == "dlp"),
             "inbound realtime DLP event"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FrameMaskModerator;
+
+    #[async_trait::async_trait]
+    impl gw_handler::moderation::Moderator for FrameMaskModerator {
+        async fn review(&self, text: &str) -> Result<gw_handler::moderation::Verdict, String> {
+            match text.find("secret") {
+                Some(i) => Ok(gw_handler::moderation::Verdict::Mask(
+                    std::iter::once(i..i + "secret".len()).collect(),
+                )),
+                None => Ok(gw_handler::moderation::Verdict::Allow),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn realtime_moderation_masks_the_frame() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {moderate: true}\nmodels: [{name: rt, protocol: realtime}]\naccess_keys: [{ak: k1, product: p, qps: 10, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let handler = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
+        .with_moderator(Arc::new(FrameMaskModerator));
+        let offline = OfflineHandler::new(handler.clone());
+        let app = AppState {
+            handler,
+            offline,
+            loader: None,
+            config_store: None,
+        };
+        let ak = app.handler.state().auth.authenticate("k1").await.unwrap();
+        let mut frame = json!({"type":"input_text","text":"tell secret now"});
+        assert_eq!(rt_inbound_policy(&app, &ak, "", &mut frame).await, Ok(0));
+        assert_eq!(
+            frame["text"], "tell [MASKED] now",
+            "the mask lands in the frame before it is forwarded"
+        );
+        let events = app
+            .handler
+            .state()
+            .store
+            .security_events(None, 10)
+            .await
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.rule == "moderation" && e.action == "mask")
         );
     }
 

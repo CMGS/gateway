@@ -17,6 +17,7 @@ use gw_dag::DagContext;
 use gw_engines::http_transport::UpstreamPolicy;
 use gw_engines::{EngineOutcome, SharedTransport};
 use gw_models::{Block, GResult, GatewayError, GatewayRequest, GatewayResponse};
+use gw_state::admission;
 use gw_state::{AkInfo, GatewayState, SharedConfig};
 
 pub use gw_models::BatchItem;
@@ -128,14 +129,63 @@ impl OnlineHandler {
         let inbound =
             (sec.moderate || retention.is_some()).then(|| plugins::inbound_text(&mut ctx.request));
 
-        if sec.moderate
-            && let Some(block) = self
-                .moderate(&ctx, sec, inbound.as_deref().unwrap_or_default())
+        if sec.moderate {
+            match self
+                .moderation(sec, inbound.as_deref().unwrap_or_default())
                 .await
-        {
-            ctx.decide("moderation", "denied");
-            ctx.outcome = Some(content_filter_outcome(block));
-            return Ok(ctx);
+            {
+                Moderation::Allow => {}
+                Moderation::Mask(spans) => {
+                    let masked = plugins::apply_mask_spans(&mut ctx.request, &spans);
+                    if masked > 0 {
+                        ctx.decide("moderation", format!("masked {masked} span(s)"));
+                        emit_security_event(&ctx, "moderation", "mask", masked as i64).await;
+                    }
+                }
+                Moderation::Degrade => {
+                    let tenant = &ctx.ak.tenant;
+                    let swapped = ctx
+                        .request
+                        .model_param_v2
+                        .as_mut()
+                        .and_then(|p| admission::swap_to_fallback(&snap.cfg, tenant, p));
+                    match swapped {
+                        Some((from, fb)) => {
+                            ctx.decide("moderation", format!("degraded {from} -> {fb}"));
+                            emit_security_event(&ctx, "moderation", "degrade", 1).await;
+                        }
+                        None => {
+                            emit_security_event(&ctx, "moderation", "block", 1).await;
+                            deny_moderation(
+                                &mut ctx,
+                                "degrade without a fallback: denied",
+                                "content requires degraded serving; no fallback model configured",
+                                gw_consts::ErrCode::EMPTY_RESP.value() as i32,
+                            );
+                            return Ok(ctx);
+                        }
+                    }
+                }
+                Moderation::Deny(reason) => {
+                    emit_security_event(&ctx, "moderation", "block", 1).await;
+                    deny_moderation(
+                        &mut ctx,
+                        "denied",
+                        reason,
+                        gw_consts::ErrCode::EMPTY_RESP.value() as i32,
+                    );
+                    return Ok(ctx);
+                }
+                Moderation::Unavailable => {
+                    deny_moderation(
+                        &mut ctx,
+                        "moderator unavailable: denied",
+                        MODERATION_UNAVAILABLE,
+                        gw_consts::ErrCode::SYSTEM_ERROR.value() as i32,
+                    );
+                    return Ok(ctx);
+                }
+            }
         }
 
         let redacted = plugins::dlp_redact_request(sec, &mut ctx.request);
@@ -214,35 +264,17 @@ impl OnlineHandler {
     /// Run the wired moderator over raw text; `Some(reason)` to deny, `None` to
     /// allow. The seam the realtime surface uses (it has no `DagContext`); the
     /// caller records the security event on its own surface.
-    pub async fn moderate_text(&self, sec: &gw_config::SecurityConf, text: &str) -> Option<String> {
+    /// [`Self::moderation`] narrowed to the realtime surface: a live session
+    /// can't switch models, so `Degrade` denies there.
+    pub async fn moderate_rt(&self, sec: &gw_config::SecurityConf, text: &str) -> RtModeration {
         match self.moderation(sec, text).await {
-            Moderation::Allow => None,
-            Moderation::Deny(reason) => Some(reason),
-            Moderation::Unavailable => Some(MODERATION_UNAVAILABLE.to_owned()),
-        }
-    }
-
-    /// Run the wired moderator over the request's pre-DLP inbound `text`;
-    /// `Some(Block)` to deny. Records a security event on a moderator deny.
-    async fn moderate(
-        &self,
-        ctx: &DagContext,
-        sec: &gw_config::SecurityConf,
-        text: &str,
-    ) -> Option<Block> {
-        match self.moderation(sec, text).await {
-            Moderation::Allow => None,
-            Moderation::Deny(reason) => {
-                emit_security_event(ctx, "moderation", "block", 1).await;
-                Some(Block::blocked(
-                    reason,
-                    gw_consts::ErrCode::EMPTY_RESP.value() as i32,
-                ))
-            }
-            Moderation::Unavailable => Some(Block::blocked(
-                MODERATION_UNAVAILABLE,
-                gw_consts::ErrCode::SYSTEM_ERROR.value() as i32,
-            )),
+            Moderation::Allow => RtModeration::Allow,
+            Moderation::Mask(spans) => RtModeration::Mask(spans),
+            Moderation::Degrade => RtModeration::Deny(
+                "content requires degraded serving; not available on a live session".to_owned(),
+            ),
+            Moderation::Deny(reason) => RtModeration::Deny(reason),
+            Moderation::Unavailable => RtModeration::Deny(MODERATION_UNAVAILABLE.to_owned()),
         }
     }
 
@@ -251,6 +283,8 @@ impl OnlineHandler {
     async fn moderation(&self, sec: &gw_config::SecurityConf, text: &str) -> Moderation {
         match self.moderator.review(text).await {
             Ok(moderation::Verdict::Allow) => Moderation::Allow,
+            Ok(moderation::Verdict::Mask(spans)) => Moderation::Mask(spans),
+            Ok(moderation::Verdict::Degrade) => Moderation::Degrade,
             Ok(moderation::Verdict::Deny(reason)) => Moderation::Deny(reason),
             Err(e) => {
                 tracing::warn!(error = %e, fail_open = sec.moderation_fail_open, "moderator error");
@@ -292,8 +326,17 @@ impl OnlineHandler {
 /// fail-closed posture (fail-open resolves to `Allow`).
 enum Moderation {
     Allow,
+    Mask(Vec<std::ops::Range<usize>>),
+    Degrade,
     Deny(String),
     Unavailable,
+}
+
+/// The realtime-surface subset of [`Moderation`]: no degrade mid-session.
+pub enum RtModeration {
+    Allow,
+    Mask(Vec<std::ops::Range<usize>>),
+    Deny(String),
 }
 
 /// A per-request correlation id: `req-<epoch_ms>-<seq>`, time-sortable and
@@ -304,6 +347,13 @@ pub fn new_request_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("req-{ms}-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Record a moderation denial: decision line + content-filter outcome. Event
+/// emission stays at the call sites (`Unavailable` deliberately records none).
+fn deny_moderation(ctx: &mut DagContext, decision: &str, reason: impl Into<String>, code: i32) {
+    ctx.decide("moderation", decision.to_owned());
+    ctx.outcome = Some(content_filter_outcome(Block::blocked(reason, code)));
 }
 
 /// The 200-with-`content_filter` outcome every pre-stage denial returns.
@@ -608,8 +658,33 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct MaskModerator;
+
+    #[async_trait::async_trait]
+    impl moderation::Moderator for MaskModerator {
+        async fn review(&self, text: &str) -> Result<moderation::Verdict, String> {
+            match text.find("secret") {
+                Some(i) => Ok(moderation::Verdict::Mask(
+                    std::iter::once(i..i + "secret".len()).collect(),
+                )),
+                None => Ok(moderation::Verdict::Allow),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct DegradeModerator;
+
+    #[async_trait::async_trait]
+    impl moderation::Moderator for DegradeModerator {
+        async fn review(&self, _text: &str) -> Result<moderation::Verdict, String> {
+            Ok(moderation::Verdict::Degrade)
+        }
+    }
+
     #[tokio::test]
-    async fn moderate_text_allow_deny_and_failure_posture() {
+    async fn moderate_rt_maps_verdicts_and_failure_posture() {
         let cfg = Arc::new(GatewayConfig::embedded_default().unwrap());
         let state = Arc::new(GatewayState::from_config(&cfg));
         let base = OnlineHandler::new(
@@ -617,21 +692,147 @@ mod tests {
             Arc::new(gw_engines::MockTransport),
         );
         let mut sec = gw_config::SecurityConf::default();
-        assert_eq!(base.moderate_text(&sec, "x").await, None, "default allows");
+        assert!(matches!(
+            base.moderate_rt(&sec, "x").await,
+            RtModeration::Allow
+        ));
         let deny = base.clone().with_moderator(Arc::new(DenyModerator));
-        assert_eq!(deny.moderate_text(&sec, "x").await.as_deref(), Some("nope"));
+        assert!(matches!(deny.moderate_rt(&sec, "x").await, RtModeration::Deny(r) if r == "nope"));
+        let mask = base.clone().with_moderator(Arc::new(MaskModerator));
+        assert!(matches!(
+            mask.moderate_rt(&sec, "a secret").await,
+            RtModeration::Mask(spans) if spans.len() == 1 && spans[0] == (2..8)
+        ));
+        let degrade = base.clone().with_moderator(Arc::new(DegradeModerator));
+        assert!(
+            matches!(degrade.moderate_rt(&sec, "x").await, RtModeration::Deny(r) if r.contains("live session")),
+            "degrade maps to deny on the realtime surface"
+        );
         let err = base.with_moderator(Arc::new(ErrModerator));
         sec.moderation_fail_open = true;
-        assert_eq!(
-            err.moderate_text(&sec, "x").await,
-            None,
-            "error + fail-open allows"
-        );
+        assert!(matches!(
+            err.moderate_rt(&sec, "x").await,
+            RtModeration::Allow
+        ));
         sec.moderation_fail_open = false;
+        assert!(matches!(
+            err.moderate_rt(&sec, "x").await,
+            RtModeration::Deny(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn moderation_mask_redacts_before_the_engine() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {moderate: true}\nmodels: [{name: gpt-4o, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
+        .with_moderator(Arc::new(MaskModerator));
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h
+            .run(chat_req("gpt-4o", "tell secret now"), key)
+            .await
+            .unwrap();
         assert!(
-            err.moderate_text(&sec, "x").await.is_some(),
-            "error + fail-closed denies"
+            ctx.outcome
+                .expect("outcome")
+                .response
+                .message
+                .contains("you said: tell [MASKED] now"),
+            "the engine saw the masked text"
         );
+        let events = h.state().store.security_events(None, 10).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.rule == "moderation" && e.action == "mask")
+        );
+    }
+
+    #[tokio::test]
+    async fn moderation_degrade_swaps_to_tenant_fallback() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {moderate: true}\nmodels: [{name: pub-m, protocol: openai-chat}, {name: fb-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m, fb-m], fallback_model: fb-m}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
+        .with_moderator(Arc::new(DegradeModerator));
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(chat_req("pub-m", "hi"), key).await.unwrap();
+        assert_eq!(
+            ctx.outcome.expect("outcome").response.model,
+            "pub-m",
+            "response echoes the requested name"
+        );
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        assert_eq!(ledger[0].model, "pub-m");
+        assert_eq!(ledger[0].served_model, "fb-m");
+        let events = h.state().store.security_events(None, 10).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.rule == "moderation" && e.action == "degrade")
+        );
+    }
+
+    #[tokio::test]
+    async fn moderation_degrade_without_fallback_denies() {
+        let yaml = "listen: {host: h, port: 1}\nsecurity: {moderate: true}\nmodels: [{name: pub-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\naccess_keys: [{ak: k1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        )
+        .with_moderator(Arc::new(DegradeModerator));
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        let ctx = h.run(chat_req("pub-m", "hi"), key).await.unwrap();
+        let out = ctx.outcome.expect("outcome");
+        assert_eq!(out.response.finish_reason, "content_filter");
+        assert!(
+            out.response
+                .message
+                .contains("no fallback model configured")
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_fallback_skips_variant_select() {
+        let yaml = "listen: {host: h, port: 1}\nmodels: [{name: pub-m, protocol: openai-chat, variants: [{model: canary-m, weight: 1}]}, {name: canary-m, protocol: openai-chat}, {name: fb-m, protocol: openai-chat}]\naccounts: [{name: a1, provider: openai, protocols: ['openai-chat']}]\ntenants: [{name: t1, models: [pub-m, canary-m, fb-m], fallback_model: fb-m, model_quotas: {pub-m: 1}}]\naccess_keys: [{ak: k1, tenant: t1, product: p, qps: 100, daily_token_quota: 100000}]";
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let h = OnlineHandler::new(
+            gw_state::SharedConfig::new(cfg, state),
+            Arc::new(gw_engines::MockTransport),
+        );
+        let key = h.state().auth.authenticate("k1").await.unwrap();
+        h.run(chat_req("pub-m", "burn the tiny quota"), key.clone())
+            .await
+            .unwrap();
+        let ctx = h
+            .run(chat_req("pub-m", "over quota now"), key)
+            .await
+            .unwrap();
+        assert!(
+            ctx.decisions
+                .iter()
+                .any(|(n, w)| *n == "model_quota" && w.contains("serving fb-m")),
+            "quota gate degraded the request: {:?}",
+            ctx.decisions
+        );
+        assert!(
+            !ctx.decisions.iter().any(|(n, _)| *n == "variant_select"),
+            "an already-degraded request skips the variant split"
+        );
+        let (_, ledger) = h.state().store.ledger_snapshot(usize::MAX).await.unwrap();
+        let rec = ledger.last().expect("two billed requests");
+        assert_eq!(rec.model, "pub-m");
+        assert_eq!(rec.served_model, "fb-m");
     }
 
     #[tokio::test]
@@ -794,6 +995,14 @@ mod tests {
             ledger[0].prompt_tokens > 0 && ledger[0].completion_tokens > 0,
             "estimated tokens, not zero: {:?}",
             ledger[0]
+        );
+        let avail = &h.state().avail;
+        avail.flush().await;
+        let minute = gw_state::epoch_secs() / 60;
+        assert_eq!(
+            avail.window("gpt-4o", minute - 5, minute).await,
+            (0, 0),
+            "an aborted stream is neither an availability success nor an error"
         );
     }
 

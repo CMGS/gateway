@@ -55,22 +55,17 @@ impl DagNode for ModelQuotaGate {
         if under {
             return Ok(());
         }
-        let fallback = ctx
-            .cfg
-            .find_tenant(&ctx.ak.tenant)
-            .and_then(|t| t.fallback_model.clone());
-        match fallback {
-            Some(fb) if fb != requested => {
-                ctx.decide(
-                    "model_quota",
-                    format!("{requested} over {limit}, serving {fb}"),
-                );
-                if let Some(param) = ctx.request.model_param_v2.as_mut() {
-                    param.fallback_from = Some(requested);
-                    param.model_name = fb;
-                }
+        let (cfg, tenant) = (&ctx.cfg, &ctx.ak.tenant);
+        let swapped = ctx
+            .request
+            .model_param_v2
+            .as_mut()
+            .and_then(|p| admission::swap_to_fallback(cfg, tenant, p));
+        match swapped {
+            Some((from, fb)) => {
+                ctx.decide("model_quota", format!("{from} over {limit}, serving {fb}"))
             }
-            _ => ctx.decide(
+            None => ctx.decide(
                 "model_quota",
                 format!("{requested} over {limit}, no fallback"),
             ),
