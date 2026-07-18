@@ -4,11 +4,13 @@ package integration_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +19,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/cocoonstack/gateway/control-plane/internal/auth"
 	"github.com/cocoonstack/gateway/control-plane/internal/gateway"
@@ -58,7 +62,7 @@ func TestTenantTokenChain(t *testing.T) {
 	if gwBin == "" || pgURL == "" || redisURL == "" {
 		t.Skip("CP_TEST_GW_BIN, CP_TEST_PG_URL and CP_TEST_REDIS_URL are required")
 	}
-	gwURL := startGateway(t, gwBin, pgURL, redisURL)
+	gwURL := startGateway(t, gwBin, provisionDatabase(t, pgURL), redisURL)
 	cp := startControlPlane(t, gwURL)
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
 	acmeKey, labsKey := "ak-e2e-acme-"+suffix, "ak-e2e-labs-"+suffix
@@ -176,6 +180,29 @@ func TestTenantTokenChain(t *testing.T) {
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
+}
+
+func provisionDatabase(t *testing.T, baseURL string) string {
+	t.Helper()
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		t.Fatalf("parse postgres url: %v", err)
+	}
+	conn, err := pgx.Connect(t.Context(), baseURL)
+	if err != nil {
+		t.Fatalf("connect postgres: %v", err)
+	}
+	name := fmt.Sprintf("cp_e2e_%d", time.Now().UnixNano())
+	if _, err := conn.Exec(t.Context(), "CREATE DATABASE "+name); err != nil {
+		t.Fatalf("create e2e database: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_, _ = conn.Exec(ctx, "DROP DATABASE "+name+" WITH (FORCE)")
+		_ = conn.Close(ctx)
+	})
+	parsed.Path = "/" + name
+	return parsed.String()
 }
 
 func startGateway(t *testing.T, bin, pgURL, redisURL string) string {
