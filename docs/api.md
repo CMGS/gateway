@@ -147,13 +147,13 @@ regardless.
 | PUT | `/admin/config` | validate + publish a new config document to the fleet config store; every instance reloads via the change feed (global token; needs `storage.postgres_url`) |
 | GET | `/admin/config/versions` | retained config versions, newest first (global token; needs `storage.postgres_url`) |
 | POST | `/admin/config/versions/{id}/rollback` | republish a retained document as a new head and reload (global token; needs `storage.postgres_url`) |
-| GET | `/admin/keys` | list keys with computed `status` / `available`, `?offset=&limit=` paged (default 200; a tenant token sees only its own tenant's) |
+| GET | `/admin/keys` | list keys with computed `status` / `available`, `?offset=&limit=` paged (default 200; a tenant token sees only its own tenant's); `?ak=` exact lookup answers a 0/1-key page — a foreign key is an empty page, never a 404 oracle |
 | POST | `/admin/keys` | create/replace a key: `{ak, product, tenant?, owner?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` (`owner` binds the key to one end user — authoritative for attribution) |
 | PATCH | `/admin/keys/{ak}` | update any of `qps` / `daily_token_quota` / `tokens_per_minute` / `expires_at_epoch_secs` (null clears) / `banned` / `suspended_until_epoch_secs` (null lifts an abuse suspension early) |
 | DELETE | `/admin/keys/{ak}` | revoke a key |
 | GET | `/admin/usage` | ledger rollup by tenant × model (requests, tokens, charged `cost_micros`, `vendor_cost_micros` for margin); `?tenant=` filter for the global token |
-| GET | `/admin/usage/users` | per-user cost rollup (user × model) over a billing period: `?since=&until=` (unix secs), `?user=` filter, `?format=csv` export; tenant-scoped |
-| GET | `/admin/usage/series` | bounded dashboard series: `?bucket=hour|day&since=&until=&user=`; tenant-scoped, maximum 400 points |
+| GET | `/admin/usage/users` | per-user cost rollup (user × model) over a billing period: `?since=&until=` (unix secs), `?user=` filter, `?format=csv` export; tenant-scoped — a tenant token reads `vendor_cost_micros` as 0 (operator-only margin basis) |
+| GET | `/admin/usage/series` | bounded dashboard series: `?bucket=hour|day&since=&until=&user=`; tenant-scoped (vendor cost redacted like `/admin/usage/users`), maximum 400 points |
 | GET | `/admin/models/status` | per-model availability over the recent window (`available` / `unstable` / `unavailable` / `no_data`), judged from client-visible outcomes against `stability.*` thresholds; attributes to the requested public name under a `variants` split; realtime models sample per billed turn and on session-fatal upstream errors; tenant-scoped |
 | GET | `/admin/audit/events` | content-safety hits (blocklist / regex / DLP / moderation) recorded without prompt text; `?limit=`; tenant-scoped |
 | GET | `/admin/audit/ops` | admin-operation trail (key CRUD, config publish, reload) with actor, target, and source IP; `?limit=`; global token only |

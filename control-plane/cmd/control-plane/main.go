@@ -111,7 +111,7 @@ func buildGateway(cfg config.Config) (gateway.Client, error) {
 	if cfg.GatewayMode == "mock" {
 		return gateway.NewMock(), nil
 	}
-	return gateway.NewHTTP(cfg.GatewayTargets, cfg.GatewayAdminToken)
+	return gateway.NewHTTP(cfg.GatewayTargets, cfg.GatewayAdminToken, cfg.GatewayTenantTokens)
 }
 
 type userSeed struct {

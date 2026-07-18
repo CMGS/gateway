@@ -11,21 +11,22 @@ import (
 )
 
 type Config struct {
-	ListenAddr        string
-	StoreDriver       string
-	DatabaseURL       string
-	KVDriver          string
-	RedisURL          string
-	GatewayMode       string
-	GatewayTargets    string
-	GatewayAdminToken string
-	WebDir            string
-	SessionTTL        time.Duration
-	CookieSecure      bool
-	DevSeed           bool
-	BootstrapEmail    string
-	BootstrapPassword string
-	LogLevel          string
+	ListenAddr          string
+	StoreDriver         string
+	DatabaseURL         string
+	KVDriver            string
+	RedisURL            string
+	GatewayMode         string
+	GatewayTargets      string
+	GatewayAdminToken   string
+	GatewayTenantTokens map[string]string
+	WebDir              string
+	SessionTTL          time.Duration
+	CookieSecure        bool
+	DevSeed             bool
+	BootstrapEmail      string
+	BootstrapPassword   string
+	LogLevel            string
 }
 
 func Load() (Config, error) {
@@ -71,10 +72,31 @@ func Load() (Config, error) {
 	if cfg.GatewayMode == "http" && strings.TrimSpace(cfg.GatewayAdminToken) == "" {
 		return Config{}, fmt.Errorf("CP_GATEWAY_ADMIN_TOKEN is required for http gateway mode")
 	}
+	tenantTokens, err := parseTenantTokens(os.Getenv("CP_GATEWAY_TENANT_TOKENS"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.GatewayTenantTokens = tenantTokens
 	if (cfg.BootstrapEmail == "") != (cfg.BootstrapPassword == "") {
 		return Config{}, fmt.Errorf("bootstrap admin email and password must be set together")
 	}
 	return cfg, nil
+}
+
+func parseTenantTokens(raw string) (map[string]string, error) {
+	tokens := make(map[string]string)
+	for part := range strings.SplitSeq(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		tenant, token, ok := strings.Cut(part, "=")
+		if !ok || tenant == "" || token == "" {
+			return nil, fmt.Errorf("CP_GATEWAY_TENANT_TOKENS entries must be tenant=token")
+		}
+		tokens[tenant] = token
+	}
+	return tokens, nil
 }
 
 func envBool(name string, fallback bool) bool {

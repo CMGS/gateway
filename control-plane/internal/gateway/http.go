@@ -23,20 +23,22 @@ type Target struct {
 var _ Client = (*HTTPClient)(nil)
 
 type HTTPClient struct {
-	targets    []Target
-	adminToken string
-	client     *http.Client
+	targets      []Target
+	adminToken   string
+	tenantTokens map[string]string
+	client       *http.Client
 }
 
-func NewHTTP(rawTargets, adminToken string) (*HTTPClient, error) {
+func NewHTTP(rawTargets, adminToken string, tenantTokens map[string]string) (*HTTPClient, error) {
 	targets, err := parseTargets(rawTargets)
 	if err != nil {
 		return nil, err
 	}
 	return &HTTPClient{
-		targets:    targets,
-		adminToken: adminToken,
-		client:     &http.Client{Timeout: 8 * time.Second},
+		targets:      targets,
+		adminToken:   adminToken,
+		tenantTokens: tenantTokens,
+		client:       &http.Client{Timeout: 8 * time.Second},
 	}, nil
 }
 
@@ -47,7 +49,7 @@ func (c *HTTPClient) Usage(ctx context.Context, scope Scope, since, until int64)
 	var resp struct {
 		Usage []UsageRow `json:"usage"`
 	}
-	if err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/usage/users?"+q.Encode(), nil, &resp, true); err != nil {
+	if err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/usage/users?"+q.Encode(), nil, &resp, c.readBearer(scope.Tenant)); err != nil {
 		return nil, err
 	}
 	return resp.Usage, nil
@@ -59,7 +61,7 @@ func (c *HTTPClient) UsageSeries(ctx context.Context, scope Scope, bucket string
 	q.Set("since", strconv.FormatInt(since, 10))
 	q.Set("until", strconv.FormatInt(until, 10))
 	var series Series
-	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/usage/series?"+q.Encode(), nil, &series, true)
+	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/usage/series?"+q.Encode(), nil, &series, c.readBearer(scope.Tenant))
 	return series, err
 }
 
@@ -72,39 +74,56 @@ func (c *HTTPClient) Models(ctx context.Context, scope Scope) ([]ModelStatus, er
 	var resp struct {
 		Models []ModelStatus `json:"models"`
 	}
-	if err := c.doJSON(ctx, c.primary(), http.MethodGet, path, nil, &resp, true); err != nil {
+	if err := c.doJSON(ctx, c.primary(), http.MethodGet, path, nil, &resp, c.readBearer(scope.Tenant)); err != nil {
 		return nil, err
 	}
 	return resp.Models, nil
 }
 
-func (c *HTTPClient) Keys(ctx context.Context, tenant string) ([]Key, error) {
+func (c *HTTPClient) Keys(ctx context.Context, tenant string, offset, limit int64) ([]Key, error) {
 	q := make(url.Values)
-	q.Set("limit", "1000")
+	if offset > 0 {
+		q.Set("offset", strconv.FormatInt(offset, 10))
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.FormatInt(limit, 10))
+	}
 	if tenant != "" {
 		q.Set("tenant", tenant)
 	}
 	var resp struct {
 		Keys []Key `json:"keys"`
 	}
-	if err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/keys?"+q.Encode(), nil, &resp, true); err != nil {
+	if err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/keys?"+q.Encode(), nil, &resp, c.readBearer(tenant)); err != nil {
 		return nil, err
 	}
 	return resp.Keys, nil
 }
 
-func (c *HTTPClient) CreateKey(ctx context.Context, key Key) error {
-	return c.doJSON(ctx, c.primary(), http.MethodPost, "/admin/keys", key, nil, true)
+func (c *HTTPClient) CreateKey(ctx context.Context, actingTenant string, key Key) error {
+	bearer, err := c.mutateBearer(actingTenant)
+	if err != nil {
+		return err
+	}
+	return c.doJSON(ctx, c.primary(), http.MethodPost, "/admin/keys", key, nil, bearer)
 }
 
-func (c *HTTPClient) PatchKey(ctx context.Context, ak string, patch map[string]any) (Key, error) {
+func (c *HTTPClient) PatchKey(ctx context.Context, actingTenant, ak string, patch map[string]any) (Key, error) {
+	bearer, err := c.mutateBearer(actingTenant)
+	if err != nil {
+		return Key{}, err
+	}
 	var key Key
-	err := c.doJSON(ctx, c.primary(), http.MethodPatch, "/admin/keys/"+url.PathEscape(ak), patch, &key, true)
+	err = c.doJSON(ctx, c.primary(), http.MethodPatch, "/admin/keys/"+url.PathEscape(ak), patch, &key, bearer)
 	return key, err
 }
 
-func (c *HTTPClient) DeleteKey(ctx context.Context, ak string) error {
-	return c.doJSON(ctx, c.primary(), http.MethodDelete, "/admin/keys/"+url.PathEscape(ak), nil, nil, true)
+func (c *HTTPClient) DeleteKey(ctx context.Context, actingTenant, ak string) error {
+	bearer, err := c.mutateBearer(actingTenant)
+	if err != nil {
+		return err
+	}
+	return c.doJSON(ctx, c.primary(), http.MethodDelete, "/admin/keys/"+url.PathEscape(ak), nil, nil, bearer)
 }
 
 func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
@@ -116,7 +135,7 @@ func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
 			var health struct {
 				Status string `json:"status"`
 			}
-			if err := c.doJSON(ctx, target, http.MethodGet, "/health", nil, &health, false); err != nil {
+			if err := c.doJSON(ctx, target, http.MethodGet, "/health", nil, &health, ""); err != nil {
 				instance.Error = err.Error()
 				instance.LatencyMS = time.Since(started).Milliseconds()
 				ch <- instance
@@ -125,7 +144,7 @@ func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
 			var accounts struct {
 				Accounts []Account `json:"accounts"`
 			}
-			if err := c.doJSON(ctx, target, http.MethodGet, "/internal/accounts", nil, &accounts, false); err != nil {
+			if err := c.doJSON(ctx, target, http.MethodGet, "/internal/accounts", nil, &accounts, ""); err != nil {
 				instance.Status = "degraded"
 				instance.Error = err.Error()
 			} else {
@@ -146,7 +165,7 @@ func (c *HTTPClient) Instances(ctx context.Context) ([]Instance, error) {
 
 func (c *HTTPClient) Config(ctx context.Context) (ConfigDocument, error) {
 	var doc ConfigDocument
-	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/config", nil, &doc, true)
+	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/config", nil, &doc, c.adminToken)
 	return doc, err
 }
 
@@ -172,7 +191,7 @@ func (c *HTTPClient) ConfigVersions(ctx context.Context) ([]ConfigVersion, error
 	var result struct {
 		Versions []ConfigVersion `json:"versions"`
 	}
-	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/config/versions", nil, &result, true)
+	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/config/versions", nil, &result, c.adminToken)
 	return result.Versions, err
 }
 
@@ -181,7 +200,7 @@ func (c *HTTPClient) RollbackConfig(ctx context.Context, id int64) (int64, error
 		Version int64 `json:"version"`
 	}
 	path := fmt.Sprintf("/admin/config/versions/%d/rollback", id)
-	err := c.doJSON(ctx, c.primary(), http.MethodPost, path, nil, &result, true)
+	err := c.doJSON(ctx, c.primary(), http.MethodPost, path, nil, &result, c.adminToken)
 	return result.Version, err
 }
 
@@ -189,7 +208,7 @@ func (c *HTTPClient) Audit(ctx context.Context) ([]AuditEntry, error) {
 	var result struct {
 		Entries []AuditEntry `json:"entries"`
 	}
-	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/audit/ops?limit=200", nil, &result, true)
+	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/audit/ops?limit=200", nil, &result, c.adminToken)
 	return result.Entries, err
 }
 
@@ -202,13 +221,32 @@ func (c *HTTPClient) SecurityEvents(ctx context.Context, tenant string) ([]Secur
 	var result struct {
 		Events []SecurityEvent `json:"events"`
 	}
-	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/audit/events?"+q.Encode(), nil, &result, true)
+	err := c.doJSON(ctx, c.primary(), http.MethodGet, "/admin/audit/events?"+q.Encode(), nil, &result, c.readBearer(tenant))
 	return result.Events, err
 }
 
 func (c *HTTPClient) primary() Target { return c.targets[0] }
 
-func (c *HTTPClient) doJSON(ctx context.Context, target Target, method, path string, input, output any, admin bool) error {
+func (c *HTTPClient) readBearer(tenant string) string {
+	if token, ok := c.tenantTokens[tenant]; ok {
+		return token
+	}
+	return c.adminToken
+}
+
+// mutateBearer fails closed: a global-token fallback would erase the tenant boundary the gateway enforces.
+func (c *HTTPClient) mutateBearer(actingTenant string) (string, error) {
+	if actingTenant == "" {
+		return c.adminToken, nil
+	}
+	token, ok := c.tenantTokens[actingTenant]
+	if !ok {
+		return "", fmt.Errorf("no gateway admin token configured for tenant %s", actingTenant)
+	}
+	return token, nil
+}
+
+func (c *HTTPClient) doJSON(ctx context.Context, target Target, method, path string, input, output any, bearer string) error {
 	var body io.Reader
 	if input != nil {
 		encoded, err := json.Marshal(input)
@@ -224,8 +262,11 @@ func (c *HTTPClient) doJSON(ctx context.Context, target Target, method, path str
 	if input != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if admin {
-		req.Header.Set("Authorization", "Bearer "+c.adminToken)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	if rid := RequestIDFrom(ctx); rid != "" {
+		req.Header.Set("X-Request-ID", rid)
 	}
 	return c.send(req, output)
 }
@@ -237,6 +278,9 @@ func (c *HTTPClient) doText(ctx context.Context, target Target, method, path, in
 	}
 	req.Header.Set("Content-Type", "application/yaml")
 	req.Header.Set("Authorization", "Bearer "+c.adminToken)
+	if rid := RequestIDFrom(ctx); rid != "" {
+		req.Header.Set("X-Request-ID", rid)
+	}
 	return c.send(req, output)
 }
 

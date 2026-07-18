@@ -1741,6 +1741,23 @@ async fn admin_key_list(
     scope: AdminScope,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    if let Some(ak) = q.get("ak") {
+        // exact lookup: an uncovered key answers an empty page, not 404, so a
+        // tenant admin cannot probe foreign key existence through the filter
+        let keys: Vec<Value> = s
+            .handler
+            .state()
+            .auth
+            .authenticate(ak)
+            .await
+            .filter(|k| scope.covers(&k.tenant))
+            .map(|k| ak_public_json(&k))
+            .into_iter()
+            .collect();
+        let mut resp = json!({ "count": keys.len(), "offset": 0 });
+        resp["keys"] = Value::Array(keys);
+        return Json(resp).into_response();
+    }
     let offset = q_num(&q, "offset", 0);
     let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT);
     // the scope filters in the store before paging, or a tenant admin's page could come back empty
@@ -1826,7 +1843,7 @@ async fn admin_usage_users(
     let tenant = scope.tenant_filter(&q);
     let since = q_num(&q, "since", 0);
     let until = q_num(&q, "until", i64::MAX);
-    let usage = match s
+    let mut usage = match s
         .handler
         .state()
         .store
@@ -1836,6 +1853,12 @@ async fn admin_usage_users(
         Ok(rows) => rows,
         Err(e) => return gateway_error(e),
     };
+    // platform vendor cost (margin basis) is operator-only; a tenant admin sees its own charge
+    if matches!(scope, AdminScope::Tenant(_)) {
+        for u in &mut usage {
+            u.vendor_cost_micros = 0;
+        }
+    }
     if q.get("format").map(String::as_str) == Some("csv") {
         let mut csv = String::from(
             "user_id,model,requests,prompt_tokens,completion_tokens,total_tokens,cost_micros,vendor_cost_micros\n",
@@ -1898,6 +1921,8 @@ async fn admin_usage_series(
         Ok(rows) => rows.into_iter().collect(),
         Err(e) => return gateway_error(e),
     };
+    // platform vendor cost (margin basis) is operator-only; a tenant admin sees its own charge
+    let redact_vendor = matches!(scope, AdminScope::Tenant(_));
     let mut series = Vec::with_capacity(points as usize);
     for idx in 0..points {
         let start = first.saturating_add(idx * bucket_secs);
@@ -1913,7 +1938,7 @@ async fn admin_usage_series(
             "completion_tokens": totals.completion_tokens,
             "total_tokens": totals.total_tokens,
             "cost_micros": totals.cost_micros,
-            "vendor_cost_micros": totals.vendor_cost_micros,
+            "vendor_cost_micros": if redact_vendor { 0 } else { totals.vendor_cost_micros },
         }));
     }
     Json(json!({
@@ -3762,6 +3787,104 @@ mod tests {
         assert_eq!(points[0]["total_tokens"], 10);
         assert_eq!(points[1]["total_tokens"], 20);
         assert_eq!(points[1]["cost_micros"], 50);
+    }
+
+    #[tokio::test]
+    async fn tenant_scope_redacts_vendor_cost_and_ak_filter_hides_foreign_keys() {
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_TSCOPE_G}\nmodels: [{name: m, protocol: openai-chat}]\ntenants: [{name: acme, admin_token_env: GW_TEST_TSCOPE_T, models: [m]}, {name: labs, models: [m]}]\naccess_keys: [{ak: k-acme, product: p, tenant: acme, qps: 1, daily_token_quota: 100}, {ak: k-labs, product: p, tenant: labs, qps: 1, daily_token_quota: 100}]";
+        // SAFETY: this test owns unique env var names.
+        unsafe {
+            std::env::set_var("GW_TEST_TSCOPE_G", "root-token");
+            std::env::set_var("GW_TEST_TSCOPE_T", "acme-token");
+        }
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let store = app_state.handler.state().store.clone();
+        store
+            .ledger_add(&gw_state::BillingRecord {
+                ak: "k-acme".into(),
+                product: "p".into(),
+                tenant: "acme".into(),
+                user_id: "alice".into(),
+                request_id: "r-1".into(),
+                created_at_epoch_secs: 3_700,
+                model: "m".into(),
+                served_model: "m".into(),
+                protocol: "openai-chat".into(),
+                account: "a".into(),
+                prompt_tokens: 10,
+                completion_tokens: 0,
+                total_tokens: 10,
+                cost_micros: 40,
+                vendor_cost_micros: 25,
+                ptu_spillover: false,
+                estimated: false,
+            })
+            .await
+            .unwrap();
+        let router = app(app_state);
+        let get = |uri: &'static str, token: &'static str| {
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/usage/users?since=0&until=10000", "acme-token"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let usage = body_json(resp).await;
+        assert_eq!(usage["usage"][0]["cost_micros"], 40);
+        assert_eq!(
+            usage["usage"][0]["vendor_cost_micros"], 0,
+            "tenant scope never sees platform vendor cost"
+        );
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/usage/users?since=0&until=10000", "root-token"))
+            .await
+            .unwrap();
+        let usage = body_json(resp).await;
+        assert_eq!(usage["usage"][0]["vendor_cost_micros"], 25);
+        let resp = router
+            .clone()
+            .oneshot(get(
+                "/admin/usage/series?bucket=hour&since=3600&until=7199",
+                "acme-token",
+            ))
+            .await
+            .unwrap();
+        let series = body_json(resp).await;
+        assert_eq!(series["series"][0]["cost_micros"], 40);
+        assert_eq!(series["series"][0]["vendor_cost_micros"], 0);
+
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/keys?ak=k-acme", "acme-token"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["keys"][0]["ak"], "k-acme");
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/keys?ak=k-labs", "acme-token"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 0, "foreign key invisible through ak filter");
+        let resp = router
+            .oneshot(get("/admin/keys?ak=k-labs", "root-token"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 1);
     }
 
     #[test]

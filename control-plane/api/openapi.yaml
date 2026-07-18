@@ -108,6 +108,8 @@ paths:
       x-role: tenant_admin_or_system_admin
       parameters:
         - {name: tenant, in: query, schema: {type: string}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, default: 1000}}
       responses:
         "200": {description: Keys, content: {application/json: {schema: {type: object}}}}
     post:

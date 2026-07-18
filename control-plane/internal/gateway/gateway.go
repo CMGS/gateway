@@ -119,21 +119,37 @@ type Scope struct {
 	User   string
 }
 
-// Client is the control plane's only dependency on the Rust gateway.
+// Client is the control plane's only dependency on the Rust gateway. Key
+// mutations carry the acting tenant ("" = global operator) so the gateway's
+// own AdminScope enforcement — not this process — draws the tenant boundary.
 type Client interface {
-	Usage(context.Context, Scope, int64, int64) ([]UsageRow, error)
-	UsageSeries(context.Context, Scope, string, int64, int64) (Series, error)
-	Models(context.Context, Scope) ([]ModelStatus, error)
-	Keys(context.Context, string) ([]Key, error)
-	CreateKey(context.Context, Key) error
-	PatchKey(context.Context, string, map[string]any) (Key, error)
-	DeleteKey(context.Context, string) error
-	Instances(context.Context) ([]Instance, error)
-	Config(context.Context) (ConfigDocument, error)
-	ValidateConfig(context.Context, string) (map[string]any, error)
-	PublishConfig(context.Context, string, int64) (int64, error)
-	ConfigVersions(context.Context) ([]ConfigVersion, error)
-	RollbackConfig(context.Context, int64) (int64, error)
-	Audit(context.Context) ([]AuditEntry, error)
-	SecurityEvents(context.Context, string) ([]SecurityEvent, error)
+	Usage(ctx context.Context, scope Scope, since, until int64) ([]UsageRow, error)
+	UsageSeries(ctx context.Context, scope Scope, bucket string, since, until int64) (Series, error)
+	Models(ctx context.Context, scope Scope) ([]ModelStatus, error)
+	Keys(ctx context.Context, tenant string, offset, limit int64) ([]Key, error)
+	CreateKey(ctx context.Context, actingTenant string, key Key) error
+	PatchKey(ctx context.Context, actingTenant, ak string, patch map[string]any) (Key, error)
+	DeleteKey(ctx context.Context, actingTenant, ak string) error
+	Instances(ctx context.Context) ([]Instance, error)
+	Config(ctx context.Context) (ConfigDocument, error)
+	ValidateConfig(ctx context.Context, yaml string) (map[string]any, error)
+	PublishConfig(ctx context.Context, yaml string, expectedVersion int64) (int64, error)
+	ConfigVersions(ctx context.Context) ([]ConfigVersion, error)
+	RollbackConfig(ctx context.Context, id int64) (int64, error)
+	Audit(ctx context.Context) ([]AuditEntry, error)
+	SecurityEvents(ctx context.Context, tenant string) ([]SecurityEvent, error)
+}
+
+type ridKey struct{}
+
+// WithRequestID tags ctx so every gateway call made under it carries the
+// X-Request-ID header end to end.
+func WithRequestID(ctx context.Context, rid string) context.Context {
+	return context.WithValue(ctx, ridKey{}, rid)
+}
+
+// RequestIDFrom returns the request id set by WithRequestID, or "".
+func RequestIDFrom(ctx context.Context) string {
+	rid, _ := ctx.Value(ridKey{}).(string)
+	return rid
 }

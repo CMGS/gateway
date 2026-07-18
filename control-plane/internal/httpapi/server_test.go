@@ -198,6 +198,30 @@ func TestLoginThrottleLocksAfterRepeatedFailures(t *testing.T) {
 	}
 }
 
+func TestRequestIDEchoedOrGenerated(t *testing.T) {
+	handler := testServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	req.Header.Set("X-Request-ID", "trace-abc.123")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if got := rec.Header().Get("X-Request-ID"); got != "trace-abc.123" {
+		t.Errorf("request id = %q, want caller value echoed", got)
+	}
+
+	for _, inbound := range []string{"", "bad id\nwith newline"} {
+		req = httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+		if inbound != "" {
+			req.Header.Set("X-Request-ID", inbound)
+		}
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		got := rec.Header().Get("X-Request-ID")
+		if got == "" || got == inbound {
+			t.Errorf("request id = %q for inbound %q, want a fresh generated id", got, inbound)
+		}
+	}
+}
+
 func TestPasswordResetEvictsExistingSessions(t *testing.T) {
 	handler := testServer(t)
 	admin := loginAs(t, handler, "admin@example.com")

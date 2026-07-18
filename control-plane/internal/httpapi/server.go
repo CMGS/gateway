@@ -18,6 +18,7 @@ import (
 
 	"github.com/projecteru2/core/log"
 
+	"github.com/cocoonstack/gateway/control-plane/internal/auth"
 	"github.com/cocoonstack/gateway/control-plane/internal/gateway"
 	"github.com/cocoonstack/gateway/control-plane/internal/kv"
 	"github.com/cocoonstack/gateway/control-plane/internal/user"
@@ -91,7 +92,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/v1/admin/config/versions/{id}/rollback", s.requireSystem(http.HandlerFunc(s.rollbackConfig)))
 	mux.Handle("GET /api/v1/admin/audit", s.requireAdmin(http.HandlerFunc(s.audit)))
 	mux.HandleFunc("/", s.serveWeb)
-	return s.accessLog(mux)
+	return requestID(s.accessLog(mux))
 }
 
 func (s *Server) requireAuth(next http.Handler) http.Handler {
@@ -149,11 +150,12 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 		next.ServeHTTP(wrapped, r)
 		log.WithFunc("httpapi.access").Infof(
 			r.Context(),
-			"%s %s status=%d duration_ms=%d",
+			"%s %s status=%d duration_ms=%d rid=%s",
 			r.Method,
 			r.URL.Path,
 			wrapped.status,
 			time.Since(started).Milliseconds(),
+			gateway.RequestIDFrom(r.Context()),
 		)
 	})
 }
@@ -207,6 +209,14 @@ func scopedTenant(p principal, requested string) string {
 		return p.User.Tenant
 	}
 	return requested
+}
+
+// actingTenant is the scope key mutations act under: "" means the global operator.
+func actingTenant(p principal) string {
+	if p.User.Role == user.RoleTenantAdmin {
+		return p.User.Tenant
+	}
+	return ""
 }
 
 func period(r *http.Request) (int64, int64, string, error) {
@@ -264,13 +274,36 @@ func mutating(method string) bool {
 	return method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
 }
 
+func requestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rid := r.Header.Get("X-Request-ID")
+		if !validRequestID(rid) {
+			var err error
+			if rid, err = auth.RandomToken(9); err != nil {
+				rid = "untraced"
+			}
+		}
+		w.Header().Set("X-Request-ID", rid)
+		next.ServeHTTP(w, r.WithContext(gateway.WithRequestID(r.Context(), rid)))
+	})
+}
+
+func validRequestID(rid string) bool {
+	if rid == "" || len(rid) > 64 {
+		return false
+	}
+	return !strings.ContainsFunc(rid, func(r rune) bool {
+		return !('a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9' || r == '-' || r == '_' || r == '.')
+	})
+}
+
 // auditLog names the principal behind a mutating admin action; accessLog lines carry only the route.
 func auditLog(r *http.Request, action, target string) {
 	p := current(r)
 	log.WithFunc("httpapi.audit").Infof(
 		r.Context(),
-		"actor=%s role=%s action=%s target=%s ip=%s",
-		p.User.Email, p.User.Role, action, target, clientIP(r),
+		"actor=%s role=%s action=%s target=%s ip=%s rid=%s",
+		p.User.Email, p.User.Role, action, target, clientIP(r), gateway.RequestIDFrom(r.Context()),
 	)
 }
 

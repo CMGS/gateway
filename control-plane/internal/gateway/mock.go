@@ -98,7 +98,7 @@ func (m *MockClient) Models(_ context.Context, _ Scope) ([]ModelStatus, error) {
 	}, nil
 }
 
-func (m *MockClient) Keys(_ context.Context, tenant string) ([]Key, error) {
+func (m *MockClient) Keys(_ context.Context, tenant string, offset, limit int64) ([]Key, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	keys := make([]Key, 0, len(m.keys))
@@ -108,14 +108,23 @@ func (m *MockClient) Keys(_ context.Context, tenant string) ([]Key, error) {
 		}
 	}
 	slices.SortFunc(keys, func(a, b Key) int { return cmp.Compare(a.AK, b.AK) })
+	if offset > 0 {
+		keys = keys[min(offset, int64(len(keys))):]
+	}
+	if limit > 0 && int64(len(keys)) > limit {
+		keys = keys[:limit]
+	}
 	return keys, nil
 }
 
-func (m *MockClient) CreateKey(_ context.Context, key Key) error {
+func (m *MockClient) CreateKey(_ context.Context, actingTenant string, key Key) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if key.AK == "" || key.Product == "" || key.Tenant == "" {
 		return fmt.Errorf("ak, product and tenant are required")
+	}
+	if existing, ok := m.keys[key.AK]; ok && actingTenant != "" && existing.Tenant != actingTenant {
+		return fmt.Errorf("ak already exists: %w", ErrConflict)
 	}
 	key.Status = "active"
 	key.Available = true
@@ -124,11 +133,11 @@ func (m *MockClient) CreateKey(_ context.Context, key Key) error {
 	return nil
 }
 
-func (m *MockClient) PatchKey(_ context.Context, ak string, patch map[string]any) (Key, error) {
+func (m *MockClient) PatchKey(_ context.Context, actingTenant, ak string, patch map[string]any) (Key, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key, ok := m.keys[ak]
-	if !ok {
+	if !ok || (actingTenant != "" && key.Tenant != actingTenant) {
 		return Key{}, fmt.Errorf("key %s: %w", ak, ErrNotFound)
 	}
 	if value, ok := patch["qps"].(float64); ok {
@@ -151,10 +160,10 @@ func (m *MockClient) PatchKey(_ context.Context, ak string, patch map[string]any
 	return cloneJSON(key), nil
 }
 
-func (m *MockClient) DeleteKey(_ context.Context, ak string) error {
+func (m *MockClient) DeleteKey(_ context.Context, actingTenant, ak string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.keys[ak]; !ok {
+	if key, ok := m.keys[ak]; !ok || (actingTenant != "" && key.Tenant != actingTenant) {
 		return fmt.Errorf("key %s: %w", ak, ErrNotFound)
 	}
 	delete(m.keys, ak)

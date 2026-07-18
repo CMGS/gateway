@@ -1,10 +1,8 @@
 package httpapi
 
 import (
-	"context"
 	"errors"
 	"net/http"
-	"slices"
 	"strconv"
 	"time"
 
@@ -123,7 +121,7 @@ func (s *Server) patchUser(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listKeys(w http.ResponseWriter, r *http.Request) {
 	p := current(r)
 	tenant := scopedTenant(p, r.URL.Query().Get("tenant"))
-	keys, err := s.gateway.Keys(r.Context(), tenant)
+	keys, err := s.gateway.Keys(r.Context(), tenant, queryInt(r, "offset", 0), queryInt(r, "limit", 1000))
 	if err != nil {
 		mapError(r.Context(), w, err)
 		return
@@ -142,22 +140,7 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "ak, product and tenant are required")
 		return
 	}
-	// gateway create is an upsert: block a tenant admin from taking over another tenant's key by name
-	if p.User.Role == user.RoleTenantAdmin {
-		all, err := s.gateway.Keys(r.Context(), "")
-		if err != nil {
-			mapError(r.Context(), w, err)
-			return
-		}
-		taken := slices.ContainsFunc(all, func(k gateway.Key) bool {
-			return k.AK == key.AK && k.Tenant != key.Tenant
-		})
-		if taken {
-			writeError(w, http.StatusConflict, "ak already exists")
-			return
-		}
-	}
-	if err := s.gateway.CreateKey(r.Context(), key); err != nil {
+	if err := s.gateway.CreateKey(r.Context(), actingTenant(p), key); err != nil {
 		mapError(r.Context(), w, err)
 		return
 	}
@@ -166,10 +149,7 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) patchKey(w http.ResponseWriter, r *http.Request) {
-	ak, ok := s.scopedKey(w, r)
-	if !ok {
-		return
-	}
+	ak := r.PathValue("ak")
 	var patch map[string]any
 	if !decodeJSON(w, r, maxJSONBody, &patch) {
 		return
@@ -180,7 +160,7 @@ func (s *Server) patchKey(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	key, err := s.gateway.PatchKey(r.Context(), ak, patch)
+	key, err := s.gateway.PatchKey(r.Context(), actingTenant(current(r)), ak, patch)
 	if err != nil {
 		mapError(r.Context(), w, err)
 		return
@@ -190,11 +170,8 @@ func (s *Server) patchKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteKey(w http.ResponseWriter, r *http.Request) {
-	ak, ok := s.scopedKey(w, r)
-	if !ok {
-		return
-	}
-	if err := s.gateway.DeleteKey(r.Context(), ak); err != nil {
+	ak := r.PathValue("ak")
+	if err := s.gateway.DeleteKey(r.Context(), actingTenant(current(r)), ak); err != nil {
 		mapError(r.Context(), w, err)
 		return
 	}
@@ -291,25 +268,6 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
-}
-
-// scopedKey answers a tenant admin's cross-tenant key reference with 404, mirroring the gateway's scoped_key.
-func (s *Server) scopedKey(w http.ResponseWriter, r *http.Request) (string, bool) {
-	ak := r.PathValue("ak")
-	p := current(r)
-	if p.User.Role == user.RoleTenantAdmin && !s.keyBelongsTo(r.Context(), ak, p.User.Tenant) {
-		writeError(w, http.StatusNotFound, "key not found")
-		return "", false
-	}
-	return ak, true
-}
-
-func (s *Server) keyBelongsTo(ctx context.Context, ak, tenant string) bool {
-	keys, err := s.gateway.Keys(ctx, tenant)
-	if err != nil {
-		return false
-	}
-	return slices.ContainsFunc(keys, func(k gateway.Key) bool { return k.AK == ak })
 }
 
 func writeUserSaveError(w http.ResponseWriter, err error) {

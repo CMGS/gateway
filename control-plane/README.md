@@ -17,6 +17,18 @@ The Go service derives tenant/user filters from the authenticated session. It
 never trusts browser-supplied scope for a member or tenant administrator, and it
 removes vendor cost from non-system responses.
 
+Tenant boundaries on key mutations are enforced by the **gateway**, not this
+process: when a tenant administrator acts, the control plane authenticates with
+that tenant's scoped gateway admin token (`CP_GATEWAY_TENANT_TOKENS`, matching
+the gateway's per-tenant `admin_token_env`), so the gateway's own
+`AdminScope` checks draw the line atomically. Mutations fail closed — a tenant
+admin without a configured tenant token cannot mutate keys at all. The gateway
+additionally redacts vendor cost for tenant-scoped tokens server-side.
+
+Every request carries an `X-Request-ID` (caller-supplied or generated): it is
+echoed in the response, stamped on access and audit log lines as `rid=`, and
+forwarded on every proxied gateway call.
+
 ## Gateway instances
 
 `CP_GATEWAY_TARGETS` is a deliberately simple ordered list such as:
@@ -74,6 +86,7 @@ default is always false, for every store backend.
 | `CP_GATEWAY_MODE` | `mock` | `mock` or `http` |
 | `CP_GATEWAY_TARGETS` | `local=http://127.0.0.1:8080` | Comma-separated `id=url` targets |
 | `CP_GATEWAY_ADMIN_TOKEN` | — | Global Rust gateway admin bearer token |
+| `CP_GATEWAY_TENANT_TOKENS` | — | Comma-separated `tenant=token` scoped gateway admin tokens |
 | `CP_WEB_DIR` | `web/dist` | Built browser assets |
 | `CP_SESSION_TTL` | `12h` | Browser session lifetime |
 | `CP_COOKIE_SECURE` | `false` | Secure cookie flag; enable behind HTTPS |
@@ -101,5 +114,13 @@ npx playwright install chromium
 npm run e2e
 ```
 
-The BFF contract is in [`api/openapi.yaml`](api/openapi.yaml). Rust admin API
-details remain in [`../docs/api.md`](../docs/api.md).
+The BFF contract is in [`api/openapi.yaml`](api/openapi.yaml); a Go test
+(`internal/httpapi/openapi_test.go`) fails CI when routes and spec drift. Rust
+admin API details remain in [`../docs/api.md`](../docs/api.md).
+
+## Releases
+
+Version tags publish multi-arch (`linux/amd64` + `linux/arm64`) Docker images
+for the gateway and the control plane (`.github/workflows/docker.yml`), plus
+control-plane binary tarballs for linux/darwin × amd64/arm64 with the built
+web assets bundled (`.github/workflows/release.yml`).
