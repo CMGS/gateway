@@ -5,11 +5,11 @@
 use gw_models::GResult;
 use sqlx::Row;
 
-/// Superseded versions kept for operator inspection/rollback.
-const KEEP_VERSIONS: i64 = 20;
-
 /// The Postgres NOTIFY channel a publish fires on (payload = version id).
 pub const CONFIG_CHANNEL: &str = "gw_config";
+
+/// Superseded versions kept for operator inspection/rollback.
+const KEEP_VERSIONS: i64 = 20;
 
 /// Every publish serializes on this advisory lock: a `MAX(id)`-guarded insert
 /// is not atomic under READ COMMITTED — two concurrent guarded publishes both
@@ -31,6 +31,7 @@ pub struct PostgresConfigStore {
 }
 
 impl PostgresConfigStore {
+    /// Open the pool and create the `gw_config` schema if missing.
     pub async fn connect(url: &str) -> GResult<Self> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(3)
