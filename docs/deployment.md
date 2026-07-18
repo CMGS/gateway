@@ -66,3 +66,18 @@ storage:
 - **Rate limits & quotas**: shared in Redis when `redis_url` is set (keys
   namespaced under `gw:`, windows self-expire), otherwise in-process. Without
   Redis, each replica limits independently.
+
+## Control plane
+
+The browser console in [`control-plane/`](../control-plane/) deploys beside the
+gateway fleet: a single Go binary serving the built web assets, plus its own
+Postgres (identities) and Redis (sessions) — never the gateway's tables.
+Releases ship `ghcr.io/cocoonstack/gateway-control-plane` (multi-arch) and
+binary tarballs for linux/darwin × amd64/arm64 with the web assets bundled.
+
+Point it at the fleet with `CP_GATEWAY_TARGETS`, give it the global admin token
+via `CP_GATEWAY_ADMIN_TOKEN`, and hand each tenant's scoped token to
+`CP_GATEWAY_TENANT_TOKENS` (`tenant=token,...` matching each tenant's
+`admin_token_env`) so tenant-admin key mutations run under the gateway's own
+tenant scope and fail closed without one. Full reference:
+[`control-plane/README.md`](../control-plane/README.md).

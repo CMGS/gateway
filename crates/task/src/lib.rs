@@ -183,14 +183,19 @@ async fn avail_alert_sweep(
             st.unstable_error_rate,
             st.unavailable_error_rate,
         );
-        if let Some(prev) = last.insert(name.clone(), cur)
-            && prev != cur
-        {
-            snap.state.alerts.emit(
-                "model_availability",
-                name.clone(),
-                format!("{} -> {}", prev.as_str(), cur.as_str()),
-            );
+        match last.get_mut(name) {
+            Some(slot) if *slot != cur => {
+                let prev = std::mem::replace(slot, cur);
+                snap.state.alerts.emit(
+                    "model_availability",
+                    name.clone(),
+                    format!("{} -> {}", prev.as_str(), cur.as_str()),
+                );
+            }
+            Some(_) => {}
+            None => {
+                last.insert(name.clone(), cur);
+            }
         }
     }
 }

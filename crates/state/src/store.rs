@@ -4,6 +4,7 @@
 //! [`SqliteStore`] (`storage.sqlite_path`, one durable node), and
 //! [`PostgresStore`] (`storage.postgres_url`, shared across a fleet).
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -291,7 +292,7 @@ pub struct UserUsageRow {
 }
 
 impl UserUsageRow {
-    fn zero(user_id: String, model: String) -> Self {
+    pub fn zero(user_id: String, model: String) -> Self {
         Self {
             user_id,
             model,
@@ -312,6 +313,16 @@ impl UserUsageRow {
         self.total_tokens = self.total_tokens.saturating_add(o.total_tokens);
         self.cost_micros = self.cost_micros.saturating_add(o.cost_micros);
         self.vendor_cost_micros = self.vendor_cost_micros.saturating_add(o.vendor_cost_micros);
+    }
+
+    /// Fold one raw ledger row's counters into self (saturating).
+    fn add_record(&mut self, r: &BillingRecord) {
+        self.requests = self.requests.saturating_add(1);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(r.prompt_tokens);
+        self.completion_tokens = self.completion_tokens.saturating_add(r.completion_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(r.total_tokens);
+        self.cost_micros = self.cost_micros.saturating_add(r.cost_micros);
+        self.vendor_cost_micros = self.vendor_cost_micros.saturating_add(r.vendor_cost_micros);
     }
 
     /// Keep the larger of each counter. A bucket's source rows are append-only
@@ -344,14 +355,44 @@ fn usage_of(r: &BillingRecord) -> UserUsageRow {
 
 /// Fold grouped usage rows into `map` by (user, model).
 fn fold_user_usage(
-    map: &mut std::collections::BTreeMap<(String, String), UserUsageRow>,
+    map: &mut BTreeMap<(String, String), UserUsageRow>,
     rows: impl IntoIterator<Item = UserUsageRow>,
 ) {
     for r in rows {
         map.entry((r.user_id.clone(), r.model.clone()))
-            .or_insert_with(|| UserUsageRow::zero(r.user_id.clone(), r.model.clone()))
-            .absorb(&r);
+            .and_modify(|e| e.absorb(&r))
+            .or_insert(r);
     }
+}
+
+fn fold_series(
+    map: &mut BTreeMap<i64, UserUsageRow>,
+    rows: impl IntoIterator<Item = (i64, UserUsageRow)>,
+) {
+    for (start, r) in rows {
+        map.entry(start).and_modify(|e| e.absorb(&r)).or_insert(r);
+    }
+}
+
+fn series_row<'r, R>(row: &'r R) -> (i64, UserUsageRow)
+where
+    R: sqlx::Row,
+    usize: sqlx::ColumnIndex<R>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    (
+        row.get(0),
+        UserUsageRow {
+            user_id: String::new(),
+            model: String::new(),
+            requests: row.get(1),
+            prompt_tokens: row.get(2),
+            completion_tokens: row.get(3),
+            total_tokens: row.get(4),
+            cost_micros: row.get(5),
+            vendor_cost_micros: row.get(6),
+        },
+    )
 }
 
 fn bucket_floor(ts: i64) -> i64 {
@@ -434,6 +475,18 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         since: i64,
         until: i64,
     ) -> GResult<Vec<UserUsageRow>>;
+    /// Bucketed usage totals over `[since, until]`: one `(bucket_start,
+    /// totals)` per `bucket_secs` bucket with traffic, ascending. Same
+    /// rollup-plus-tail sourcing and filters as [`Store::usage_by_user`];
+    /// the `user_id`/`model` fields of the totals are empty.
+    async fn usage_series(
+        &self,
+        tenant: Option<&str>,
+        user: Option<&str>,
+        since: i64,
+        until: i64,
+        bucket_secs: i64,
+    ) -> GResult<Vec<(i64, UserUsageRow)>>;
     /// Roll completed minutes of the ledger into durable `usage_rollup`
     /// buckets: every bucket in the trailing backfill window is recomputed
     /// from the raw rows and upserted — never deleted — so the periodic task
@@ -585,7 +638,7 @@ pub struct MemoryStore {
     records: Mutex<Vec<BillingRecord>>,
     /// Minute buckets keyed by (minute, tenant, user, model); see
     /// [`Store::usage_rollup_advance`].
-    rollup: Mutex<std::collections::BTreeMap<(i64, String, String, String), UserUsageRow>>,
+    rollup: Mutex<BTreeMap<(i64, String, String, String), UserUsageRow>>,
     sec_events: Mutex<Vec<SecurityEvent>>,
     audit: Mutex<Vec<AdminAudit>>,
     content: Mutex<Vec<crate::ContentRecord>>,
@@ -657,8 +710,7 @@ impl Store for MemoryStore {
             .records
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut rollup: std::collections::BTreeMap<(String, String), UsageRow> =
-            std::collections::BTreeMap::new();
+        let mut rollup: BTreeMap<(String, String), UsageRow> = BTreeMap::new();
         for r in records.iter() {
             if tenant.is_some_and(|t| t != r.tenant) {
                 continue;
@@ -696,7 +748,7 @@ impl Store for MemoryStore {
         until: i64,
     ) -> GResult<Vec<UserUsageRow>> {
         let (since, until) = align_bounds(since, until);
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         let watermark = {
             let rollup = self
                 .rollup
@@ -708,7 +760,9 @@ impl Store for MemoryStore {
                     && tenant.is_none_or(|f| f == t)
                     && user.is_none_or(|f| f == u)
                 {
-                    fold_user_usage(&mut map, [row.clone()]);
+                    map.entry((row.user_id.clone(), row.model.clone()))
+                        .and_modify(|e: &mut UserUsageRow| e.absorb(row))
+                        .or_insert_with(|| row.clone());
                 }
             }
             rollup
@@ -730,6 +784,55 @@ impl Store for MemoryStore {
         Ok(map.into_values().collect())
     }
 
+    async fn usage_series(
+        &self,
+        tenant: Option<&str>,
+        user: Option<&str>,
+        since: i64,
+        until: i64,
+        bucket_secs: i64,
+    ) -> GResult<Vec<(i64, UserUsageRow)>> {
+        let bucket = |t: i64| t - t.rem_euclid(bucket_secs);
+        let (since, until) = align_bounds(since, until);
+        let mut map: BTreeMap<i64, UserUsageRow> = BTreeMap::new();
+        let watermark = {
+            let rollup = self
+                .rollup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for ((minute, t, u, _), row) in rollup.iter() {
+                if *minute >= bucket_floor(since)
+                    && *minute <= bucket_floor(until)
+                    && tenant.is_none_or(|f| f == t)
+                    && user.is_none_or(|f| f == u)
+                {
+                    map.entry(bucket(*minute))
+                        .or_insert_with(|| UserUsageRow::zero(String::new(), String::new()))
+                        .absorb(row);
+                }
+            }
+            rollup
+                .keys()
+                .next_back()
+                .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS)
+        };
+        let records = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for r in records.iter().filter(|r| {
+            r.created_at_epoch_secs >= since.max(watermark)
+                && r.created_at_epoch_secs <= until
+                && tenant.is_none_or(|t| t == r.tenant)
+                && user.is_none_or(|u| u == r.user_id)
+        }) {
+            map.entry(bucket(r.created_at_epoch_secs))
+                .or_insert_with(|| UserUsageRow::zero(String::new(), String::new()))
+                .add_record(r);
+        }
+        Ok(map.into_iter().collect())
+    }
+
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
         let hi = bucket_floor(now - ROLLUP_SETTLE_SECS);
         let mut rollup = self
@@ -741,7 +844,7 @@ impl Store for MemoryStore {
             .next_back()
             .map_or(0, |k| k.0 + ROLLUP_BUCKET_SECS);
         let lo = (hi - ROLLUP_BACKFILL_SECS).min(watermark);
-        let mut fresh = std::collections::BTreeMap::new();
+        let mut fresh = BTreeMap::new();
         {
             let records = self
                 .records
@@ -759,7 +862,7 @@ impl Store for MemoryStore {
                         r.model.clone(),
                     ))
                     .or_insert_with(|| UserUsageRow::zero(r.user_id.clone(), r.model.clone()))
-                    .absorb(&usage_of(r));
+                    .add_record(r);
             }
         }
         let written = fresh.len() as u64;
@@ -900,15 +1003,17 @@ impl Store for MemoryStore {
             "file-local-{}",
             self.seq.fetch_add(1, Ordering::Relaxed) + 1
         );
-        let f = StoredFile {
+        let meta = StoredFile {
             id: id.clone(),
             tenant: tenant.to_owned(),
             bytes: content.len(),
             purpose: purpose.to_owned(),
-            content,
+            content: String::new(),
         };
-        self.files.insert(id, f.clone());
-        Ok(f)
+        let mut stored = meta.clone();
+        stored.content = content;
+        self.files.insert(id, stored);
+        Ok(meta)
     }
 
     async fn file_get(&self, id: &str) -> GResult<Option<StoredFile>> {
@@ -1509,10 +1614,64 @@ sql_store_impl!(SqliteStore, sqlite, {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("roll up user usage", e))?;
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         fold_user_usage(&mut map, rolled.iter().map(user_usage_row));
         fold_user_usage(&mut map, raw.iter().map(user_usage_row));
         Ok(map.into_values().collect())
+    }
+
+    async fn usage_series(
+        &self,
+        tenant: Option<&str>,
+        user: Option<&str>,
+        since: i64,
+        until: i64,
+        bucket_secs: i64,
+    ) -> GResult<Vec<(i64, UserUsageRow)>> {
+        let (since, until) = align_bounds(since, until);
+        let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
+        let rolled = sqlx::query(
+            "SELECT minute_epoch - (minute_epoch % ?5), SUM(requests),
+             SUM(prompt_tokens), SUM(completion_tokens),
+             SUM(total_tokens), SUM(cost_micros), SUM(vendor_cost_micros)
+             FROM usage_rollup
+             WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
+               AND minute_epoch BETWEEN ?3 AND ?4
+             GROUP BY 1",
+        )
+        .bind(tenant)
+        .bind(user)
+        .bind(since)
+        .bind(until)
+        .bind(bucket_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("read rolled series", e))?;
+        let raw = sqlx::query(
+            "SELECT created_at_epoch_secs - (created_at_epoch_secs % ?6), COUNT(*),
+             SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
+             SUM(cost_micros), SUM(vendor_cost_micros)
+             FROM billing
+             WHERE (?1 IS NULL OR tenant = ?1) AND (?2 IS NULL OR user_id = ?2)
+               AND created_at_epoch_secs BETWEEN MAX(?3, ?5) AND ?4
+             GROUP BY 1",
+        )
+        .bind(tenant)
+        .bind(user)
+        .bind(since)
+        .bind(until)
+        .bind(watermark)
+        .bind(bucket_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("roll up series tail", e))?;
+        let mut map = BTreeMap::new();
+        fold_series(&mut map, rolled.iter().map(series_row));
+        fold_series(&mut map, raw.iter().map(series_row));
+        Ok(map.into_iter().collect())
     }
 
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
@@ -1769,7 +1928,7 @@ impl PostgresStore {
             .connect(url)
             .await
             .map_err(|e| crate::sqlx_err("connect postgres store", e))?;
-        for ddl in [
+        let ddls = [
             "CREATE TABLE IF NOT EXISTS billing (
                 n BIGSERIAL PRIMARY KEY,
                 ak TEXT NOT NULL, product TEXT NOT NULL,
@@ -1850,12 +2009,8 @@ impl PostgresStore {
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS created_at_epoch_secs BIGINT NOT NULL DEFAULT 0",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS estimated BOOLEAN NOT NULL DEFAULT FALSE",
-        ] {
-            sqlx::query(ddl)
-                .execute(&pool)
-                .await
-                .map_err(|e| crate::sqlx_err("create postgres schema", e))?;
-        }
+        ];
+        crate::setup_schema(&pool, "postgres", &ddls).await?;
         Ok(Self {
             pool,
             ledger_max_rows,
@@ -1943,10 +2098,64 @@ sql_store_impl!(PostgresStore, postgres, {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("roll up user usage", e))?;
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         fold_user_usage(&mut map, rolled.iter().map(user_usage_row));
         fold_user_usage(&mut map, raw.iter().map(user_usage_row));
         Ok(map.into_values().collect())
+    }
+
+    async fn usage_series(
+        &self,
+        tenant: Option<&str>,
+        user: Option<&str>,
+        since: i64,
+        until: i64,
+        bucket_secs: i64,
+    ) -> GResult<Vec<(i64, UserUsageRow)>> {
+        let (since, until) = align_bounds(since, until);
+        let watermark: i64 = sqlx::query_scalar(ROLLUP_WATERMARK_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| crate::sqlx_err("read rollup watermark", e))?;
+        let rolled = sqlx::query(
+            "SELECT minute_epoch - (minute_epoch % $5), SUM(requests)::BIGINT,
+             SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT,
+             SUM(total_tokens)::BIGINT, SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             FROM usage_rollup
+             WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
+               AND minute_epoch BETWEEN $3 AND $4
+             GROUP BY 1",
+        )
+        .bind(tenant)
+        .bind(user)
+        .bind(since)
+        .bind(until)
+        .bind(bucket_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("read rolled series", e))?;
+        let raw = sqlx::query(
+            "SELECT created_at_epoch_secs - (created_at_epoch_secs % $6), COUNT(*),
+             SUM(prompt_tokens)::BIGINT, SUM(completion_tokens)::BIGINT, SUM(total_tokens)::BIGINT,
+             SUM(cost_micros)::BIGINT, SUM(vendor_cost_micros)::BIGINT
+             FROM billing
+             WHERE ($1::text IS NULL OR tenant = $1) AND ($2::text IS NULL OR user_id = $2)
+               AND created_at_epoch_secs BETWEEN GREATEST($3, $5) AND $4
+             GROUP BY 1",
+        )
+        .bind(tenant)
+        .bind(user)
+        .bind(since)
+        .bind(until)
+        .bind(watermark)
+        .bind(bucket_secs)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| crate::sqlx_err("roll up series tail", e))?;
+        let mut map = BTreeMap::new();
+        fold_series(&mut map, rolled.iter().map(series_row));
+        fold_series(&mut map, raw.iter().map(series_row));
+        Ok(map.into_iter().collect())
     }
 
     async fn usage_rollup_advance(&self, now: i64) -> GResult<u64> {
@@ -2721,6 +2930,17 @@ mod tests {
             windowed.iter().any(|r| r.user_id == "bob")
                 && windowed.iter().any(|r| r.user_id == "carol"),
             "window keeps the rolled bucket and the raw tail"
+        );
+
+        let series = store
+            .usage_series(Some(&tenant), None, 0, i64::MAX, 600)
+            .await
+            .unwrap();
+        let counts: Vec<(i64, i64)> = series.iter().map(|(b, r)| (*b, r.requests)).collect();
+        assert_eq!(
+            counts,
+            vec![(0, 2), (1_200, 1)],
+            "rolled buckets and the raw tail group by bucket start"
         );
     }
 

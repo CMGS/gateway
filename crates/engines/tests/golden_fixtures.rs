@@ -26,7 +26,7 @@ impl Transport for FixtureTransport {
             body: if self.sse {
                 UpstreamBody::Sse(self.bytes.clone())
             } else {
-                UpstreamBody::Json(self.bytes.clone())
+                UpstreamBody::Json(bytes::Bytes::from(self.bytes.clone()))
             },
         })
     }

@@ -112,21 +112,22 @@ impl OpenAiEngine {
     }
 
     fn parse_json(&self, status: u16, body: &[u8]) -> GResult<EngineOutcome> {
-        let v: Value = serde_json::from_slice(body)
+        let mut v: Value = serde_json::from_slice(body)
             .map_err(|e| GatewayError::internal("parse openai response").with_source(e))?;
         // surface vendor error envelopes instead of silently returning empty
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
         }
-        let msg = &v["choices"][0]["message"];
         let mut resp = GatewayResponse {
-            message: msg["content"].as_str().unwrap_or_default().to_owned(),
-            tool_calls: msg.get("tool_calls").filter(|t| !t.is_null()).cloned(),
-            model: v["model"].as_str().unwrap_or_default().to_owned(),
-            finish_reason: v["choices"][0]["finish_reason"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
+            message: crate::engine::take_string(&mut v, "/choices/0/message/content")
+                .unwrap_or_default(),
+            tool_calls: v
+                .pointer_mut("/choices/0/message/tool_calls")
+                .map(Value::take)
+                .filter(|t| !t.is_null()),
+            model: crate::engine::take_string(&mut v, "/model").unwrap_or_default(),
+            finish_reason: crate::engine::take_string(&mut v, "/choices/0/finish_reason")
+                .unwrap_or_default(),
             ..Default::default()
         };
         apply_openai_usage(&mut resp, &v["usage"]);

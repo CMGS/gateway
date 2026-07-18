@@ -85,18 +85,18 @@ impl ClaudeEngine {
     }
 
     fn parse_json(&self, status: u16, bytes: &[u8]) -> GResult<EngineOutcome> {
-        let v: Value = serde_json::from_slice(bytes)
+        let mut v: Value = serde_json::from_slice(bytes)
             .map_err(|e| GatewayError::internal("parse anthropic response").with_source(e))?;
         if let Some(err) = crate::engine::vendor_error(status, &v) {
             return Err(err);
         }
         let mut text = String::new();
         let mut tool_use: Vec<Value> = Vec::new();
-        if let Some(blocks) = v["content"].as_array() {
+        if let Some(Value::Array(blocks)) = v.get_mut("content").map(Value::take) {
             for b in blocks {
                 match b["type"].as_str() {
                     Some("text") => text.push_str(b["text"].as_str().unwrap_or_default()),
-                    Some("tool_use") => tool_use.push(b.clone()),
+                    Some("tool_use") => tool_use.push(b),
                     _ => {}
                 }
             }
@@ -104,6 +104,11 @@ impl ClaudeEngine {
         let usage = &v["usage"];
         let input = crate::engine::tok(&usage["input_tokens"]);
         let output = crate::engine::tok(&usage["output_tokens"]);
+        let raw_usage_json = if usage.is_null() {
+            vec![]
+        } else {
+            serde_json::to_vec(usage).unwrap_or_default()
+        };
         let resp = GatewayResponse {
             message: text,
             tool_calls: if tool_use.is_empty() {
@@ -111,17 +116,13 @@ impl ClaudeEngine {
             } else {
                 Some(Value::Array(tool_use))
             },
-            model: v["model"].as_str().unwrap_or_default().to_owned(),
-            finish_reason: v["stop_reason"].as_str().unwrap_or_default().to_owned(),
+            model: crate::engine::take_string(&mut v, "/model").unwrap_or_default(),
+            finish_reason: crate::engine::take_string(&mut v, "/stop_reason").unwrap_or_default(),
             is_messages_protocol: true,
             prompt_tokens: input,
             completion_tokens: output,
             total_tokens: input.saturating_add(output),
-            raw_usage_json: if usage.is_null() {
-                vec![]
-            } else {
-                serde_json::to_vec(usage).unwrap_or_default()
-            },
+            raw_usage_json,
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))
@@ -241,7 +242,7 @@ impl SseState {
                         block["input"] = parsed;
                     }
                     chunks.push(StreamChunk {
-                        tool_calls: Some(json!([block.clone()])),
+                        tool_calls: Some(Value::Array(vec![block.clone()])),
                         ..Default::default()
                     });
                     self.tool_blocks.push(block);

@@ -18,6 +18,7 @@ key-based auth, quotas, rate limits, failover, and a billing ledger.
 - **Providers behind traits** — engines talk to upstreams through a `Transport` seam; accounts with a real endpoint go over HTTP (reqwest + rustls), accounts without one are served by a deterministic in-process mock; AWS SigV4 signing included
 - **Observability built in** — Prometheus `/metrics` (per-route request/status counters, per-pipeline-stage latency, token counters), structured access logs
 - **One binary, one YAML** — no external services required to start; in-process state by default, SQLite for one-node durability, Postgres + Redis for a shared fleet; graceful shutdown
+- **Web control plane** — a role-aware browser console ([`control-plane/`](control-plane/)): members see their own usage and charges, tenant admins manage keys and security events under gateway-enforced tenant scope, system admins get fleet economics, instance health, config publish/rollback and audit. Go BFF + React UI, its own identity store, everything proxied through the gateway admin API
 
 ## Quick Start
 
@@ -54,7 +55,9 @@ docker run -p 8080:8080 -v $PWD/conf/gateway.yaml:/etc/gateway.yaml \
 ```
 
 The image binds `0.0.0.0` (`GW_HOST`) and ships a `/health` HEALTHCHECK.
-Published multi-arch to `ghcr.io/cocoonstack/gateway` on `v*` tags.
+Published multi-arch (amd64 + arm64) to `ghcr.io/cocoonstack/gateway` on `v*`
+tags, alongside `ghcr.io/cocoonstack/gateway-control-plane` and control-plane
+binary tarballs (linux/darwin × amd64/arm64) on the GitHub Release.
 
 ## Development
 

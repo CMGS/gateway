@@ -31,7 +31,7 @@ pub struct UpstreamRequest {
 /// Body of an upstream response: buffered JSON, buffered SSE bytes, or live
 /// SSE bytes yielded as the vendor sends them.
 pub enum UpstreamBody {
-    Json(Vec<u8>),
+    Json(bytes::Bytes),
     Sse(Vec<u8>),
     SseStream(futures::stream::BoxStream<'static, Result<bytes::Bytes, String>>),
 }
@@ -140,7 +140,7 @@ impl MockTransport {
     fn ok_json(v: Value) -> GResult<UpstreamResponse> {
         Ok(UpstreamResponse {
             status: 200,
-            body: UpstreamBody::Json(v.to_string().into_bytes()),
+            body: UpstreamBody::Json(bytes::Bytes::from(v.to_string())),
         })
     }
 
@@ -157,9 +157,10 @@ impl MockTransport {
     fn openai_reply(&self, req: &UpstreamRequest) -> GResult<UpstreamResponse> {
         let body = Self::parse(&req.body, "openai")?;
         let model = body["model"].as_str().unwrap_or("mock-model").to_owned();
-        let msgs = body["messages"].as_array().cloned().unwrap_or_default();
-        let user = Self::last_user_text(&msgs);
-        let images = Self::image_count(&msgs);
+        let empty = Vec::new();
+        let msgs = body["messages"].as_array().unwrap_or(&empty);
+        let user = Self::last_user_text(msgs);
+        let images = Self::image_count(msgs);
         let img_note = if images > 0 {
             format!("[saw {images} image(s)] ")
         } else {
@@ -168,12 +169,8 @@ impl MockTransport {
         let reply = format!("[mock-openai:{model}] {img_note}you said: {user}");
         let (pt, ct) = (Self::tokens(&user) + 3, Self::tokens(&reply));
 
-        let tools = body["tools"].as_array().cloned().unwrap_or_default();
-        if let Some(first_tool) = tools.first() {
-            let name = first_tool["function"]["name"]
-                .as_str()
-                .unwrap_or("tool")
-                .to_owned();
+        if let Some(first_tool) = body["tools"].as_array().and_then(|t| t.first()) {
+            let name = first_tool["function"]["name"].as_str().unwrap_or("tool");
             let call = json!({"id":"call-mock-1","type":"function",
                 "function":{"name":name,"arguments":format!("{{\"echo\":{}}}", Value::String(user.clone()))}});
             if req.stream {
@@ -261,9 +258,8 @@ impl MockTransport {
         let reply = format!("[mock-anthropic:{model}] {sys_note}you said: {user}");
         let (it, ot) = (Self::tokens(&user) + 3, Self::tokens(&reply));
 
-        let tools = body["tools"].as_array().cloned().unwrap_or_default();
-        if let Some(first_tool) = tools.first() {
-            let name = first_tool["name"].as_str().unwrap_or("tool").to_owned();
+        if let Some(first_tool) = body["tools"].as_array().and_then(|t| t.first()) {
+            let name = first_tool["name"].as_str().unwrap_or("tool");
             return Self::ok_json(json!({
                 "id": "msg-mock", "type": "message", "role": "assistant", "model": model,
                 "content": [{"type":"tool_use","id":"tu-mock-1","name":name,"input":{"echo":user}}],
@@ -471,15 +467,16 @@ impl MockTransport {
         let body = Self::parse(&req.body, "moderations")?;
         let results: Vec<Value> = body["input"]
             .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|i| {
-                // deterministic: the literal token "unsafe" flags
-                let flagged = i.as_str().is_some_and(|s| s.contains("unsafe"));
-                json!({"flagged": flagged, "categories": {"unsafe": flagged}})
+            .map(|arr| {
+                arr.iter()
+                    .map(|i| {
+                        // deterministic: the literal token "unsafe" flags
+                        let flagged = i.as_str().is_some_and(|s| s.contains("unsafe"));
+                        json!({"flagged": flagged, "categories": {"unsafe": flagged}})
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         Self::ok_json(json!({"id": "modr-mock", "model": body["model"], "results": results}))
     }
 
@@ -488,17 +485,18 @@ impl MockTransport {
         let query = body["query"].as_str().unwrap_or_default().to_lowercase();
         let mut scored: Vec<(usize, f64)> = body["documents"]
             .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .enumerate()
-            .map(|(i, d)| {
-                // deterministic relevance: shared-word count with the query
-                let doc = d.as_str().unwrap_or_default().to_lowercase();
-                let hits = query.split_whitespace().filter(|w| doc.contains(w)).count();
-                (i, hits as f64)
+            .map(|arr| {
+                arr.iter()
+                    .enumerate()
+                    .map(|(i, d)| {
+                        // deterministic relevance: shared-word count with the query
+                        let doc = d.as_str().unwrap_or_default().to_lowercase();
+                        let hits = query.split_whitespace().filter(|w| doc.contains(w)).count();
+                        (i, hits as f64)
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         let top_n = body["top_n"].as_u64().unwrap_or(scored.len() as u64) as usize;
         let results: Vec<Value> = scored

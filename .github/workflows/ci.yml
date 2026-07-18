@@ -33,6 +33,10 @@ jobs:
     env:
       GW_TEST_PG_URL: postgres://postgres:gwtest@127.0.0.1:5432/gw
       GW_TEST_REDIS_URL: redis://127.0.0.1:6379
+      CP_TEST_PG_URL: postgres://postgres:gwtest@127.0.0.1:5432/gw?sslmode=disable
+      CP_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+      # built by the cargo test step; drives the tenant-token full-chain E2E
+      CP_TEST_GW_BIN: ${{ github.workspace }}/target/debug/gw
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,6 +49,35 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: control-plane/go.mod
+          cache-dependency-path: control-plane/go.sum
+      - name: Control-plane Go gates
+        working-directory: control-plane
+        run: |
+          GOWORK=off go vet ./...
+          GOWORK=off go test ./...
+          GOWORK=off go test -tags=integration -count=1 ./internal/integration
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: control-plane/web/package-lock.json
+      - name: Control-plane web gates
+        working-directory: control-plane/web
+        run: |
+          npm ci
+          npm test
+          npm run build
+      - name: Install browser
+        working-directory: control-plane/web
+        run: npx playwright install --with-deps chromium
+      - name: Control-plane browser E2E
+        working-directory: control-plane/web
+        run: npm run e2e
+      - name: Control-plane image builds
+        run: docker build control-plane/
 
   deny:
     runs-on: ubuntu-latest

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -35,6 +35,8 @@ use serde_json::{Value, json};
 
 const LEDGER_PAGE_DEFAULT: usize = 100;
 const KEY_PAGE_DEFAULT: usize = 200;
+const CONFIG_VERSION_PAGE_DEFAULT: usize = 20;
+const USAGE_SERIES_MAX_POINTS: i64 = 400;
 const STREAM_CHANNEL_CAP: usize = 64;
 /// Per-turn token reserve against the AK daily quota; settled to actuals at billing.
 const REALTIME_TURN_RESERVE: i64 = 1_000;
@@ -123,10 +125,17 @@ pub fn app(state: AppState) -> Router {
         .route("/internal/ledger", get(ledger))
         .route("/internal/accounts", get(accounts))
         .route("/admin/reload", post(admin_reload))
-        .route("/admin/config", axum::routing::put(admin_config_put))
+        .route("/admin/config", get(admin_config_get).put(admin_config_put))
+        .route("/admin/config/validate", post(admin_config_validate))
+        .route("/admin/config/versions", get(admin_config_versions))
+        .route(
+            "/admin/config/versions/{id}/rollback",
+            post(admin_config_rollback),
+        )
         .route("/admin/keys", post(admin_key_create).get(admin_key_list))
         .route("/admin/usage", get(admin_usage))
         .route("/admin/usage/users", get(admin_usage_users))
+        .route("/admin/usage/series", get(admin_usage_series))
         .route("/admin/models/status", get(admin_models_status))
         .route("/admin/audit/events", get(admin_security_events))
         .route("/admin/audit/ops", get(admin_audit_ops))
@@ -181,7 +190,7 @@ fn ws_subprotocol_ak(headers: &HeaderMap) -> Option<String> {
 async fn realtime_ws(
     State(s): State<AppState>,
     headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
     // one consistent snapshot for the whole accept decision (cfg + state)
@@ -485,7 +494,7 @@ async fn realtime_session(
 
     while let Some(Ok(msg)) = socket.recv().await {
         let text = match msg {
-            Message::Text(t) => t.to_string(),
+            Message::Text(t) => t,
             Message::Close(_) => break,
             _ => continue,
         };
@@ -919,10 +928,7 @@ async fn list_models(State(s): State<AppState>, Authed(ak): Authed) -> Response 
 }
 
 /// Local billing ledger snapshot.
-async fn ledger(
-    State(s): State<AppState>,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
-) -> Response {
+async fn ledger(State(s): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
     let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
     match s.handler.state().store.ledger_snapshot(limit).await {
         Ok((count, records)) => Json(json!({ "count": count, "records": records })).into_response(),
@@ -1065,6 +1071,12 @@ impl AdminScope {
             AdminScope::Tenant(t) => Some(t.as_str()),
             AdminScope::Global => q.get("tenant").map(String::as_str),
         }
+    }
+
+    /// Platform vendor cost (margin basis) is operator-only; a tenant admin
+    /// sees its own charge. Every usage read applies this before serializing.
+    fn sees_vendor_cost(&self) -> bool {
+        matches!(self, AdminScope::Global)
     }
 }
 
@@ -1296,6 +1308,16 @@ fn require_global_admin(s: &AppState, headers: &HeaderMap) -> Result<(), Respons
     }
 }
 
+#[allow(clippy::result_large_err)] // admin plane, not hot; boxing would noise every call site
+fn require_config_store(s: &AppState) -> Result<&Arc<gw_state::PostgresConfigStore>, Response> {
+    s.config_store.as_ref().ok_or_else(|| {
+        error_response(
+            400,
+            "config store not configured (set storage.postgres_url)",
+        )
+    })
+}
+
 /// Key lookup under an admin scope: another tenant's key answers 404 (not
 /// 403), so a tenant admin can't probe which keys exist outside its scope.
 async fn scoped_key(
@@ -1313,6 +1335,7 @@ async fn scoped_key(
 
 /// The admin surfaces' public view of a key — one shape for PATCH and GET.
 fn ak_public_json(k: &AkInfo) -> Value {
+    let status = k.status_at(gw_state::epoch_secs());
     json!({
         "ak": k.ak, "product": k.product, "tenant": k.tenant, "owner": k.owner,
         "qps": k.qps, "daily_token_quota": k.daily_token_quota,
@@ -1320,6 +1343,8 @@ fn ak_public_json(k: &AkInfo) -> Value {
         "expires_at_epoch_secs": k.expires_at_epoch_secs,
         "banned": k.banned,
         "suspended_until_epoch_secs": k.suspended_until_epoch_secs,
+        "status": status,
+        "available": status == gw_state::KeyStatus::Active,
     })
 }
 
@@ -1525,29 +1550,104 @@ async fn admin_key_delete(
     }
 }
 
+/// GET /admin/config — the current fleet config document. Global admin only.
+async fn admin_config_get(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_global_admin(&s, &headers) {
+        return r;
+    }
+    let store = match require_config_store(&s) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    match store.load_latest().await {
+        Ok(Some((version, yaml))) => {
+            Json(json!({ "version": version, "yaml": yaml })).into_response()
+        }
+        Ok(None) => error_response(404, "config store is empty"),
+        Err(e) => gateway_error(e),
+    }
+}
+
+/// POST /admin/config/validate — parse and validate without publishing.
+async fn admin_config_validate(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(r) = require_global_admin(&s, &headers) {
+        return r;
+    }
+    match GatewayConfig::from_yaml(&body) {
+        Ok(cfg) => Json(json!({
+            "valid": true,
+            "generation": cfg.generation(),
+            "access_keys": cfg.access_keys.len(),
+            "models": cfg.models.len(),
+            "accounts": cfg.accounts.len(),
+            "tenants": cfg.tenants.len(),
+        }))
+        .into_response(),
+        Err(e) => error_response(400, format!("invalid config: {e}")),
+    }
+}
+
+/// GET /admin/config/versions — retained config heads, newest first.
+async fn admin_config_versions(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(r) = require_global_admin(&s, &headers) {
+        return r;
+    }
+    let store = match require_config_store(&s) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let limit = q_num(&q, "limit", CONFIG_VERSION_PAGE_DEFAULT);
+    match store.list_versions(limit).await {
+        Ok(versions) => Json(json!({ "versions": versions })).into_response(),
+        Err(e) => gateway_error(e),
+    }
+}
+
 /// PUT /admin/config — validate, publish to the fleet config store, and reload
 /// this instance; peers converge via the store's change feed. Global admin only.
 async fn admin_config_put(
     State(s): State<AppState>,
     headers: HeaderMap,
     AuditSourceIp(source): AuditSourceIp,
+    Query(q): Query<HashMap<String, String>>,
     body: String,
 ) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    let Some(store) = &s.config_store else {
-        return error_response(
-            400,
-            "config store not configured (set storage.postgres_url)",
-        );
+    let store = match require_config_store(&s) {
+        Ok(v) => v,
+        Err(r) => return r,
     };
     if let Err(e) = GatewayConfig::from_yaml(&body) {
         return error_response(400, format!("invalid config: {e}"));
     }
-    let version = match store.publish(&body).await {
-        Ok(v) => v,
-        Err(e) => return gateway_error(e),
+    let version = match q
+        .get("expected_version")
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        Some(expected) => match store.publish_if(&body, expected).await {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return error_response(
+                    409,
+                    format!("config head moved past version {expected}; reload and retry"),
+                );
+            }
+            Err(e) => return gateway_error(e),
+        },
+        None => match store.publish(&body).await {
+            Ok(v) => v,
+            Err(e) => return gateway_error(e),
+        },
     };
     // audit before the local reload can fail — the published version already leads the fleet
     let reload = s.reload().await;
@@ -1577,13 +1677,93 @@ async fn admin_config_put(
     }
 }
 
+/// POST /admin/config/versions/{id}/rollback — republish a retained document
+/// as a new head and reload this instance. Global admin only.
+async fn admin_config_rollback(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    AuditSourceIp(source): AuditSourceIp,
+    Path(source_id): Path<i64>,
+) -> Response {
+    if let Err(r) = require_global_admin(&s, &headers) {
+        return r;
+    }
+    let store = match require_config_store(&s) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let yaml = match store.load_version(source_id).await {
+        Ok(Some(y)) => y,
+        Ok(None) => return error_response(404, format!("config version {source_id} not found")),
+        Err(e) => return gateway_error(e),
+    };
+    // a retained document can predate stricter validation — republishing it
+    // unvalidated would brick peers' reloads and fresh boots
+    if let Err(e) = GatewayConfig::from_yaml(&yaml) {
+        return error_response(
+            400,
+            format!("config version {source_id} no longer validates: {e}"),
+        );
+    }
+    let version = match store.publish(&yaml).await {
+        Ok(v) => v,
+        Err(e) => return gateway_error(e),
+    };
+    let reload = s.reload().await;
+    let detail = match &reload {
+        Ok(()) => format!("source_version={source_id}"),
+        Err(e) => format!("source_version={source_id}; local reload failed: {e}"),
+    };
+    audit_admin(
+        &s,
+        &AdminScope::Global,
+        source,
+        "config_rollback",
+        &version.to_string(),
+        detail,
+    )
+    .await;
+    match reload {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "rolled_back",
+                "source_version": source_id,
+                "version": version,
+            })),
+        )
+            .into_response(),
+        Err(e) => error_response(
+            500,
+            format!("published rollback v{version} but local reload failed: {e}"),
+        ),
+    }
+}
+
 /// GET /admin/keys?offset=&limit= — a page of the key table, scoped: a tenant
 /// admin sees only its own keys. Paginated so a fleet key table never loads whole.
 async fn admin_key_list(
     State(s): State<AppState>,
     scope: AdminScope,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    if let Some(ak) = q.get("ak") {
+        // exact lookup: an uncovered key answers an empty page, not 404, so a
+        // tenant admin cannot probe foreign key existence through the filter
+        let keys: Vec<Value> = s
+            .handler
+            .state()
+            .auth
+            .authenticate(ak)
+            .await
+            .filter(|k| scope.covers(&k.tenant))
+            .map(|k| ak_public_json(&k))
+            .into_iter()
+            .collect();
+        let mut resp = json!({ "count": keys.len(), "offset": 0 });
+        resp["keys"] = Value::Array(keys);
+        return Json(resp).into_response();
+    }
     let offset = q_num(&q, "offset", 0);
     let limit = q_num(&q, "limit", KEY_PAGE_DEFAULT);
     // the scope filters in the store before paging, or a tenant admin's page could come back empty
@@ -1648,13 +1828,18 @@ async fn admin_models_status(State(s): State<AppState>, scope: AdminScope) -> Re
 async fn admin_usage(
     State(s): State<AppState>,
     scope: AdminScope,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let filter = scope.tenant_filter(&q);
-    let usage = match s.handler.state().store.ledger_usage(filter).await {
+    let mut usage = match s.handler.state().store.ledger_usage(filter).await {
         Ok(rows) => rows,
         Err(e) => return gateway_error(e),
     };
+    if !scope.sees_vendor_cost() {
+        for u in &mut usage {
+            u.vendor_cost_micros = 0;
+        }
+    }
     Json(json!({ "usage": usage })).into_response()
 }
 
@@ -1664,12 +1849,12 @@ async fn admin_usage(
 async fn admin_usage_users(
     State(s): State<AppState>,
     scope: AdminScope,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let tenant = scope.tenant_filter(&q);
     let since = q_num(&q, "since", 0);
     let until = q_num(&q, "until", i64::MAX);
-    let usage = match s
+    let mut usage = match s
         .handler
         .state()
         .store
@@ -1679,6 +1864,11 @@ async fn admin_usage_users(
         Ok(rows) => rows,
         Err(e) => return gateway_error(e),
     };
+    if !scope.sees_vendor_cost() {
+        for u in &mut usage {
+            u.vendor_cost_micros = 0;
+        }
+    }
     if q.get("format").map(String::as_str) == Some("csv") {
         let mut csv = String::from(
             "user_id,model,requests,prompt_tokens,completion_tokens,total_tokens,cost_micros,vendor_cost_micros\n",
@@ -1702,22 +1892,89 @@ async fn admin_usage_users(
     Json(json!({ "usage": usage })).into_response()
 }
 
+/// GET /admin/usage/series?bucket=hour|day&since=&until=&user= — bounded
+/// tenant/user usage totals for dashboard charts, scoped like the other usage reads.
+async fn admin_usage_series(
+    State(s): State<AppState>,
+    scope: AdminScope,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let now = gw_state::epoch_secs();
+    let bucket_name = q.get("bucket").map(String::as_str).unwrap_or("day");
+    let bucket_secs = match bucket_name {
+        "hour" => 3_600,
+        "day" => 86_400,
+        _ => return error_response(400, "bucket must be `hour` or `day`"),
+    };
+    let since = q_num(&q, "since", now.saturating_sub(29 * 86_400));
+    let until = q_num(&q, "until", now);
+    if since < 0 || until < since {
+        return error_response(400, "since/until must be a valid non-negative range");
+    }
+    let first = since - since.rem_euclid(bucket_secs);
+    let points = (until - first) / bucket_secs + 1;
+    if points > USAGE_SERIES_MAX_POINTS {
+        return error_response(
+            400,
+            format!("usage series is limited to {USAGE_SERIES_MAX_POINTS} points"),
+        );
+    }
+    let tenant = scope.tenant_filter(&q);
+    let user = q.get("user").map(String::as_str);
+    let mut by_bucket: std::collections::BTreeMap<i64, gw_state::UserUsageRow> = match s
+        .handler
+        .state()
+        .store
+        .usage_series(tenant, user, since, until, bucket_secs)
+        .await
+    {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(e) => return gateway_error(e),
+    };
+    let redact_vendor = !scope.sees_vendor_cost();
+    let mut series = Vec::with_capacity(points as usize);
+    for idx in 0..points {
+        let start = first.saturating_add(idx * bucket_secs);
+        let end = start.saturating_add(bucket_secs - 1).min(until);
+        let totals = by_bucket
+            .remove(&start)
+            .unwrap_or_else(|| gw_state::UserUsageRow::zero(String::new(), String::new()));
+        series.push(json!({
+            "start": start,
+            "end": end,
+            "requests": totals.requests,
+            "prompt_tokens": totals.prompt_tokens,
+            "completion_tokens": totals.completion_tokens,
+            "total_tokens": totals.total_tokens,
+            "cost_micros": totals.cost_micros,
+            "vendor_cost_micros": if redact_vendor { 0 } else { totals.vendor_cost_micros },
+        }));
+    }
+    Json(json!({
+        "bucket": bucket_name,
+        "since": since,
+        "until": until,
+        "series": series,
+    }))
+    .into_response()
+}
+
 /// A CSV field, RFC-4180 quoted AND neutralized against spreadsheet formula
 /// injection: a field opening with a formula trigger (`= + - @` / tab / CR) is
 /// prefixed with `'` so Excel/Sheets treat it as text (the value is
 /// attacker-controlled — it can carry a user id).
-fn csv_field(s: &str) -> String {
+fn csv_field(s: &str) -> std::borrow::Cow<'_, str> {
     let needs_prefix = s
         .chars()
         .next()
         .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'));
-    let body = if needs_prefix {
-        format!("'{s}")
+    let body: std::borrow::Cow<'_, str> = if needs_prefix {
+        format!("'{s}").into()
     } else {
-        s.to_owned()
+        s.into()
     };
     if body.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", body.replace('"', "\"\""))
+        format!("\"{}\"", body.replace('"', "\"\"")).into()
     } else {
         body
     }
@@ -1728,7 +1985,7 @@ fn csv_field(s: &str) -> String {
 async fn admin_security_events(
     State(s): State<AppState>,
     scope: AdminScope,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let tenant = scope.tenant_filter(&q);
     let limit = q_num(&q, "limit", LEDGER_PAGE_DEFAULT);
@@ -1743,7 +2000,7 @@ async fn admin_security_events(
 async fn admin_audit_ops(
     State(s): State<AppState>,
     headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
@@ -1803,7 +2060,7 @@ async fn admin_content_erase(
     State(s): State<AppState>,
     scope: AdminScope,
     AuditSourceIp(source): AuditSourceIp,
-    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let Some(user) = q.get("user").filter(|u| !u.is_empty()) else {
         return error_response(400, "user is required");
@@ -2391,7 +2648,7 @@ async fn messages(
         Err(e) => return anthropic_gateway_error(e),
     };
     log_access("messages", &ctx, started);
-    let Some(outcome) = ctx.outcome else {
+    let Some(mut outcome) = ctx.outcome else {
         return anthropic_error(500, "pipeline produced no outcome");
     };
 
@@ -2400,7 +2657,7 @@ async fn messages(
         outcome.response.completion_tokens,
         outcome.response.common_usage,
     );
-    let tool_use = anthropic_tool_blocks(outcome.response.tool_calls.as_ref());
+    let tool_use = anthropic_tool_blocks(outcome.response.tool_calls.take());
     let mut content: Vec<gw_protocol::anthropic::ContentBlock> = Vec::new();
     if !outcome.response.message.is_empty() {
         content.push(gw_protocol::anthropic::ContentBlock::Text {
@@ -2426,19 +2683,18 @@ async fn messages(
 
 /// tool_use blocks for an engine's tool_calls: native blocks pass through;
 /// OpenAI-shaped calls convert via [`gw_protocol::anthropic::tool_calls_to_tool_use`].
-fn anthropic_tool_blocks(tool_calls: Option<&Value>) -> Vec<Value> {
+fn anthropic_tool_blocks(tool_calls: Option<Value>) -> Vec<Value> {
     let Some(Value::Array(blocks)) = tool_calls else {
         return Vec::new();
     };
-    let native: Vec<Value> = blocks
-        .iter()
-        .filter(|b| b["type"] == "tool_use")
-        .cloned()
-        .collect();
-    if !native.is_empty() {
-        return native;
+    if blocks.iter().any(|b| b["type"] == "tool_use") {
+        blocks
+            .into_iter()
+            .filter(|b| b["type"] == "tool_use")
+            .collect()
+    } else {
+        gw_protocol::anthropic::tool_calls_to_tool_use(&blocks)
     }
-    gw_protocol::anthropic::tool_calls_to_tool_use(blocks)
 }
 
 /// Streaming /v1/messages as the anthropic event sequence. message_start goes
@@ -2538,7 +2794,7 @@ fn messages_stream_response(
         ) {
             self.ensure_message_start();
             if let Some(frags) = self.tool_frags.take() {
-                for block in anthropic_tool_blocks(Some(&frags)) {
+                for block in anthropic_tool_blocks(Some(frags)) {
                     self.emit_tool_block(&block);
                 }
             }
@@ -2572,7 +2828,7 @@ fn messages_stream_response(
                     ));
                     true
                 }
-                Some(c) => {
+                Some(mut c) => {
                     if !c.delta.is_empty() {
                         self.ensure_message_start();
                         let idx = self.open_text();
@@ -2582,7 +2838,7 @@ fn messages_stream_response(
                                    "delta":{"type":"text_delta","text":c.delta}}),
                         ));
                     }
-                    if let Some(tc) = &c.tool_calls {
+                    if let Some(tc) = c.tool_calls.take() {
                         self.ensure_message_start();
                         let native = tc
                             .as_array()
@@ -2593,7 +2849,7 @@ fn messages_stream_response(
                                 self.emit_tool_block(&block);
                             }
                         } else {
-                            gw_engines::merge_tool_call_fragments(&mut self.tool_frags, tc);
+                            gw_engines::merge_tool_call_fragments(&mut self.tool_frags, &tc);
                         }
                     }
                     if let Some(fr) = c.finish_reason {
@@ -3018,7 +3274,7 @@ async fn audio_speech(
         voice: body["voice"].as_str().map(str::to_owned),
         response_format: Some(format.clone()),
     });
-    let ctx = match run_family(
+    let mut ctx = match run_family(
         &s,
         ak,
         model,
@@ -3033,8 +3289,8 @@ async fn audio_speech(
         Err(resp) => return resp,
     };
     log_access("audio_speech", &ctx, started);
-    if let Some(o) = ctx.outcome.as_ref().filter(|o| o.block.block) {
-        return error_response(400, o.response.message.clone());
+    if let Some(o) = ctx.outcome.take_if(|o| o.block.block) {
+        return error_response(400, o.response.message);
     }
     let Some(b64) = ctx
         .outcome
@@ -3472,6 +3728,190 @@ mod tests {
             .unwrap();
         assert_eq!(by_user.len(), 1);
         assert!(by_user[0].total_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn admin_keys_expose_lifecycle_and_usage_series_is_bucketed() {
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_CP_ADMIN}\nmodels: [{name: m, protocol: openai-chat}]\naccess_keys: [{ak: active, product: p, qps: 1, daily_token_quota: 100}, {ak: banned, product: p, qps: 1, daily_token_quota: 100, banned: true}, {ak: expired, product: p, qps: 1, daily_token_quota: 100, expires_at_epoch_secs: 1}]";
+        // SAFETY: this test owns a unique env var name.
+        unsafe { std::env::set_var("GW_TEST_CP_ADMIN", "cp-root") };
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let store = app_state.handler.state().store.clone();
+        for (created_at_epoch_secs, tokens, cost_micros) in [(3_700, 10, 25), (7_300, 20, 50)] {
+            store
+                .ledger_add(&gw_state::BillingRecord {
+                    ak: "active".into(),
+                    product: "p".into(),
+                    tenant: "default".into(),
+                    user_id: "alice".into(),
+                    request_id: format!("r-{created_at_epoch_secs}"),
+                    created_at_epoch_secs,
+                    model: "m".into(),
+                    served_model: "m".into(),
+                    protocol: "openai-chat".into(),
+                    account: "a".into(),
+                    prompt_tokens: tokens,
+                    completion_tokens: 0,
+                    total_tokens: tokens,
+                    cost_micros,
+                    vendor_cost_micros: cost_micros / 2,
+                    ptu_spillover: false,
+                    estimated: false,
+                })
+                .await
+                .unwrap();
+        }
+        let router = app(app_state);
+        let get = |uri: &'static str| {
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", "Bearer cp-root")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let resp = router.clone().oneshot(get("/admin/keys")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let keys = body["keys"].as_array().unwrap();
+        let key = |name: &str| keys.iter().find(|k| k["ak"] == name).unwrap();
+        assert_eq!(key("active")["status"], "active");
+        assert_eq!(key("active")["available"], true);
+        assert_eq!(key("banned")["status"], "banned");
+        assert_eq!(key("expired")["status"], "expired");
+
+        let resp = router
+            .oneshot(get(
+                "/admin/usage/series?bucket=hour&since=3600&until=10799&user=alice",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let series = body_json(resp).await;
+        let points = series["series"].as_array().unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0]["total_tokens"], 10);
+        assert_eq!(points[1]["total_tokens"], 20);
+        assert_eq!(points[1]["cost_micros"], 50);
+    }
+
+    #[tokio::test]
+    async fn tenant_scope_redacts_vendor_cost_and_ak_filter_hides_foreign_keys() {
+        let yaml = "listen: {host: h, port: 1}\nadmin: {token_env: GW_TEST_TSCOPE_G}\nmodels: [{name: m, protocol: openai-chat}]\ntenants: [{name: acme, admin_token_env: GW_TEST_TSCOPE_T, models: [m]}, {name: labs, models: [m]}]\naccess_keys: [{ak: k-acme, product: p, tenant: acme, qps: 1, daily_token_quota: 100}, {ak: k-labs, product: p, tenant: labs, qps: 1, daily_token_quota: 100}]";
+        // SAFETY: this test owns unique env var names.
+        unsafe {
+            std::env::set_var("GW_TEST_TSCOPE_G", "root-token");
+            std::env::set_var("GW_TEST_TSCOPE_T", "acme-token");
+        }
+        let cfg = Arc::new(GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
+        let app_state = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
+        let store = app_state.handler.state().store.clone();
+        store
+            .ledger_add(&gw_state::BillingRecord {
+                ak: "k-acme".into(),
+                product: "p".into(),
+                tenant: "acme".into(),
+                user_id: "alice".into(),
+                request_id: "r-1".into(),
+                created_at_epoch_secs: 3_700,
+                model: "m".into(),
+                served_model: "m".into(),
+                protocol: "openai-chat".into(),
+                account: "a".into(),
+                prompt_tokens: 10,
+                completion_tokens: 0,
+                total_tokens: 10,
+                cost_micros: 40,
+                vendor_cost_micros: 25,
+                ptu_spillover: false,
+                estimated: false,
+            })
+            .await
+            .unwrap();
+        let router = app(app_state);
+        let get = |uri: &'static str, token: &'static str| {
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/usage/users?since=0&until=10000", "acme-token"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let usage = body_json(resp).await;
+        assert_eq!(usage["usage"][0]["cost_micros"], 40);
+        assert_eq!(
+            usage["usage"][0]["vendor_cost_micros"], 0,
+            "tenant scope never sees platform vendor cost"
+        );
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/usage/users?since=0&until=10000", "root-token"))
+            .await
+            .unwrap();
+        let usage = body_json(resp).await;
+        assert_eq!(usage["usage"][0]["vendor_cost_micros"], 25);
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/usage", "acme-token"))
+            .await
+            .unwrap();
+        let usage = body_json(resp).await;
+        assert_eq!(usage["usage"][0]["cost_micros"], 40);
+        assert_eq!(
+            usage["usage"][0]["vendor_cost_micros"], 0,
+            "ledger rollup redacts vendor cost under a tenant scope too"
+        );
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/usage", "root-token"))
+            .await
+            .unwrap();
+        let usage = body_json(resp).await;
+        assert_eq!(usage["usage"][0]["vendor_cost_micros"], 25);
+        let resp = router
+            .clone()
+            .oneshot(get(
+                "/admin/usage/series?bucket=hour&since=3600&until=7199",
+                "acme-token",
+            ))
+            .await
+            .unwrap();
+        let series = body_json(resp).await;
+        assert_eq!(series["series"][0]["cost_micros"], 40);
+        assert_eq!(series["series"][0]["vendor_cost_micros"], 0);
+
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/keys?ak=k-acme", "acme-token"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["keys"][0]["ak"], "k-acme");
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/keys?ak=k-labs", "acme-token"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 0, "foreign key invisible through ak filter");
+        let resp = router
+            .oneshot(get("/admin/keys?ak=k-labs", "root-token"))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["count"], 1);
     }
 
     #[test]

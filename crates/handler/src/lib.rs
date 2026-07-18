@@ -589,7 +589,7 @@ mod tests {
                 let mut v: serde_json::Value = serde_json::from_slice(b).unwrap();
                 v["usage"]["prompt_tokens"] = 100.into();
                 v["usage"]["prompt_tokens_details"] = serde_json::json!({"cached_tokens": 80});
-                *b = serde_json::to_vec(&v).unwrap();
+                *b = serde_json::to_vec(&v).unwrap().into();
             }
             Ok(resp)
         }

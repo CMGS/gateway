@@ -242,7 +242,9 @@ fn ensure_json_content_type(headers: &mut Vec<(String, String)>) {
 pub(crate) fn merge_raw_extras(body: &mut serde_json::Map<String, Value>, raw: &Value) {
     if let Value::Object(extra) = raw {
         for (k, v) in extra {
-            body.entry(k.clone()).or_insert_with(|| v.clone());
+            if !body.contains_key(k.as_str()) {
+                body.insert(k.clone(), v.clone());
+            }
         }
     }
 }

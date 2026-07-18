@@ -1,0 +1,47 @@
+name: Release control plane
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: control-plane/go.mod
+          cache-dependency-path: control-plane/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: control-plane/web/package-lock.json
+      - name: Build web assets
+        working-directory: control-plane/web
+        run: |
+          npm ci
+          npm run build
+      - name: Build and package binaries
+        working-directory: control-plane
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}" arch="${target#*/}"
+            out="dist/control-plane_${GITHUB_REF_NAME}_${os}_${arch}"
+            mkdir -p "$out"
+            GOWORK=off CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w" -o "$out/control-plane" ./cmd/control-plane
+            cp -r web/dist "$out/web-dist"
+            tar -czf "$out.tar.gz" -C dist "$(basename "$out")"
+          done
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" control-plane/dist/*.tar.gz --clobber

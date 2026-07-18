@@ -230,21 +230,21 @@ pub struct ChunkChoice {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatCompletionChunk {
-    pub id: String,
-    /// Always "chat.completion.chunk"; borrowed so per-frame construction
-    /// doesn't allocate it.
-    pub object: std::borrow::Cow<'static, str>,
+/// Borrows `id`/`model` from the stream state: chunks are built and serialized
+/// once per SSE frame, so owning them would allocate twice per frame.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatCompletionChunk<'a> {
+    pub id: &'a str,
+    pub object: &'static str,
     pub created: i64,
-    pub model: String,
+    pub model: &'a str,
     pub choices: Vec<ChunkChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
 }
 
-impl ChatCompletionChunk {
-    pub fn content(id: &str, created: i64, model: &str, text: impl Into<String>) -> Self {
+impl<'a> ChatCompletionChunk<'a> {
+    pub fn content(id: &'a str, created: i64, model: &'a str, text: impl Into<String>) -> Self {
         Self::with_delta(
             id,
             created,
@@ -258,7 +258,7 @@ impl ChatCompletionChunk {
         )
     }
 
-    pub fn tool_calls(id: &str, created: i64, model: &str, calls: Vec<Value>) -> Self {
+    pub fn tool_calls(id: &'a str, created: i64, model: &'a str, calls: Vec<Value>) -> Self {
         Self::with_delta(
             id,
             created,
@@ -272,7 +272,7 @@ impl ChatCompletionChunk {
         )
     }
 
-    pub fn finish(id: &str, created: i64, model: &str, usage: Option<Usage>) -> Self {
+    pub fn finish(id: &'a str, created: i64, model: &'a str, usage: Option<Usage>) -> Self {
         Self::with_delta(
             id,
             created,
@@ -284,18 +284,18 @@ impl ChatCompletionChunk {
     }
 
     fn with_delta(
-        id: &str,
+        id: &'a str,
         created: i64,
-        model: &str,
+        model: &'a str,
         delta: ChunkDelta,
         finish_reason: Option<String>,
         usage: Option<Usage>,
     ) -> Self {
         Self {
-            id: id.to_owned(),
-            object: std::borrow::Cow::Borrowed("chat.completion.chunk"),
+            id,
+            object: "chat.completion.chunk",
             created,
-            model: model.to_owned(),
+            model,
             choices: vec![ChunkChoice {
                 index: 0,
                 delta,

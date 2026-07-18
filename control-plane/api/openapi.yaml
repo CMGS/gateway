@@ -1,0 +1,279 @@
+# Mirrors internal/httpapi/server.go routes and the wire types in
+# internal/gateway + internal/user — update together.
+openapi: 3.1.0
+info:
+  title: Gateway Control Plane API
+  version: 0.1.0
+  description: Browser-facing API. Gateway data and mutations are proxied through the Rust gateway admin API.
+servers:
+  - url: /api/v1
+paths:
+  /health:
+    get:
+      security: []
+      summary: Control-plane liveness
+      responses:
+        "200": {description: Healthy, content: {application/json: {schema: {type: object}}}}
+  /auth/login:
+    post:
+      security: []
+      summary: Start an opaque browser session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: {type: string, format: email}
+                password: {type: string, format: password}
+      responses:
+        "200": {$ref: "#/components/responses/Session"}
+        "401": {$ref: "#/components/responses/Error"}
+  /auth/logout:
+    post:
+      summary: End the current session
+      responses:
+        "204": {description: Signed out}
+  /session:
+    get:
+      summary: Current user and CSRF token
+      responses:
+        "200": {$ref: "#/components/responses/Session"}
+        "401": {$ref: "#/components/responses/Error"}
+  /overview:
+    get:
+      summary: Scoped usage, trend and model availability
+      parameters:
+        - {$ref: "#/components/parameters/Since"}
+        - {$ref: "#/components/parameters/Until"}
+        - {$ref: "#/components/parameters/Bucket"}
+      responses:
+        "200": {description: Overview, content: {application/json: {schema: {type: object}}}}
+  /usage:
+    get:
+      summary: Scoped usage and billing rows
+      parameters:
+        - {$ref: "#/components/parameters/Since"}
+        - {$ref: "#/components/parameters/Until"}
+      responses:
+        "200": {description: Usage rows, content: {application/json: {schema: {type: object}}}}
+  /usage/series:
+    get:
+      summary: Scoped hourly or daily usage series
+      parameters:
+        - {$ref: "#/components/parameters/Since"}
+        - {$ref: "#/components/parameters/Until"}
+        - {$ref: "#/components/parameters/Bucket"}
+      responses:
+        "200": {description: Usage series, content: {application/json: {schema: {$ref: "#/components/schemas/UsageSeries"}}}}
+  /models/status:
+    get:
+      summary: Scoped client-visible model availability
+      responses:
+        "200": {description: Model states, content: {application/json: {schema: {type: object}}}}
+  /admin/instances:
+    get:
+      summary: Configured gateway instances and local account health
+      x-role: system_admin
+      responses:
+        "200": {description: Instance states, content: {application/json: {schema: {type: object}}}}
+  /admin/users:
+    get:
+      summary: List control-plane identities
+      x-role: system_admin
+      responses:
+        "200": {description: Users, content: {application/json: {schema: {type: object}}}}
+    post:
+      summary: Create a control-plane identity
+      x-role: system_admin
+      requestBody: {$ref: "#/components/requestBodies/UserCreate"}
+      responses:
+        "201": {description: Created user, content: {application/json: {schema: {$ref: "#/components/schemas/User"}}}}
+  /admin/users/{id}:
+    patch:
+      summary: Update or disable a control-plane identity
+      x-role: system_admin
+      parameters:
+        - {$ref: "#/components/parameters/ID"}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object}}}
+      responses:
+        "200": {description: Updated user, content: {application/json: {schema: {$ref: "#/components/schemas/User"}}}}
+  /admin/keys:
+    get:
+      summary: List live gateway access-key lifecycle state
+      x-role: tenant_admin_or_system_admin
+      parameters:
+        - {name: tenant, in: query, schema: {type: string}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, default: 1000}}
+      responses:
+        "200": {description: Keys, content: {application/json: {schema: {type: object}}}}
+    post:
+      summary: Create a gateway access key
+      x-role: tenant_admin_or_system_admin
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: "#/components/schemas/AccessKey"}}}
+      responses:
+        "201": {description: Key created}
+  /admin/keys/{ak}:
+    patch:
+      summary: Change gateway key limits or lifecycle state
+      x-role: tenant_admin_or_system_admin
+      parameters:
+        - {$ref: "#/components/parameters/AK"}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object}}}
+      responses:
+        "200": {description: Updated key, content: {application/json: {schema: {$ref: "#/components/schemas/AccessKey"}}}}
+    delete:
+      summary: Revoke a gateway access key
+      x-role: tenant_admin_or_system_admin
+      parameters:
+        - {$ref: "#/components/parameters/AK"}
+      responses:
+        "204": {description: Revoked}
+  /admin/config:
+    get:
+      summary: Current gateway configuration
+      x-role: system_admin
+      responses:
+        "200": {description: Configuration document, content: {application/json: {schema: {$ref: "#/components/schemas/ConfigDocument"}}}}
+    put:
+      summary: Validate and publish gateway configuration
+      x-role: system_admin
+      requestBody: {$ref: "#/components/requestBodies/Config"}
+      responses:
+        "200": {description: Published version, content: {application/json: {schema: {type: object}}}}
+        "409": {description: Head moved past expected_version; reload and retry}
+  /admin/config/validate:
+    post:
+      summary: Validate gateway configuration without publishing
+      x-role: system_admin
+      requestBody: {$ref: "#/components/requestBodies/Config"}
+      responses:
+        "200": {description: Validation result, content: {application/json: {schema: {type: object}}}}
+  /admin/config/versions:
+    get:
+      summary: Retained gateway configuration versions
+      x-role: system_admin
+      responses:
+        "200": {description: Versions, content: {application/json: {schema: {type: object}}}}
+  /admin/config/versions/{id}/rollback:
+    post:
+      summary: Republish a retained gateway configuration
+      x-role: system_admin
+      parameters:
+        - {$ref: "#/components/parameters/ID"}
+      responses:
+        "200": {description: New active version, content: {application/json: {schema: {type: object}}}}
+  /admin/audit:
+    get:
+      summary: Gateway operational audit or scoped security events
+      x-role: "kind=ops: system_admin; kind=security: tenant_admin_or_system_admin"
+      parameters:
+        - {name: kind, in: query, schema: {type: string, enum: [ops, security], default: ops}}
+        - {name: tenant, in: query, schema: {type: string}}
+      responses:
+        "200": {description: Audit entries or security events, content: {application/json: {schema: {type: object}}}}
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: cp_session
+    csrf:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+  parameters:
+    ID: {name: id, in: path, required: true, schema: {type: string}}
+    AK: {name: ak, in: path, required: true, schema: {type: string}}
+    Since: {name: since, in: query, schema: {type: integer, format: int64}}
+    Until: {name: until, in: query, schema: {type: integer, format: int64}}
+    Bucket: {name: bucket, in: query, schema: {type: string, enum: [hour, day]}}
+  requestBodies:
+    Config:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [yaml]
+            properties:
+              yaml: {type: string}
+              expected_version: {type: integer, format: int64, description: "When >0, publish only if this is still the head version"}
+    UserCreate:
+      required: true
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: "#/components/schemas/User"}
+              - {type: object, required: [password], properties: {password: {type: string, format: password}}}
+  responses:
+    Session:
+      description: Authenticated session
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [user, csrf_token]
+            properties:
+              user: {$ref: "#/components/schemas/User"}
+              csrf_token: {type: string}
+    Error:
+      description: Error envelope
+      content: {application/json: {schema: {type: object}}}
+  schemas:
+    User:
+      type: object
+      required: [email, display_name, role]
+      properties:
+        id: {type: string}
+        email: {type: string, format: email}
+        display_name: {type: string}
+        tenant: {type: string}
+        gateway_user_id: {type: string}
+        role: {type: string, enum: [member, tenant_admin, system_admin]}
+        disabled: {type: boolean}
+        created_at: {type: integer, format: int64}
+        updated_at: {type: integer, format: int64}
+    AccessKey:
+      type: object
+      required: [ak, product, tenant]
+      properties:
+        ak: {type: string}
+        product: {type: string}
+        tenant: {type: string}
+        owner: {type: [string, "null"]}
+        qps: {type: number}
+        daily_token_quota: {type: integer, format: int64}
+        tokens_per_minute: {type: [integer, "null"], format: int64}
+        expires_at_epoch_secs: {type: [integer, "null"], format: int64}
+        suspended_until_epoch_secs: {type: [integer, "null"], format: int64}
+        model_quotas: {type: object, additionalProperties: {type: integer, format: int64}}
+        banned: {type: boolean}
+        status: {type: string, enum: [active, banned, expired, suspended]}
+        available: {type: boolean}
+    ConfigDocument:
+      type: object
+      required: [version, yaml]
+      properties:
+        version: {type: integer, format: int64}
+        yaml: {type: string}
+    UsageSeries:
+      type: object
+      properties:
+        bucket: {type: string, enum: [hour, day]}
+        since: {type: integer, format: int64}
+        until: {type: integer, format: int64}
+        series: {type: array, items: {type: object}}
+security:
+  - sessionCookie: []
+    csrf: []

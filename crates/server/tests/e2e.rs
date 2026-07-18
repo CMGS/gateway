@@ -2092,7 +2092,7 @@ async fn outbound_dlp_redacts_the_responses_body() {
             });
             Ok(gw_engines::transport::UpstreamResponse {
                 status: 200,
-                body: gw_engines::transport::UpstreamBody::Json(body.to_string().into_bytes()),
+                body: gw_engines::transport::UpstreamBody::Json(body.to_string().into()),
             })
         }
     }

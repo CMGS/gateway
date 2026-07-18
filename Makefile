@@ -1,6 +1,6 @@
 BIN := gw
 
-.PHONY: all build release test lint fmt fmt-check deny dist dist-plan docker run clean
+.PHONY: all build release test lint fmt fmt-check deny dist dist-plan docker run clean control-plane control-plane-test control-plane-integration
 
 all: fmt lint test build
 
@@ -37,6 +37,15 @@ docker:
 
 run:
 	cargo run -p gw-server
+
+control-plane:
+	$(MAKE) -C control-plane build
+
+control-plane-test:
+	$(MAKE) -C control-plane test web-test
+
+control-plane-integration:
+	$(MAKE) -C control-plane test-integration
 
 clean:
 	cargo clean
