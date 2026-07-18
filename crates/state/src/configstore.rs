@@ -32,27 +32,15 @@ impl PostgresConfigStore {
             .connect(url)
             .await
             .map_err(|e| crate::sqlx_err("connect postgres config store", e))?;
-        let mut schema = pool
-            .begin()
-            .await
-            .map_err(|e| crate::sqlx_err("begin gw_config schema", e))?;
-        sqlx::query(crate::PG_SCHEMA_LOCK_SQL)
-            .execute(&mut *schema)
-            .await
-            .map_err(|e| crate::sqlx_err("lock gw_config schema", e))?;
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS gw_config (
+        crate::setup_schema(
+            &pool,
+            "gw_config",
+            &["CREATE TABLE IF NOT EXISTS gw_config (
                 id BIGSERIAL PRIMARY KEY,
                 yaml TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now())"],
         )
-        .execute(&mut *schema)
-        .await
-        .map_err(|e| crate::sqlx_err("create gw_config schema", e))?;
-        schema
-            .commit()
-            .await
-            .map_err(|e| crate::sqlx_err("commit gw_config schema", e))?;
+        .await?;
         Ok(Self { pool })
     }
 
@@ -74,13 +62,13 @@ impl PostgresConfigStore {
             .map_err(|e| crate::sqlx_err("read config version", e))
     }
 
-    /// List retained versions newest first. The store keeps at most 20.
+    /// List retained versions newest first.
     pub async fn list_versions(&self, limit: usize) -> GResult<Vec<ConfigVersion>> {
         let rows = sqlx::query(
             "SELECT id, EXTRACT(EPOCH FROM created_at)::BIGINT
              FROM gw_config ORDER BY id DESC LIMIT $1",
         )
-        .bind(limit.min(KEEP_VERSIONS as usize) as i64)
+        .bind(limit as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| crate::sqlx_err("list config versions", e))?;

@@ -34,7 +34,9 @@ impl OfflineHandler {
             let items: Vec<BatchItem> = items
                 .into_iter()
                 .map(|mut i| {
-                    i.user = ak.attributed_user(&i.user).to_owned();
+                    if let Some(owner) = ak.owner_override() {
+                        i.user = owner.to_owned();
+                    }
                     i
                 })
                 .collect();
@@ -147,7 +149,10 @@ impl OfflineHandler {
                             ok: false,
                             message: "item unavailable at dispatch".into(),
                             total_tokens: 0,
-                            user: ak.attributed_user(&item.user).to_owned(),
+                            user: match ak.owner_override() {
+                                Some(owner) => owner.to_owned(),
+                                None => item.user,
+                            },
                         };
                         if let Err(e) = store.batch_push_result(id, result).await {
                             tracing::error!(error = %e, batch = %id, "batch result write failed");

@@ -186,9 +186,8 @@ impl Transport for HttpTransport {
         } else {
             read.await
         };
-        let bytes = bytes
-            .map_err(|e| GatewayError::internal("read upstream body").with_source(e))?
-            .to_vec();
+        let bytes =
+            bytes.map_err(|e| GatewayError::internal("read upstream body").with_source(e))?;
         Ok(UpstreamResponse {
             status,
             body: UpstreamBody::Json(bytes),

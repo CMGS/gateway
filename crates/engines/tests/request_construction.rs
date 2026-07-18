@@ -58,7 +58,7 @@ impl Transport for RecordingTransport {
         *self.seen.lock().unwrap() = Some(req);
         Ok(UpstreamResponse {
             status: 200,
-            body: UpstreamBody::Json(self.reply.clone()),
+            body: UpstreamBody::Json(bytes::Bytes::from(self.reply.clone())),
         })
     }
 }

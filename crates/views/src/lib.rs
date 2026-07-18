@@ -494,7 +494,7 @@ async fn realtime_session(
 
     while let Some(Ok(msg)) = socket.recv().await {
         let text = match msg {
-            Message::Text(t) => t.to_string(),
+            Message::Text(t) => t,
             Message::Close(_) => break,
             _ => continue,
         };
@@ -1305,6 +1305,16 @@ fn require_global_admin(s: &AppState, headers: &HeaderMap) -> Result<(), Respons
     }
 }
 
+#[allow(clippy::result_large_err)] // admin plane, not hot; boxing would noise every call site
+fn require_config_store(s: &AppState) -> Result<&Arc<gw_state::PostgresConfigStore>, Response> {
+    s.config_store.as_ref().ok_or_else(|| {
+        error_response(
+            400,
+            "config store not configured (set storage.postgres_url)",
+        )
+    })
+}
+
 /// Key lookup under an admin scope: another tenant's key answers 404 (not
 /// 403), so a tenant admin can't probe which keys exist outside its scope.
 async fn scoped_key(
@@ -1330,12 +1340,7 @@ fn ak_public_json(k: &AkInfo) -> Value {
         "expires_at_epoch_secs": k.expires_at_epoch_secs,
         "banned": k.banned,
         "suspended_until_epoch_secs": k.suspended_until_epoch_secs,
-        "status": match status {
-            gw_state::KeyStatus::Active => "active",
-            gw_state::KeyStatus::Banned => "banned",
-            gw_state::KeyStatus::Expired => "expired",
-            gw_state::KeyStatus::Suspended => "suspended",
-        },
+        "status": status,
         "available": status == gw_state::KeyStatus::Active,
     })
 }
@@ -1547,11 +1552,9 @@ async fn admin_config_get(State(s): State<AppState>, headers: HeaderMap) -> Resp
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    let Some(store) = &s.config_store else {
-        return error_response(
-            400,
-            "config store not configured (set storage.postgres_url)",
-        );
+    let store = match require_config_store(&s) {
+        Ok(v) => v,
+        Err(r) => return r,
     };
     match store.load_latest().await {
         Ok(Some((version, yaml))) => {
@@ -1594,11 +1597,9 @@ async fn admin_config_versions(
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    let Some(store) = &s.config_store else {
-        return error_response(
-            400,
-            "config store not configured (set storage.postgres_url)",
-        );
+    let store = match require_config_store(&s) {
+        Ok(v) => v,
+        Err(r) => return r,
     };
     let limit = q_num(&q, "limit", CONFIG_VERSION_PAGE_DEFAULT);
     match store.list_versions(limit).await {
@@ -1618,11 +1619,9 @@ async fn admin_config_put(
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    let Some(store) = &s.config_store else {
-        return error_response(
-            400,
-            "config store not configured (set storage.postgres_url)",
-        );
+    let store = match require_config_store(&s) {
+        Ok(v) => v,
+        Err(r) => return r,
     };
     if let Err(e) = GatewayConfig::from_yaml(&body) {
         return error_response(400, format!("invalid config: {e}"));
@@ -1670,11 +1669,9 @@ async fn admin_config_rollback(
     if let Err(r) = require_global_admin(&s, &headers) {
         return r;
     }
-    let Some(store) = &s.config_store else {
-        return error_response(
-            400,
-            "config store not configured (set storage.postgres_url)",
-        );
+    let store = match require_config_store(&s) {
+        Ok(v) => v,
+        Err(r) => return r,
     };
     let version = match store.rollback(source_id).await {
         Ok(Some(v)) => v,
@@ -1838,8 +1835,7 @@ async fn admin_usage_users(
 }
 
 /// GET /admin/usage/series?bucket=hour|day&since=&until=&user= — bounded
-/// tenant/user usage totals for dashboard charts. Tenant-scoped like the other
-/// usage reads; every point is computed from the durable rollup plus raw tail.
+/// tenant/user usage totals for dashboard charts, scoped like the other usage reads.
 async fn admin_usage_series(
     State(s): State<AppState>,
     scope: AdminScope,
@@ -1869,7 +1865,7 @@ async fn admin_usage_series(
     let user = q.get("user").map(String::as_str);
     let mut series = Vec::with_capacity(points as usize);
     for idx in 0..points {
-        let start = first.saturating_add(idx.saturating_mul(bucket_secs));
+        let start = first.saturating_add(idx * bucket_secs);
         let end = start.saturating_add(bucket_secs - 1).min(until);
         let rows = match s
             .handler
@@ -1881,29 +1877,19 @@ async fn admin_usage_series(
             Ok(rows) => rows,
             Err(e) => return gateway_error(e),
         };
-        let mut requests = 0_i64;
-        let mut prompt_tokens = 0_i64;
-        let mut completion_tokens = 0_i64;
-        let mut total_tokens = 0_i64;
-        let mut cost_micros = 0_i64;
-        let mut vendor_cost_micros = 0_i64;
-        for row in rows {
-            requests = requests.saturating_add(row.requests);
-            prompt_tokens = prompt_tokens.saturating_add(row.prompt_tokens);
-            completion_tokens = completion_tokens.saturating_add(row.completion_tokens);
-            total_tokens = total_tokens.saturating_add(row.total_tokens);
-            cost_micros = cost_micros.saturating_add(row.cost_micros);
-            vendor_cost_micros = vendor_cost_micros.saturating_add(row.vendor_cost_micros);
+        let mut totals = gw_state::UserUsageRow::zero(String::new(), String::new());
+        for row in &rows {
+            totals.absorb(row);
         }
         series.push(json!({
             "start": start,
             "end": end,
-            "requests": requests,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "cost_micros": cost_micros,
-            "vendor_cost_micros": vendor_cost_micros,
+            "requests": totals.requests,
+            "prompt_tokens": totals.prompt_tokens,
+            "completion_tokens": totals.completion_tokens,
+            "total_tokens": totals.total_tokens,
+            "cost_micros": totals.cost_micros,
+            "vendor_cost_micros": totals.vendor_cost_micros,
         }));
     }
     Json(json!({
@@ -1919,18 +1905,18 @@ async fn admin_usage_series(
 /// injection: a field opening with a formula trigger (`= + - @` / tab / CR) is
 /// prefixed with `'` so Excel/Sheets treat it as text (the value is
 /// attacker-controlled — it can carry a user id).
-fn csv_field(s: &str) -> String {
+fn csv_field(s: &str) -> std::borrow::Cow<'_, str> {
     let needs_prefix = s
         .chars()
         .next()
         .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'));
-    let body = if needs_prefix {
-        format!("'{s}")
+    let body: std::borrow::Cow<'_, str> = if needs_prefix {
+        format!("'{s}").into()
     } else {
-        s.to_owned()
+        s.into()
     };
     if body.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", body.replace('"', "\"\""))
+        format!("\"{}\"", body.replace('"', "\"\"")).into()
     } else {
         body
     }
@@ -2604,7 +2590,7 @@ async fn messages(
         Err(e) => return anthropic_gateway_error(e),
     };
     log_access("messages", &ctx, started);
-    let Some(outcome) = ctx.outcome else {
+    let Some(mut outcome) = ctx.outcome else {
         return anthropic_error(500, "pipeline produced no outcome");
     };
 
@@ -2613,7 +2599,7 @@ async fn messages(
         outcome.response.completion_tokens,
         outcome.response.common_usage,
     );
-    let tool_use = anthropic_tool_blocks(outcome.response.tool_calls.as_ref());
+    let tool_use = anthropic_tool_blocks(outcome.response.tool_calls.take());
     let mut content: Vec<gw_protocol::anthropic::ContentBlock> = Vec::new();
     if !outcome.response.message.is_empty() {
         content.push(gw_protocol::anthropic::ContentBlock::Text {
@@ -2639,19 +2625,18 @@ async fn messages(
 
 /// tool_use blocks for an engine's tool_calls: native blocks pass through;
 /// OpenAI-shaped calls convert via [`gw_protocol::anthropic::tool_calls_to_tool_use`].
-fn anthropic_tool_blocks(tool_calls: Option<&Value>) -> Vec<Value> {
+fn anthropic_tool_blocks(tool_calls: Option<Value>) -> Vec<Value> {
     let Some(Value::Array(blocks)) = tool_calls else {
         return Vec::new();
     };
-    let native: Vec<Value> = blocks
-        .iter()
-        .filter(|b| b["type"] == "tool_use")
-        .cloned()
-        .collect();
-    if !native.is_empty() {
-        return native;
+    if blocks.iter().any(|b| b["type"] == "tool_use") {
+        blocks
+            .into_iter()
+            .filter(|b| b["type"] == "tool_use")
+            .collect()
+    } else {
+        gw_protocol::anthropic::tool_calls_to_tool_use(&blocks)
     }
-    gw_protocol::anthropic::tool_calls_to_tool_use(blocks)
 }
 
 /// Streaming /v1/messages as the anthropic event sequence. message_start goes
@@ -2751,7 +2736,7 @@ fn messages_stream_response(
         ) {
             self.ensure_message_start();
             if let Some(frags) = self.tool_frags.take() {
-                for block in anthropic_tool_blocks(Some(&frags)) {
+                for block in anthropic_tool_blocks(Some(frags)) {
                     self.emit_tool_block(&block);
                 }
             }
@@ -2785,7 +2770,7 @@ fn messages_stream_response(
                     ));
                     true
                 }
-                Some(c) => {
+                Some(mut c) => {
                     if !c.delta.is_empty() {
                         self.ensure_message_start();
                         let idx = self.open_text();
@@ -2795,7 +2780,7 @@ fn messages_stream_response(
                                    "delta":{"type":"text_delta","text":c.delta}}),
                         ));
                     }
-                    if let Some(tc) = &c.tool_calls {
+                    if let Some(tc) = c.tool_calls.take() {
                         self.ensure_message_start();
                         let native = tc
                             .as_array()
@@ -2806,7 +2791,7 @@ fn messages_stream_response(
                                 self.emit_tool_block(&block);
                             }
                         } else {
-                            gw_engines::merge_tool_call_fragments(&mut self.tool_frags, tc);
+                            gw_engines::merge_tool_call_fragments(&mut self.tool_frags, &tc);
                         }
                     }
                     if let Some(fr) = c.finish_reason {
@@ -3231,7 +3216,7 @@ async fn audio_speech(
         voice: body["voice"].as_str().map(str::to_owned),
         response_format: Some(format.clone()),
     });
-    let ctx = match run_family(
+    let mut ctx = match run_family(
         &s,
         ak,
         model,
@@ -3246,8 +3231,8 @@ async fn audio_speech(
         Err(resp) => return resp,
     };
     log_access("audio_speech", &ctx, started);
-    if let Some(o) = ctx.outcome.as_ref().filter(|o| o.block.block) {
-        return error_response(400, o.response.message.clone());
+    if let Some(o) = ctx.outcome.take_if(|o| o.block.block) {
+        return error_response(400, o.response.message);
     }
     let Some(b64) = ctx
         .outcome
@@ -3732,7 +3717,8 @@ mod tests {
 
         let resp = router.clone().oneshot(get("/admin/keys")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let keys = body_json(resp).await["keys"].as_array().unwrap().clone();
+        let body = body_json(resp).await;
+        let keys = body["keys"].as_array().unwrap();
         let key = |name: &str| keys.iter().find(|k| k["ak"] == name).unwrap();
         assert_eq!(key("active")["status"], "active");
         assert_eq!(key("active")["available"], true);

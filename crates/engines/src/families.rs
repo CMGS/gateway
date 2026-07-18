@@ -701,7 +701,7 @@ impl ModelEngine for CompletionsEngine {
                 body["temperature"] = json!(t);
             }
         }
-        let (status, v) = self
+        let (status, mut v) = self
             .base
             .round_trip(
                 &format!(
@@ -711,34 +711,31 @@ impl ModelEngine for CompletionsEngine {
                 body,
             )
             .await?;
-        let text = v["choices"][0]["text"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
         let usage = &v["usage"];
         let (pt, ct) = (
             crate::engine::tok(&usage["prompt_tokens"]),
             crate::engine::tok(&usage["completion_tokens"]),
         );
+        // floor a present-but-negative upstream total too, not just the sum
+        let total = usage["total_tokens"]
+            .as_i64()
+            .unwrap_or(pt.saturating_add(ct))
+            .max(0);
+        let raw_usage_json = if usage.is_null() {
+            vec![]
+        } else {
+            serde_json::to_vec(usage).unwrap_or_default()
+        };
         let resp = GatewayResponse {
-            message: text,
-            model: v["model"].as_str().unwrap_or(&param.model_name).to_owned(),
-            finish_reason: v["choices"][0]["finish_reason"]
-                .as_str()
-                .unwrap_or("stop")
-                .to_owned(),
+            message: crate::engine::take_string(&mut v, "/choices/0/text").unwrap_or_default(),
+            model: crate::engine::take_string(&mut v, "/model")
+                .unwrap_or_else(|| param.model_name.clone()),
+            finish_reason: crate::engine::take_string(&mut v, "/choices/0/finish_reason")
+                .unwrap_or_else(|| "stop".to_owned()),
             prompt_tokens: pt,
             completion_tokens: ct,
-            // floor a present-but-negative upstream total too, not just the sum
-            total_tokens: usage["total_tokens"]
-                .as_i64()
-                .unwrap_or(pt.saturating_add(ct))
-                .max(0),
-            raw_usage_json: if usage.is_null() {
-                vec![]
-            } else {
-                serde_json::to_vec(usage).unwrap_or_default()
-            },
+            total_tokens: total,
+            raw_usage_json,
             ..Default::default()
         };
         Ok(EngineOutcome::with_status(resp, status))

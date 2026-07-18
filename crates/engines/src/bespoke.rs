@@ -110,10 +110,11 @@ impl ModelEngine for ErnieEngine {
             self.base.base_url("mock://aip.baidubce.com"),
             self.base.api_key(),
         );
-        let (status, v) = self.base.post_json(&url, vec![], body).await?;
+        let (status, mut v) = self.base.post_json(&url, vec![], body).await?;
+        let message = crate::engine::take_string(&mut v, "/result").unwrap_or_default();
         let usage = &v["usage"];
         let resp = GatewayResponse {
-            message: v["result"].as_str().unwrap_or_default().to_owned(),
+            message,
             model,
             finish_reason: if v["is_truncated"].as_bool().unwrap_or(false) {
                 "length".into()
@@ -161,7 +162,7 @@ impl ModelEngine for MinimaxV1Engine {
             "{}/v1/text/chatcompletion",
             self.base.base_url("mock://api.minimax.chat")
         );
-        let (status, v) = self
+        let (status, mut v) = self
             .base
             .post_json(&url, self.base.bearer_headers(), body)
             .await?;
@@ -176,7 +177,7 @@ impl ModelEngine for MinimaxV1Engine {
         }
         let total = crate::engine::tok(&v["usage"]["total_tokens"]);
         let resp = GatewayResponse {
-            message: v["reply"].as_str().unwrap_or_default().to_owned(),
+            message: crate::engine::take_string(&mut v, "/reply").unwrap_or_default(),
             model,
             finish_reason: "stop".into(),
             total_tokens: total,
@@ -228,15 +229,16 @@ impl ModelEngine for CohereEngine {
         {
             body["max_tokens"] = json!(mt);
         }
-        let (status, v) =
+        let (status, mut v) =
             bedrock_invoke(&self.base, "/model/cohere.command-r/invoke", body).await?;
+        let message = crate::engine::take_string(&mut v, "/text").unwrap_or_default();
         let tokens = &v["meta"]["tokens"];
         let (input, output) = (
             crate::engine::tok(&tokens["input_tokens"]),
             crate::engine::tok(&tokens["output_tokens"]),
         );
         let resp = GatewayResponse {
-            message: v["text"].as_str().unwrap_or_default().to_owned(),
+            message,
             model,
             finish_reason: v["finish_reason"].as_str().unwrap_or("stop").to_lowercase(),
             prompt_tokens: input,
@@ -280,7 +282,7 @@ impl ModelEngine for LlamaEngine {
                 body["temperature"] = json!(t);
             }
         }
-        let (status, v) = bedrock_invoke(
+        let (status, mut v) = bedrock_invoke(
             &self.base,
             "/model/meta.llama3-70b-instruct-v1/invoke",
             body,
@@ -292,9 +294,10 @@ impl ModelEngine for LlamaEngine {
         );
         let total = pt.saturating_add(ct);
         let resp = GatewayResponse {
-            message: v["generation"].as_str().unwrap_or_default().to_owned(),
+            message: crate::engine::take_string(&mut v, "/generation").unwrap_or_default(),
             model,
-            finish_reason: v["stop_reason"].as_str().unwrap_or("stop").to_owned(),
+            finish_reason: crate::engine::take_string(&mut v, "/stop_reason")
+                .unwrap_or_else(|| "stop".to_owned()),
             prompt_tokens: pt,
             completion_tokens: ct,
             total_tokens: total,
@@ -404,21 +407,16 @@ impl ModelEngine for DashScopeEngine {
             return self.run_stream().await;
         }
         let body = self.build_body(false)?;
-        let (status, v) = self
+        let (status, mut v) = self
             .base
             .post_json(&self.url(), self.headers(false), body)
             .await?;
-        let choice = &v["output"]["choices"][0];
         let mut resp = GatewayResponse {
-            message: choice["message"]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
+            message: crate::engine::take_string(&mut v, "/output/choices/0/message/content")
+                .unwrap_or_default(),
             model: self.base.model_name()?.to_owned(),
-            finish_reason: choice["finish_reason"]
-                .as_str()
-                .unwrap_or("stop")
-                .to_owned(),
+            finish_reason: crate::engine::take_string(&mut v, "/output/choices/0/finish_reason")
+                .unwrap_or_else(|| "stop".to_owned()),
             ..Default::default()
         };
         dashscope_apply_usage(&v["usage"], &mut resp);

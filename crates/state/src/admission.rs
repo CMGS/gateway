@@ -105,16 +105,16 @@ pub fn swap_to_fallback(
 ) -> FallbackSwap {
     let Some(fb) = cfg
         .find_tenant(tenant)
-        .and_then(|t| t.fallback_model.clone())
+        .and_then(|t| t.fallback_model.as_deref())
     else {
         return FallbackSwap::Unconfigured;
     };
     if fb == param.model_name {
         return FallbackSwap::AlreadyServing;
     }
-    let from = std::mem::replace(&mut param.model_name, fb.clone());
+    let from = std::mem::replace(&mut param.model_name, fb.to_owned());
     param.fallback_from = Some(from.clone());
-    FallbackSwap::Swapped(from, fb)
+    FallbackSwap::Swapped(from, param.model_name.clone())
 }
 
 /// Pooled tenant QPS, when the tenant configures one.

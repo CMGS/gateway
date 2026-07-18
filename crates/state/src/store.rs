@@ -291,7 +291,7 @@ pub struct UserUsageRow {
 }
 
 impl UserUsageRow {
-    fn zero(user_id: String, model: String) -> Self {
+    pub fn zero(user_id: String, model: String) -> Self {
         Self {
             user_id,
             model,
@@ -305,13 +305,23 @@ impl UserUsageRow {
     }
 
     /// Fold `o`'s counters into self (saturating).
-    fn absorb(&mut self, o: &UserUsageRow) {
+    pub fn absorb(&mut self, o: &UserUsageRow) {
         self.requests = self.requests.saturating_add(o.requests);
         self.prompt_tokens = self.prompt_tokens.saturating_add(o.prompt_tokens);
         self.completion_tokens = self.completion_tokens.saturating_add(o.completion_tokens);
         self.total_tokens = self.total_tokens.saturating_add(o.total_tokens);
         self.cost_micros = self.cost_micros.saturating_add(o.cost_micros);
         self.vendor_cost_micros = self.vendor_cost_micros.saturating_add(o.vendor_cost_micros);
+    }
+
+    /// Fold one raw ledger row's counters into self (saturating).
+    fn add_record(&mut self, r: &BillingRecord) {
+        self.requests = self.requests.saturating_add(1);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(r.prompt_tokens);
+        self.completion_tokens = self.completion_tokens.saturating_add(r.completion_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(r.total_tokens);
+        self.cost_micros = self.cost_micros.saturating_add(r.cost_micros);
+        self.vendor_cost_micros = self.vendor_cost_micros.saturating_add(r.vendor_cost_micros);
     }
 
     /// Keep the larger of each counter. A bucket's source rows are append-only
@@ -349,8 +359,8 @@ fn fold_user_usage(
 ) {
     for r in rows {
         map.entry((r.user_id.clone(), r.model.clone()))
-            .or_insert_with(|| UserUsageRow::zero(r.user_id.clone(), r.model.clone()))
-            .absorb(&r);
+            .and_modify(|e| e.absorb(&r))
+            .or_insert(r);
     }
 }
 
@@ -708,7 +718,9 @@ impl Store for MemoryStore {
                     && tenant.is_none_or(|f| f == t)
                     && user.is_none_or(|f| f == u)
                 {
-                    fold_user_usage(&mut map, [row.clone()]);
+                    map.entry((row.user_id.clone(), row.model.clone()))
+                        .and_modify(|e: &mut UserUsageRow| e.absorb(row))
+                        .or_insert_with(|| row.clone());
                 }
             }
             rollup
@@ -759,7 +771,7 @@ impl Store for MemoryStore {
                         r.model.clone(),
                     ))
                     .or_insert_with(|| UserUsageRow::zero(r.user_id.clone(), r.model.clone()))
-                    .absorb(&usage_of(r));
+                    .add_record(r);
             }
         }
         let written = fresh.len() as u64;
@@ -900,15 +912,17 @@ impl Store for MemoryStore {
             "file-local-{}",
             self.seq.fetch_add(1, Ordering::Relaxed) + 1
         );
-        let f = StoredFile {
+        let meta = StoredFile {
             id: id.clone(),
             tenant: tenant.to_owned(),
             bytes: content.len(),
             purpose: purpose.to_owned(),
-            content,
+            content: String::new(),
         };
-        self.files.insert(id, f.clone());
-        Ok(f)
+        let mut stored = meta.clone();
+        stored.content = content;
+        self.files.insert(id, stored);
+        Ok(meta)
     }
 
     async fn file_get(&self, id: &str) -> GResult<Option<StoredFile>> {
@@ -1769,15 +1783,7 @@ impl PostgresStore {
             .connect(url)
             .await
             .map_err(|e| crate::sqlx_err("connect postgres store", e))?;
-        let mut schema = pool
-            .begin()
-            .await
-            .map_err(|e| crate::sqlx_err("begin postgres schema", e))?;
-        sqlx::query(crate::PG_SCHEMA_LOCK_SQL)
-            .execute(&mut *schema)
-            .await
-            .map_err(|e| crate::sqlx_err("lock postgres schema", e))?;
-        for ddl in [
+        let ddls = [
             "CREATE TABLE IF NOT EXISTS billing (
                 n BIGSERIAL PRIMARY KEY,
                 ak TEXT NOT NULL, product TEXT NOT NULL,
@@ -1858,16 +1864,8 @@ impl PostgresStore {
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS created_at_epoch_secs BIGINT NOT NULL DEFAULT 0",
             "ALTER TABLE billing ADD COLUMN IF NOT EXISTS estimated BOOLEAN NOT NULL DEFAULT FALSE",
-        ] {
-            sqlx::query(ddl)
-                .execute(&mut *schema)
-                .await
-                .map_err(|e| crate::sqlx_err("create postgres schema", e))?;
-        }
-        schema
-            .commit()
-            .await
-            .map_err(|e| crate::sqlx_err("commit postgres schema", e))?;
+        ];
+        crate::setup_schema(&pool, "postgres", &ddls).await?;
         Ok(Self {
             pool,
             ledger_max_rows,

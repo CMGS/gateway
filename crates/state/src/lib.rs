@@ -34,8 +34,7 @@ pub use store::*;
 
 const CACHE_MAX_ENTRIES: u64 = 10_000;
 /// Postgres `IF NOT EXISTS` DDL can still race in `pg_class` when replicas
-/// bootstrap together. One transaction-scoped lock serializes gateway schema
-/// setup while leaving normal reads and writes untouched.
+/// bootstrap together; one transaction-scoped lock serializes schema setup.
 const PG_SCHEMA_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtext('cocoon_gateway_schema'))";
 /// A failure streak idle this long restarts on the next failure — mirrors the
 /// Redis health backend's failure-key TTL so both backends trip identically.
@@ -89,10 +88,12 @@ impl AkInfo {
     /// else the caller-supplied `fallback` (request metadata / the realtime
     /// `x-gw-user` hint). The one resolution every surface shares.
     pub fn attributed_user<'a>(&'a self, fallback: &'a str) -> &'a str {
-        self.owner
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(fallback)
+        self.owner_override().unwrap_or(fallback)
+    }
+
+    /// The non-empty `owner` identity when this key overrides attribution.
+    pub fn owner_override(&self) -> Option<&str> {
+        self.owner.as_deref().filter(|s| !s.is_empty())
     }
 
     /// Apply a partial quota/lifecycle patch.
@@ -149,7 +150,8 @@ pub struct KeyPatch {
 }
 
 /// Key lifecycle state: expired and banned keys authenticate to distinct 403s.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum KeyStatus {
     Active,
     Banned,
@@ -416,15 +418,15 @@ impl AccountPool {
             .collect();
         let checks =
             futures::future::join_all(candidates.iter().map(|a| health.available(&a.name))).await;
-        let mut all_excluded = excluded.to_vec();
-        all_excluded.extend(
-            candidates
-                .iter()
-                .zip(checks)
-                .filter(|(_, ok)| !ok)
-                .map(|(a, _)| a.name.clone()),
-        );
-        self.select_excluding(p, provider, &all_excluded)
+        let unhealthy: Vec<&str> = candidates
+            .iter()
+            .zip(checks)
+            .filter(|(_, ok)| !ok)
+            .map(|(a, _)| a.name.as_str())
+            .collect();
+        self.select_with(p, provider, |name| {
+            excluded.iter().any(|e| e == name) || unhealthy.contains(&name)
+        })
     }
 
     /// PTU accounts are preferred over paygo; `excluded` (failed-over) accounts
@@ -436,12 +438,29 @@ impl AccountPool {
         provider: Option<&str>,
         excluded: &[String],
     ) -> Option<Arc<Account>> {
+        self.select_with(p, provider, |name| excluded.iter().any(|e| e == name))
+    }
+
+    pub fn len(&self) -> usize {
+        self.accounts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+    }
+
+    fn select_with(
+        &self,
+        p: Protocol,
+        provider: Option<&str>,
+        is_excluded: impl Fn(&str) -> bool,
+    ) -> Option<Arc<Account>> {
         let candidates: Vec<&Arc<Account>> = self
             .accounts
             .iter()
             .filter(|a| {
                 a.protocols.contains(&p)
-                    && !excluded.contains(&a.name)
+                    && !is_excluded(&a.name)
                     && provider.is_none_or(|want| a.provider == want)
             })
             .collect();
@@ -458,14 +477,6 @@ impl AccountPool {
             .collect();
         let idx = self.rr.fetch_add(1, Ordering::Relaxed) % top.len();
         Some(Arc::clone(top[idx]))
-    }
-
-    pub fn len(&self) -> usize {
-        self.accounts.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.accounts.is_empty()
     }
 }
 
@@ -531,7 +542,7 @@ impl AccountHealth {
         threshold: usize,
         cooldown: std::time::Duration,
     ) -> bool {
-        let mut e = self.entries.entry(name.to_owned()).or_default();
+        let mut e = slot_mut(&self.entries, name, Default::default);
         if e.last_failure.is_some_and(|at| at.elapsed() >= FAILS_DECAY) {
             e.consecutive_failures = 0;
         }
@@ -903,6 +914,30 @@ fn settle_on(counter: &mut i64, delta: i64) {
 /// Wrap a sqlx error as an internal gateway error with context.
 pub(crate) fn sqlx_err(what: &str, e: sqlx::Error) -> gw_models::GatewayError {
     gw_models::GatewayError::internal(what).with_source(e)
+}
+
+pub(crate) async fn setup_schema(
+    pool: &sqlx::PgPool,
+    what: &str,
+    ddls: &[&'static str],
+) -> gw_models::GResult<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| sqlx_err(&format!("begin {what} schema"), e))?;
+    sqlx::query(PG_SCHEMA_LOCK_SQL)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| sqlx_err(&format!("lock {what} schema"), e))?;
+    for ddl in ddls.iter().copied() {
+        sqlx::query(ddl)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| sqlx_err(&format!("create {what} schema"), e))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| sqlx_err(&format!("commit {what} schema"), e))
 }
 
 /// Open a Redis connection manager (the governance/health/cache backends).

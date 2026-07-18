@@ -70,6 +70,16 @@ pub fn tok(v: &Value) -> i64 {
     v.as_i64().unwrap_or(0).max(0)
 }
 
+/// Move the string at `ptr` (JSON Pointer) out of `v`; `None` when the path is
+/// absent or not a string. `pointer_mut`, not `IndexMut` — indexing a hostile
+/// non-object reply would panic.
+pub fn take_string(v: &mut Value, ptr: &str) -> Option<String> {
+    match v.pointer_mut(ptr).map(Value::take) {
+        Some(Value::String(s)) => Some(s),
+        _ => None,
+    }
+}
+
 /// Detect a vendor error and turn it into a `GatewayError`. Covers the
 /// enveloped shapes (OpenAI `{"error":{…}}`, MiniMax `{"type":"error",…}`) at
 /// any status, plus — because some vendors (Bedrock, DashScope native) answer
