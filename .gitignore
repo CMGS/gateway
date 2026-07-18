@@ -1,4 +1,6 @@
 /target
+/dist-gw
+/dist-web
 /control-plane/web/node_modules
 /control-plane/web/dist
 /control-plane/web/playwright-report

@@ -1,0 +1,45 @@
+version: 2
+
+project_name: gateway
+
+before:
+  hooks:
+    - go mod download -C control-plane
+
+builds:
+  - id: control-plane
+    dir: control-plane
+    main: ./cmd/control-plane
+    binary: control-plane
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: control-plane
+    ids:
+      - control-plane
+    name_template: 'control-plane_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^review:'
+
+release:
+  extra_files:
+    - glob: dist-gw/*.tar.gz
+    - glob: dist-web/*.tar.gz

@@ -9,18 +9,18 @@ make lint        # cargo clippy --workspace --all-targets -- -D warnings
 make fmt         # cargo fmt --all
 make deny        # cargo deny check (advisories + licenses)
 make release     # optimized gw-server binary (--locked)
-make dist        # cross-platform release artifacts (mirrors CI)
 make docker      # build the container image
 make run         # cargo run -p gw-server
 ```
 
-CI runs fmt/clippy/test and `cargo deny` on every push to `main` and every pull request. Releases are cut by
-[dist](https://opensource.axo.dev/cargo-dist/) on a `v*` tag — it
-cross-compiles the binaries, generates the install script and checksums, and
-publishes the GitHub release (`.github/workflows/release.yml` is generated;
-edit `dist-workspace.toml` and run `dist generate`). The container image is
-built separately on tags (`.github/workflows/docker.yml`). Edition 2024; the
-workspace denies `unwrap`/`expect`/undocumented `unsafe` outside tests.
+CI runs fmt/clippy/test and `cargo deny` on every push to `main` and every pull request. A `v*` tag cuts one
+GitHub release (`.github/workflows/release.yml`): native runners build `gw`
+for linux/darwin × amd64/arm64, goreleaser builds the `control-plane` binaries
+and the web-asset tarball, attaches everything, and generates the changelog.
+Bump the workspace version in `Cargo.toml` before tagging. Multi-arch container
+images for both components go to ghcr on the same tag
+(`.github/workflows/docker.yml`). Edition 2024; the workspace denies
+`unwrap`/`expect`/undocumented `unsafe` outside tests.
 
 ## Workspace layout
 

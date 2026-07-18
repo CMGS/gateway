@@ -1,6 +1,6 @@
 BIN := gw
 
-.PHONY: all build release test lint fmt fmt-check deny dist dist-plan docker run clean control-plane control-plane-test control-plane-integration
+.PHONY: all build release test lint fmt fmt-check deny docker run clean control-plane control-plane-test control-plane-integration
 
 all: fmt lint test build
 
@@ -24,13 +24,6 @@ fmt-check:
 
 deny:
 	cargo deny check
-
-# dist owns releases (v* tags in CI); these mirror it locally.
-dist-plan:
-	dist plan
-
-dist:
-	dist build
 
 docker:
 	docker build -t gateway .
