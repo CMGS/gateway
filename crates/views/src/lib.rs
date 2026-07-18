@@ -219,26 +219,51 @@ async fn realtime_ws(
             format!("model `{model}` is not entitled for tenant `{}`", ak.tenant),
         );
     }
+    // client attribution hint captured at connect (no per-turn body user field)
+    let hint = user_header(&headers).unwrap_or_default();
+    // variant split pins for the whole session, sticky by the attributed user
+    // (per-connection spread when anonymous) — the REST semantics, one level up
+    let served = match model_conf {
+        Some(conf) if !conf.variants.is_empty() => {
+            let sticky = ak.attributed_user(&hint);
+            let key = if sticky.is_empty() {
+                gw_handler::new_request_id()
+            } else {
+                sticky.to_owned()
+            };
+            gw_config::pick_variant(&conf.variants, &key).model.clone()
+        }
+        _ => model.clone(),
+    };
+    let served_conf = if served == model {
+        model_conf
+    } else {
+        snap.cfg.find_model(&served)
+    };
     let account = snap
         .state
         .pool
         .select_healthy(
             mt,
-            model_conf.and_then(|m| m.provider.as_deref()),
+            served_conf.and_then(|m| m.provider.as_deref()),
             &[],
             snap.state.health.as_ref(),
         )
         .await;
     let Some(account) = account else {
+        // an exhausted pool is a client-visible failure of the public name
+        snap.state.avail.record(&model, false);
         return error_response(503, format!("no healthy upstream account serves `{model}`"));
+    };
+    let m = RtModel {
+        requested: model,
+        served,
     };
     // select "realtime" so subprotocol-offering clients get a valid handshake
     let ws = ws.protocols(["realtime"]);
-    // client attribution hint captured at connect (no per-turn body user field)
-    let hint = user_header(&headers).unwrap_or_default();
     if account.endpoint.is_empty() {
         ws.on_upgrade(move |socket| {
-            realtime_session(socket, s, ak, model, mt, account.name.clone(), hint)
+            realtime_session(socket, s, ak, m, mt, account.name.clone(), hint)
         })
     } else if gw_engines::realtime::is_gemini_realtime(&account.provider) {
         // no pre-generation gate signal in this dialect — refuse rather than bill after the fact
@@ -250,8 +275,18 @@ async fn realtime_ws(
             ),
         )
     } else {
-        ws.on_upgrade(move |socket| realtime_bridge(socket, s, ak, model, mt, account, hint))
+        ws.on_upgrade(move |socket| realtime_bridge(socket, s, ak, m, mt, account, hint))
     }
+}
+
+/// A realtime session's model identity: the public name the client asked for
+/// and the variant actually served (equal without a split). Entitlement and
+/// the per-(AK, model) counter judge `requested`; capacity (QPM), pricing,
+/// the upstream URL, and availability's success/error samples follow the REST
+/// semantics — samples attribute to `requested`.
+struct RtModel {
+    requested: String,
+    served: String,
 }
 
 /// A turn admitted by [`realtime_gate`]: the freshly re-authenticated key,
@@ -294,7 +329,7 @@ impl RealtimeAdmit {
 async fn realtime_gate(
     s: &AppState,
     ak: &AkInfo,
-    model: &str,
+    m: &RtModel,
     hint: &str,
 ) -> Result<RealtimeAdmit, String> {
     let snap = s.handler.config.load();
@@ -305,24 +340,24 @@ async fn realtime_gate(
         }
         _ => return Err(format!("access key {} is no longer valid", ak.ak)),
     };
-    if !cfg.tenant_allows_model(&ak.tenant, model) {
+    if !cfg.tenant_allows_model(&ak.tenant, &m.requested) {
         return Err(format!(
-            "model `{model}` is not entitled for tenant `{}`",
-            ak.tenant
+            "model `{}` is not entitled for tenant `{}`",
+            m.requested, ak.tenant
         ));
     }
     let gov = state.governance.as_ref();
     admission::check_tenant_rate(gov, cfg, &ak.tenant).await?;
     admission::check_ak_rate(gov, &ak).await?;
     admission::check_product_qpm(gov, cfg, &ak.product).await?;
-    admission::check_model_qpm(gov, cfg, model).await?;
+    admission::check_model_qpm(gov, cfg, &m.served).await?;
     admission::check_user_budget(gov, cfg, &ak.tenant, ak.attributed_user(hint)).await?;
-    if let Some(limit) = admission::model_quota_limit(cfg, &ak, model)
+    if let Some(limit) = admission::model_quota_limit(cfg, &ak, &m.requested)
         && !gov
-            .quota_check(&admission::model_quota_key(&ak.ak, model), limit)
+            .quota_check(&admission::model_quota_key(&ak.ak, &m.requested), limit)
             .await
     {
-        return Err(format!("model quota exhausted for `{model}`"));
+        return Err(format!("model quota exhausted for `{}`", m.requested));
     }
     let at = gw_state::epoch_secs();
     admission::reserve_daily(gov, &ak, REALTIME_TURN_RESERVE, at).await?;
@@ -350,7 +385,7 @@ async fn realtime_gate(
 /// frame (cancelled/empty turn) refunds the reserves and writes nothing.
 async fn bill_realtime_turn(
     admit: &RealtimeAdmit,
-    model: &str,
+    m: &RtModel,
     mt: gw_consts::Protocol,
     account: &str,
     it: i64,
@@ -365,11 +400,11 @@ async fn bill_realtime_turn(
     }
     let (cfg, state) = (&admit.snap.cfg, &admit.snap.state);
     // pipeline parity: the same shared weighting the DAG estimate paths use
-    let rate = gw_state::model_token_rate(cfg, model);
+    let rate = gw_state::model_token_rate(cfg, &m.served);
     let (bp, bc) = gw_models::weighted_pair(it, ot, &rate);
     let total = gw_state::clamp_tokens(bp.saturating_add(bc));
-    let model_quota_key = admission::model_quota_limit(cfg, ak, model)
-        .map(|_| admission::model_quota_key(&ak.ak, model));
+    let model_quota_key = admission::model_quota_limit(cfg, ak, &m.requested)
+        .map(|_| admission::model_quota_key(&ak.ak, &m.requested));
     admission::settle_and_bill(
         state.governance.as_ref(),
         state.store.as_ref(),
@@ -381,8 +416,8 @@ async fn bill_realtime_turn(
                 tenant: &ak.tenant,
                 user_id: admit.user.as_str(),
                 request_id: &admit.request_id,
-                requested_model: model,
-                served_model: model,
+                requested_model: &m.requested,
+                served_model: &m.served,
                 protocol: mt.as_str(),
                 account,
                 prompt: it,
@@ -408,6 +443,7 @@ async fn bill_realtime_turn(
         total,
     )
     .await;
+    state.avail.record(&m.requested, true);
     metrics::counter!("gateway_tokens_total", "kind" => "prompt").increment(it as u64);
     metrics::counter!("gateway_tokens_total", "kind" => "completion").increment(ot as u64);
 }
@@ -417,7 +453,7 @@ async fn realtime_session(
     mut socket: axum::extract::ws::WebSocket,
     s: AppState,
     ak: AkInfo,
-    model: String,
+    rtm: RtModel,
     mt: gw_consts::Protocol,
     account: String,
     hint: String,
@@ -427,7 +463,7 @@ async fn realtime_session(
 
     let _ = socket
         .send(send(json!({"type":"session.created",
-            "session":{"model": model, "account": account}})))
+            "session":{"model": rtm.requested, "account": account}})))
         .await;
 
     while let Some(Ok(msg)) = socket.recv().await {
@@ -450,7 +486,7 @@ async fn realtime_session(
         }
         match ev["type"].as_str().unwrap_or_default() {
             "input_text" => {
-                let admit = match realtime_gate(&s, &ak, &model, &hint).await {
+                let admit = match realtime_gate(&s, &ak, &rtm, &hint).await {
                     Ok(a) => a,
                     Err(denied) => {
                         let _ = socket
@@ -460,7 +496,7 @@ async fn realtime_session(
                     }
                 };
                 let input = ev["text"].as_str().unwrap_or_default().to_owned();
-                let reply = format!("[mock-realtime:{model}] you said: {input}");
+                let reply = format!("[mock-realtime:{}] you said: {input}", rtm.served);
                 let (it, ot) = (
                     (input.len() as i64 / 4).max(1) + 3,
                     (reply.len() as i64 / 4).max(1),
@@ -480,7 +516,7 @@ async fn realtime_session(
                     .send(send(json!({"type":"response.done",
                         "usage":{"input_tokens": it, "output_tokens": ot}})))
                     .await;
-                bill_realtime_turn(&admit, &model, mt, &account, it, ot).await;
+                bill_realtime_turn(&admit, &rtm, mt, &account, it, ot).await;
             }
             "session.close" => {
                 let _ = socket.send(send(json!({"type":"session.closed"}))).await;
@@ -531,7 +567,7 @@ async fn realtime_bridge(
     mut client: axum::extract::ws::WebSocket,
     s: AppState,
     ak: AkInfo,
-    model: String,
+    rtm: RtModel,
     mt: gw_consts::Protocol,
     account: Arc<gw_models::Account>,
     hint: String,
@@ -547,10 +583,11 @@ async fn realtime_bridge(
     let ws_base = base
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
-    let url = format!("{ws_base}/v1/realtime?model={model}");
+    let url = format!("{ws_base}/v1/realtime?model={}", rtm.served);
     let mut req = match url.into_client_request() {
         Ok(r) => r,
         Err(e) => {
+            s.handler.state().avail.record(&rtm.requested, false);
             let _ = client
                 .send(CMsg::Text(
                     send_err(format!("bad upstream url: {e}"))
@@ -568,6 +605,7 @@ async fn realtime_bridge(
     let upstream = match tokio_tungstenite::connect_async(req).await {
         Ok((u, _)) => u,
         Err(e) => {
+            s.handler.state().avail.record(&rtm.requested, false);
             let _ = client
                 .send(CMsg::Text(
                     send_err(format!("upstream realtime connect failed: {e}"))
@@ -626,7 +664,7 @@ async fn realtime_bridge(
                     // upstream rejects the duplicate, and a raced accept is
                     // caught by the response.created gate below
                     if is_response_create(&frame) && pending.is_none() {
-                        match realtime_gate(&s, &ak, &model, &hint).await {
+                        match realtime_gate(&s, &ak, &rtm, &hint).await {
                             Ok(admit) => {
                                 pending = Some(admit);
                                 generations += 1;
@@ -659,7 +697,12 @@ async fn realtime_bridge(
                     Some(Ok(UMsg::Binary(b))) => {
                         (serde_json::from_slice::<Value>(&b).ok(), false, None, Some(b))
                     }
-                    Some(Ok(UMsg::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Err(_)) => {
+                        // upstream died mid-session — a client-visible model error
+                        s.handler.state().avail.record(&rtm.requested, false);
+                        break;
+                    }
+                    Some(Ok(UMsg::Close(_))) | None => break,
                     Some(Ok(_)) => continue, // ping/pong handled by the ws stacks
                 };
                 let mut relay = true;
@@ -676,7 +719,7 @@ async fn realtime_bridge(
                         // server-VAD: OpenAI auto-starts a turn with no client
                         // response.create — gate it here like a manual one
                         else if realtime_turn_started(&account.provider, &v) && pending.is_none() {
-                            match realtime_gate(&s, &ak, &model, &hint).await {
+                            match realtime_gate(&s, &ak, &rtm, &hint).await {
                                 Ok(admit) => pending = Some(admit),
                                 Err(denied) => {
                                     let _ = up_tx
@@ -694,7 +737,7 @@ async fn realtime_bridge(
                             // a boundary with no gated turn bills unreserved
                             match pending.take() {
                                 Some(a) => {
-                                    bill_realtime_turn(&a, &model, mt, &account.name, it, ot).await
+                                    bill_realtime_turn(&a, &rtm, mt, &account.name, it, ot).await
                                 }
                                 None if it.saturating_add(ot) > 0 => {
                                     // re-authenticate so billing uses the key's current
@@ -718,7 +761,7 @@ async fn realtime_bridge(
                                     };
                                     bill_realtime_turn(
                                         &unreserved,
-                                        &model,
+                                        &rtm,
                                         mt,
                                         &account.name,
                                         it,
@@ -779,7 +822,7 @@ async fn realtime_bridge(
     if generations > 0 && recognized == 0 {
         tracing::warn!(
             account = %account.name,
-            model = %model,
+            model = %rtm.requested,
             generations,
             "realtime bridge relayed generations but saw no usage frame — vendor dialect not recognized?"
         );
@@ -1543,21 +1586,18 @@ async fn admin_key_list(
 }
 
 /// GET /admin/models/status — per-model availability over the configured
-/// window, judged from minute-bucketed success/error counts. A tenant admin
-/// sees only its entitled models. Realtime models are excluded: never
-/// sampled, listing them would read as a permanent no_data.
+/// window, judged from minute-bucketed success/error counts (REST terminal
+/// outcomes; realtime samples per billed turn and on session-fatal upstream
+/// errors). A tenant admin sees only its entitled models.
 async fn admin_models_status(State(s): State<AppState>, scope: AdminScope) -> Response {
     let cfg = s.handler.cfg();
     let st = &cfg.stability;
     let until = gw_state::epoch_secs() / 60;
     let since = until - (st.availability_window_minutes - 1);
     let state = s.handler.state();
-    let entitled = cfg.models.iter().filter(|m| {
-        m.protocol() != Some(gw_consts::Protocol::Realtime)
-            && match &scope {
-                AdminScope::Tenant(t) => cfg.tenant_allows_model(t, &m.name),
-                AdminScope::Global => true,
-            }
+    let entitled = cfg.models.iter().filter(|m| match &scope {
+        AdminScope::Tenant(t) => cfg.tenant_allows_model(t, &m.name),
+        AdminScope::Global => true,
     });
     let avail = &state.avail;
     let counts = futures::future::join_all(
@@ -3233,6 +3273,13 @@ mod tests {
         ))
     }
 
+    fn rt(name: &str) -> RtModel {
+        RtModel {
+            requested: name.to_owned(),
+            served: name.to_owned(),
+        }
+    }
+
     async fn body_json(resp: Response) -> Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -3451,10 +3498,11 @@ mod tests {
         assert_eq!(of("m-ok")["requests"], 4);
         assert_eq!(of("m-bad")["state"], "unavailable");
         assert_eq!(of("m-bad")["errors"], 4);
-        assert!(
-            !rows.iter().any(|r| r["model"] == "rt-m"),
-            "realtime models are not listed (never sampled)"
-        );
+        let rt_row = rows
+            .iter()
+            .find(|r| r["model"] == "rt-m")
+            .expect("realtime models are listed (turn-sampled)");
+        assert_eq!(rt_row["state"], "no_data", "no turns billed yet");
 
         let resp = router.clone().oneshot(status("t1-tok")).await.unwrap();
         let j = body_json(resp).await;
@@ -3832,21 +3880,43 @@ mod tests {
         let gov = || s.handler.state().governance.clone();
         let used = || async { gov().quota_used(&ak.ak).await };
 
-        let a1 = realtime_gate(&s, &ak, "gpt-4o", "").await.expect("admit");
+        let a1 = realtime_gate(&s, &ak, &rt("gpt-4o"), "")
+            .await
+            .expect("admit");
         assert_eq!(used().await, REALTIME_TURN_RESERVE, "reserved up front");
 
-        bill_realtime_turn(&a1, "gpt-4o", gw_consts::Protocol::Realtime, "acc", 30, 70).await;
+        bill_realtime_turn(
+            &a1,
+            &rt("gpt-4o"),
+            gw_consts::Protocol::Realtime,
+            "acc",
+            30,
+            70,
+        )
+        .await;
         assert_eq!(used().await, 100, "settled to actual (30 + 70)");
 
-        let a2 = realtime_gate(&s, &ak, "gpt-4o", "").await.expect("admit");
+        let a2 = realtime_gate(&s, &ak, &rt("gpt-4o"), "")
+            .await
+            .expect("admit");
         assert_eq!(used().await, 100 + REALTIME_TURN_RESERVE);
         gov().quota_settle(&a2.ak.ak, -a2.reserved, a2.at).await;
         assert_eq!(used().await, 100, "dropped turn refunded whole");
 
-        let a3 = realtime_gate(&s, &ak, "gpt-4o", "").await.expect("admit");
+        let a3 = realtime_gate(&s, &ak, &rt("gpt-4o"), "")
+            .await
+            .expect("admit");
         assert_eq!(used().await, 100 + REALTIME_TURN_RESERVE);
         let ledger_before = s.handler.state().store.ledger_snapshot(1).await.unwrap().0;
-        bill_realtime_turn(&a3, "gpt-4o", gw_consts::Protocol::Realtime, "acc", 0, 0).await;
+        bill_realtime_turn(
+            &a3,
+            &rt("gpt-4o"),
+            gw_consts::Protocol::Realtime,
+            "acc",
+            0,
+            0,
+        )
+        .await;
         assert_eq!(used().await, 100, "zero-usage turn refunds its reserve");
         let ledger_after = s.handler.state().store.ledger_snapshot(1).await.unwrap().0;
         assert_eq!(
@@ -3862,8 +3932,18 @@ mod tests {
         let state = Arc::new(GatewayState::from_config(&cfg));
         let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
         let ak = s.handler.state().auth.authenticate("k1").await.unwrap();
-        let a = realtime_gate(&s, &ak, "rt-m", "").await.expect("admit");
-        bill_realtime_turn(&a, "rt-m", gw_consts::Protocol::Realtime, "acc", 100, 100).await;
+        let a = realtime_gate(&s, &ak, &rt("rt-m"), "")
+            .await
+            .expect("admit");
+        bill_realtime_turn(
+            &a,
+            &rt("rt-m"),
+            gw_consts::Protocol::Realtime,
+            "acc",
+            100,
+            100,
+        )
+        .await;
         let (_, ledger) = s
             .handler
             .state()
@@ -3897,14 +3977,14 @@ mod tests {
             .unwrap();
         let gov = s.handler.state().governance.clone();
 
-        let a1 = realtime_gate(&s, &ak, "gpt-4o", "")
+        let a1 = realtime_gate(&s, &ak, &rt("gpt-4o"), "")
             .await
             .expect("first admits");
         assert_eq!(a1.tpm_reserved, Some(REALTIME_TURN_RESERVE));
         let daily_before = gov.quota_used(&ak.ak).await;
 
         assert!(
-            realtime_gate(&s, &ak, "gpt-4o", "").await.is_err(),
+            realtime_gate(&s, &ak, &rt("gpt-4o"), "").await.is_err(),
             "second turn denied by the TPM reserve"
         );
         assert_eq!(
@@ -3926,12 +4006,20 @@ mod tests {
         let s = AppState::new(cfg, state, Arc::new(gw_engines::MockTransport));
         let ak = s.handler.state().auth.authenticate("k-rt").await.unwrap();
 
-        let admit = realtime_gate(&s, &ak, "rt", "").await.expect("admit");
+        let admit = realtime_gate(&s, &ak, &rt("rt"), "").await.expect("admit");
         s.handler
             .reload(GatewayConfig::from_yaml(&price(2_000_000)).unwrap())
             .await
             .unwrap();
-        bill_realtime_turn(&admit, "rt", gw_consts::Protocol::Realtime, "acc", 100, 100).await;
+        bill_realtime_turn(
+            &admit,
+            &rt("rt"),
+            gw_consts::Protocol::Realtime,
+            "acc",
+            100,
+            100,
+        )
+        .await;
 
         let (_, records) = s.handler.state().store.ledger_snapshot(1).await.unwrap();
         assert_eq!(
@@ -3954,11 +4042,19 @@ mod tests {
             .authenticate("k-shared")
             .await
             .unwrap();
-        let admit = realtime_gate(&s, &shared, "rt", "alice")
+        let admit = realtime_gate(&s, &shared, &rt("rt"), "alice")
             .await
             .expect("admit");
         assert_eq!(admit.user, "alice", "ownerless key attributes to the hint");
-        bill_realtime_turn(&admit, "rt", gw_consts::Protocol::Realtime, "acc", 40, 60).await;
+        bill_realtime_turn(
+            &admit,
+            &rt("rt"),
+            gw_consts::Protocol::Realtime,
+            "acc",
+            40,
+            60,
+        )
+        .await;
 
         let owned = s
             .handler
@@ -3967,14 +4063,22 @@ mod tests {
             .authenticate("k-owned")
             .await
             .unwrap();
-        let admit = realtime_gate(&s, &owned, "rt", "mallory")
+        let admit = realtime_gate(&s, &owned, &rt("rt"), "mallory")
             .await
             .expect("admit");
         assert_eq!(
             admit.user, "bob",
             "owner is authoritative over a spoofed hint"
         );
-        bill_realtime_turn(&admit, "rt", gw_consts::Protocol::Realtime, "acc", 10, 20).await;
+        bill_realtime_turn(
+            &admit,
+            &rt("rt"),
+            gw_consts::Protocol::Realtime,
+            "acc",
+            10,
+            20,
+        )
+        .await;
 
         let (_, records) = s.handler.state().store.ledger_snapshot(2).await.unwrap();
         let users: std::collections::HashSet<&str> =

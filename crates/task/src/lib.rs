@@ -144,8 +144,8 @@ pub fn spawn_alert_dispatch(shared: SharedConfig) -> tokio::task::JoinHandle<()>
     })
 }
 
-/// Spawn the availability alert sweep: re-classify every non-realtime model
-/// each period and emit an alert on a state transition.
+/// Spawn the availability alert sweep: re-classify every model each period
+/// and emit an alert on a state transition.
 pub fn spawn_avail_alerts(shared: SharedConfig, period: Duration) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(period);
@@ -168,12 +168,7 @@ async fn avail_alert_sweep(
     let st = &snap.cfg.stability;
     let until = gw_state::epoch_secs() / 60;
     let since = until - (st.availability_window_minutes - 1);
-    let sampled = snap
-        .cfg
-        .models
-        .iter()
-        .filter(|m| m.protocol() != Some(gw_consts::Protocol::Realtime));
-    let counts = futures::future::join_all(sampled.map(|m| async {
+    let counts = futures::future::join_all(snap.cfg.models.iter().map(|m| async {
         (
             &m.name,
             snap.state.avail.window(&m.name, since, until).await,

@@ -177,7 +177,7 @@ impl DagNode for VariantSelect {
             "" => ctx.request.request_id.as_str(),
             user => user,
         };
-        let target = pick_variant(&conf.variants, key).model.clone();
+        let target = gw_config::pick_variant(&conf.variants, key).model.clone();
         if target == param.model_name {
             ctx.decide("variant_select", format!("{target} (self)"));
             return Ok(());
@@ -189,32 +189,6 @@ impl DagNode for VariantSelect {
         ctx.decide("variant_select", decision);
         Ok(())
     }
-}
-
-/// Cumulative-weight pick, keyed by a stable hash so every instance maps the
-/// same key to the same bucket with no shared state.
-fn pick_variant<'a>(
-    variants: &'a [gw_config::VariantConf],
-    key: &str,
-) -> &'a gw_config::VariantConf {
-    let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
-    let mut roll = fnv1a(key) % total.max(1);
-    for v in variants {
-        if roll < u64::from(v.weight) {
-            return v;
-        }
-        roll -= u64::from(v.weight);
-    }
-    // unreachable (weights validated >= 1); quiets the type checker
-    &variants[0]
-}
-
-/// FNV-1a 64: deterministic across processes and releases (std's hasher is
-/// neither), which the fleet-consistent sticky mapping depends on.
-fn fnv1a(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
 }
 
 /// preprocess/cache_lookup: request-level TTL cache. On a hit the outcome is
@@ -924,31 +898,6 @@ mod tests {
         assert_eq!((t.prompt, t.completion), (100, 50));
         assert_eq!((t.billable_prompt, t.billable_completion), (50, 50));
         assert_eq!(t.total(), 100);
-    }
-
-    #[test]
-    fn variant_pick_is_sticky_and_weighted() {
-        let variants = vec![
-            gw_config::VariantConf {
-                model: "a".into(),
-                weight: 9,
-            },
-            gw_config::VariantConf {
-                model: "b".into(),
-                weight: 1,
-            },
-        ];
-        let first = super::pick_variant(&variants, "user-1").model.clone();
-        for _ in 0..10 {
-            assert_eq!(super::pick_variant(&variants, "user-1").model, first);
-        }
-        let hits = (0..1000)
-            .filter(|i| super::pick_variant(&variants, &format!("user-{i}")).model == "b")
-            .count();
-        assert!(
-            (40..250).contains(&hits),
-            "10% weight took {hits}/1000 keys"
-        );
     }
 
     #[test]

@@ -143,6 +143,30 @@ pub struct VariantConf {
     pub weight: u32,
 }
 
+/// Cumulative-weight pick over a model's variants, keyed by a stable hash so
+/// every instance (REST DAG and realtime handshake alike) maps the same key
+/// to the same bucket with no shared state.
+pub fn pick_variant<'a>(variants: &'a [VariantConf], key: &str) -> &'a VariantConf {
+    let total: u64 = variants.iter().map(|v| u64::from(v.weight)).sum();
+    let mut roll = fnv1a(key) % total.max(1);
+    for v in variants {
+        if roll < u64::from(v.weight) {
+            return v;
+        }
+        roll -= u64::from(v.weight);
+    }
+    // unreachable (weights validated >= 1); quiets the type checker
+    &variants[0]
+}
+
+/// FNV-1a 64: deterministic across processes and releases (std's hasher is
+/// neither), which the fleet-consistent sticky mapping depends on.
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// Per-component billing weights relative to the model's unit prices
 /// (e.g. cache reads at 0.1, cache writes at 1.25). Missing fields stay 1.0.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -774,11 +798,6 @@ impl GatewayConfig {
                     variant: v.model.clone(),
                     reason,
                 };
-                // realtime pins its model at handshake, never traversing
-                // VariantSelect — accepting this would silently serve the parent
-                if m.protocol() == Some(Protocol::Realtime) {
-                    return Err(bad("variants are not supported on realtime models"));
-                }
                 if v.weight == 0 {
                     return Err(bad("weight must be >= 1"));
                 }
@@ -1429,11 +1448,30 @@ tenants: [{name: t1}, {name: t1}]
 
         let rt = "listen: {host: h, port: 1}\nmodels: [{name: r1, protocol: realtime, variants: [{model: r2, weight: 1}]}, {name: r2, protocol: realtime}]";
         assert!(
-            matches!(
-                GatewayConfig::from_yaml(rt),
-                Err(ConfigError::BadVariant { .. })
-            ),
-            "realtime variants are rejected at load"
+            GatewayConfig::from_yaml(rt).is_ok(),
+            "realtime variants pick at the session handshake"
+        );
+
+        let variants = [
+            VariantConf {
+                model: "a".into(),
+                weight: 9,
+            },
+            VariantConf {
+                model: "b".into(),
+                weight: 1,
+            },
+        ];
+        let first = pick_variant(&variants, "user-1").model.clone();
+        for _ in 0..10 {
+            assert_eq!(pick_variant(&variants, "user-1").model, first, "sticky");
+        }
+        let hits = (0..1000)
+            .filter(|i| pick_variant(&variants, &format!("user-{i}")).model == "b")
+            .count();
+        assert!(
+            (40..250).contains(&hits),
+            "10% weight took {hits}/1000 keys"
         );
 
         for bad in [

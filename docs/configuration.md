@@ -115,10 +115,11 @@ models:
 `token_rate` weights scale cost and quota consumption per token component; the
 ledger's prompt/completion columns stay vendor-reported, while `total_tokens`
 is the weighted platform total. `variants` splits a public name across other
-declared same-protocol models (one level, no realtime): entitlement and the
-per-(AK, model) daily counter judge the public name, billing prices the served
-variant, and the response echoes the requested name. Selection hashes the
-effective user, so a user sticks to one backend across the fleet.
+declared same-protocol models (one level): entitlement and the per-(AK, model)
+daily counter judge the public name, billing prices the served variant, and
+the response echoes the requested name. Selection hashes the effective user,
+so a user sticks to one backend across the fleet; a realtime session picks
+its variant once at the handshake and pins it for the whole session.
 
 ### `providers` — first-class provider presets
 
