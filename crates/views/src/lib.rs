@@ -1072,6 +1072,12 @@ impl AdminScope {
             AdminScope::Global => q.get("tenant").map(String::as_str),
         }
     }
+
+    /// Platform vendor cost (margin basis) is operator-only; a tenant admin
+    /// sees its own charge. Every usage read applies this before serializing.
+    fn sees_vendor_cost(&self) -> bool {
+        matches!(self, AdminScope::Global)
+    }
 }
 
 impl axum::extract::FromRequestParts<AppState> for AdminScope {
@@ -1825,10 +1831,15 @@ async fn admin_usage(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let filter = scope.tenant_filter(&q);
-    let usage = match s.handler.state().store.ledger_usage(filter).await {
+    let mut usage = match s.handler.state().store.ledger_usage(filter).await {
         Ok(rows) => rows,
         Err(e) => return gateway_error(e),
     };
+    if !scope.sees_vendor_cost() {
+        for u in &mut usage {
+            u.vendor_cost_micros = 0;
+        }
+    }
     Json(json!({ "usage": usage })).into_response()
 }
 
@@ -1853,8 +1864,7 @@ async fn admin_usage_users(
         Ok(rows) => rows,
         Err(e) => return gateway_error(e),
     };
-    // platform vendor cost (margin basis) is operator-only; a tenant admin sees its own charge
-    if matches!(scope, AdminScope::Tenant(_)) {
+    if !scope.sees_vendor_cost() {
         for u in &mut usage {
             u.vendor_cost_micros = 0;
         }
@@ -1921,8 +1931,7 @@ async fn admin_usage_series(
         Ok(rows) => rows.into_iter().collect(),
         Err(e) => return gateway_error(e),
     };
-    // platform vendor cost (margin basis) is operator-only; a tenant admin sees its own charge
-    let redact_vendor = matches!(scope, AdminScope::Tenant(_));
+    let redact_vendor = !scope.sees_vendor_cost();
     let mut series = Vec::with_capacity(points as usize);
     for idx in 0..points {
         let start = first.saturating_add(idx * bucket_secs);
@@ -3848,6 +3857,24 @@ mod tests {
         let resp = router
             .clone()
             .oneshot(get("/admin/usage/users?since=0&until=10000", "root-token"))
+            .await
+            .unwrap();
+        let usage = body_json(resp).await;
+        assert_eq!(usage["usage"][0]["vendor_cost_micros"], 25);
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/usage", "acme-token"))
+            .await
+            .unwrap();
+        let usage = body_json(resp).await;
+        assert_eq!(usage["usage"][0]["cost_micros"], 40);
+        assert_eq!(
+            usage["usage"][0]["vendor_cost_micros"], 0,
+            "ledger rollup redacts vendor cost under a tenant scope too"
+        );
+        let resp = router
+            .clone()
+            .oneshot(get("/admin/usage", "root-token"))
             .await
             .unwrap();
         let usage = body_json(resp).await;

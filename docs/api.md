@@ -151,7 +151,7 @@ regardless.
 | POST | `/admin/keys` | create/replace a key: `{ak, product, tenant?, owner?, qps, daily_token_quota, tokens_per_minute?, expires_at_epoch_secs?, banned?, model_quotas?}` (`owner` binds the key to one end user — authoritative for attribution) |
 | PATCH | `/admin/keys/{ak}` | update any of `qps` / `daily_token_quota` / `tokens_per_minute` / `expires_at_epoch_secs` (null clears) / `banned` / `suspended_until_epoch_secs` (null lifts an abuse suspension early) |
 | DELETE | `/admin/keys/{ak}` | revoke a key |
-| GET | `/admin/usage` | ledger rollup by tenant × model (requests, tokens, charged `cost_micros`, `vendor_cost_micros` for margin); `?tenant=` filter for the global token |
+| GET | `/admin/usage` | ledger rollup by tenant × model (requests, tokens, charged `cost_micros`, `vendor_cost_micros` for margin); `?tenant=` filter for the global token; tenant-scoped — a tenant token reads `vendor_cost_micros` as 0 |
 | GET | `/admin/usage/users` | per-user cost rollup (user × model) over a billing period: `?since=&until=` (unix secs), `?user=` filter, `?format=csv` export; tenant-scoped — a tenant token reads `vendor_cost_micros` as 0 (operator-only margin basis) |
 | GET | `/admin/usage/series` | bounded dashboard series: `?bucket=hour|day&since=&until=&user=`; tenant-scoped (vendor cost redacted like `/admin/usage/users`), maximum 400 points |
 | GET | `/admin/models/status` | per-model availability over the recent window (`available` / `unstable` / `unavailable` / `no_data`), judged from client-visible outcomes against `stability.*` thresholds; attributes to the requested public name under a `variants` split; realtime models sample per billed turn and on session-fatal upstream errors; tenant-scoped |
