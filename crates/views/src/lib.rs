@@ -2911,10 +2911,6 @@ async fn run_family(
     }
 }
 
-/// The engine's native payload, or a 500 naming the engine that returned none.
-/// A pre-stage content block answers 400 with the block message — these
-/// surfaces have no in-band content_filter shape, and falling through would
-/// misreport the block as an engine failure.
 /// An `input`-style field that may be a string or an array of strings
 /// (the OpenAI embeddings/moderations shape).
 fn string_or_string_array(v: Option<Value>) -> Vec<String> {
@@ -2931,6 +2927,10 @@ fn string_or_string_array(v: Option<Value>) -> Vec<String> {
     }
 }
 
+/// The engine's native payload, or a 500 naming the engine that returned none.
+/// A pre-stage content block answers 400 with the block message — these
+/// surfaces have no in-band content_filter shape, and falling through would
+/// misreport the block as an engine failure.
 fn response_v2_or_500(outcome: Option<gw_engines::EngineOutcome>, engine: &str) -> Response {
     match outcome {
         Some(o) if o.block.block => error_response(400, o.response.message),

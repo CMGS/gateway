@@ -268,11 +268,10 @@ impl OnlineHandler {
         Ok(ctx)
     }
 
-    /// Run the wired moderator over raw text; `Some(reason)` to deny, `None` to
-    /// allow. The seam the realtime surface uses (it has no `DagContext`); the
-    /// caller records the security event on its own surface.
-    /// [`Self::moderation`] narrowed to the realtime surface: a live session
-    /// can't switch models, so `Degrade` denies there.
+    /// Run the wired moderator over raw text; the seam the realtime surface
+    /// uses (it has no `DagContext`), so the caller records the security event
+    /// on its own surface. [`Self::moderation`] narrowed to this surface: a
+    /// live session can't switch models, so `Degrade` denies here instead.
     pub async fn moderate_rt(&self, sec: &gw_config::SecurityConf, text: &str) -> RtModeration {
         match self.moderation(sec, text).await {
             Moderation::Allow => RtModeration::Allow,

@@ -754,7 +754,6 @@ impl GatewayConfig {
                 protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
             });
         }
-        // normalize the global policy and every tenant override once at load
         compile_security(&mut self.security);
         for t in &mut self.tenants {
             if let Some(sec) = t.security.as_mut() {
