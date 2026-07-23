@@ -268,11 +268,10 @@ impl OnlineHandler {
         Ok(ctx)
     }
 
-    /// Run the wired moderator over raw text; `Some(reason)` to deny, `None` to
-    /// allow. The seam the realtime surface uses (it has no `DagContext`); the
-    /// caller records the security event on its own surface.
-    /// [`Self::moderation`] narrowed to the realtime surface: a live session
-    /// can't switch models, so `Degrade` denies there.
+    /// Run the wired moderator over raw text; the seam the realtime surface
+    /// uses (it has no `DagContext`), so the caller records the security event
+    /// on its own surface. [`Self::moderation`] narrowed to this surface: a
+    /// live session can't switch models, so `Degrade` denies here instead.
     pub async fn moderate_rt(&self, sec: &gw_config::SecurityConf, text: &str) -> RtModeration {
         match self.moderation(sec, text).await {
             Moderation::Allow => RtModeration::Allow,
@@ -349,10 +348,7 @@ pub enum RtModeration {
 /// A per-request correlation id: `req-<epoch_ms>-<seq>`, time-sortable and
 /// unique within the process (the seq disambiguates same-millisecond requests).
 pub fn new_request_id() -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let ms = gw_state::epoch_millis();
     format!("req-{ms}-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 

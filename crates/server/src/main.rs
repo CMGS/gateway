@@ -223,18 +223,18 @@ fn select_transport() -> anyhow::Result<gw_engines::SharedTransport> {
     Ok(match env::var("GW_TRANSPORT").as_deref() {
         Ok("mock") => {
             tracing::info!("transport = mock (zero egress)");
-            std::sync::Arc::new(gw_engines::MockTransport)
+            Arc::new(gw_engines::MockTransport)
         }
         Ok("http") => {
             tracing::info!("transport = http (accounts without an endpoint fail)");
-            std::sync::Arc::new(gw_engines::http_transport::HttpTransport::with_policies(
+            Arc::new(gw_engines::http_transport::HttpTransport::with_policies(
                 Default::default(),
                 Default::default(),
             )?)
         }
         _ => {
             tracing::info!("transport = auto (mock:// in-process, real URLs over HTTP)");
-            std::sync::Arc::new(
+            Arc::new(
                 gw_engines::http_transport::DispatchTransport::with_policies(
                     Default::default(),
                     Default::default(),

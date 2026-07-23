@@ -347,6 +347,19 @@ pub struct StabilityConf {
     pub availability_min_samples: u64,
 }
 
+impl Default for StabilityConf {
+    fn default() -> Self {
+        Self {
+            failure_threshold: default_failure_threshold(),
+            cooldown_seconds: default_cooldown_seconds(),
+            availability_window_minutes: default_availability_window_minutes(),
+            unstable_error_rate: default_unstable_error_rate(),
+            unavailable_error_rate: default_unavailable_error_rate(),
+            availability_min_samples: default_availability_min_samples(),
+        }
+    }
+}
+
 fn default_failure_threshold() -> usize {
     3
 }
@@ -364,19 +377,6 @@ fn default_availability_min_samples() -> u64 {
 }
 fn default_cooldown_seconds() -> u64 {
     30
-}
-
-impl Default for StabilityConf {
-    fn default() -> Self {
-        Self {
-            failure_threshold: default_failure_threshold(),
-            cooldown_seconds: default_cooldown_seconds(),
-            availability_window_minutes: default_availability_window_minutes(),
-            unstable_error_rate: default_unstable_error_rate(),
-            unavailable_error_rate: default_unavailable_error_rate(),
-            availability_min_samples: default_availability_min_samples(),
-        }
-    }
 }
 
 /// One automatic-suspension tier: this many admission rejections in a day
@@ -754,7 +754,6 @@ impl GatewayConfig {
                 protocols: preset.wires.iter().map(|w| (*w).to_owned()).collect(),
             });
         }
-        // normalize the global policy and every tenant override once at load
         compile_security(&mut self.security);
         for t in &mut self.tenants {
             if let Some(sec) = t.security.as_mut() {

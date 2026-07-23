@@ -2126,10 +2126,6 @@ fn anthropic_error(status: u16, message: impl Into<String>) -> Response {
         .into_response()
 }
 
-fn anthropic_gateway_error(e: GatewayError) -> Response {
-    anthropic_error(e.http_status, e.message)
-}
-
 /// Run the pipeline on its own task so a client disconnect can't cancel it
 /// mid-billing: once admitted, quota/ledger accounting runs to completion.
 async fn run_pipeline(s: &AppState, request: GatewayRequest, ak: AkInfo) -> GResult<DagContext> {
@@ -2645,7 +2641,7 @@ async fn messages(
 
     let ctx = match run_pipeline(&s, request, ak).await {
         Ok(ctx) => ctx,
-        Err(e) => return anthropic_gateway_error(e),
+        Err(e) => return anthropic_error(e.http_status, e.message),
     };
     log_access("messages", &ctx, started);
     let Some(mut outcome) = ctx.outcome else {
@@ -2911,10 +2907,6 @@ async fn run_family(
     }
 }
 
-/// The engine's native payload, or a 500 naming the engine that returned none.
-/// A pre-stage content block answers 400 with the block message — these
-/// surfaces have no in-band content_filter shape, and falling through would
-/// misreport the block as an engine failure.
 /// An `input`-style field that may be a string or an array of strings
 /// (the OpenAI embeddings/moderations shape).
 fn string_or_string_array(v: Option<Value>) -> Vec<String> {
@@ -2931,6 +2923,10 @@ fn string_or_string_array(v: Option<Value>) -> Vec<String> {
     }
 }
 
+/// The engine's native payload, or a 500 naming the engine that returned none.
+/// A pre-stage content block answers 400 with the block message — these
+/// surfaces have no in-band content_filter shape, and falling through would
+/// misreport the block as an engine failure.
 fn response_v2_or_500(outcome: Option<gw_engines::EngineOutcome>, engine: &str) -> Response {
     match outcome {
         Some(o) if o.block.block => error_response(400, o.response.message),
