@@ -237,8 +237,8 @@ mod tests {
     #[tokio::test]
     async fn avail_sweep_alerts_on_transition_only() {
         let yaml = "listen: {host: h, port: 1}\nmodels: [{name: m, protocol: openai-chat}, {name: rt, protocol: realtime}]\nstability: {availability_min_samples: 2}";
-        let cfg = std::sync::Arc::new(gw_config::GatewayConfig::from_yaml(yaml).unwrap());
-        let state = std::sync::Arc::new(GatewayState::from_config(&cfg));
+        let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
         let shared = SharedConfig::new(cfg, state.clone());
         let mut rx = state.alerts.take_receiver().expect("receiver");
         let mut last = HashMap::new();
@@ -276,8 +276,8 @@ mod tests {
             std::env::set_var("GW_TEST_ALERT_URL", format!("http://{addr}/hook"));
         }
         let yaml = "listen: {host: h, port: 1}\nalerts: {webhook_url_env: GW_TEST_ALERT_URL}";
-        let cfg = std::sync::Arc::new(gw_config::GatewayConfig::from_yaml(yaml).unwrap());
-        let state = std::sync::Arc::new(GatewayState::from_config(&cfg));
+        let cfg = Arc::new(gw_config::GatewayConfig::from_yaml(yaml).unwrap());
+        let state = Arc::new(GatewayState::from_config(&cfg));
         let shared = SharedConfig::new(cfg, state.clone());
         let task = spawn_alert_dispatch(shared);
         state

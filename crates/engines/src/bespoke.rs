@@ -494,11 +494,13 @@ fn dashscope_raw_usage(resp: &GatewayResponse) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::transport::{MockTransport, SharedTransport};
+    use std::sync::Arc;
+
     use gw_consts::Protocol;
     use gw_models::{ChatMsg, GatewayRequest, ModelParamV2};
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::transport::{MockTransport, SharedTransport};
 
     fn req(mt: Protocol, name: &str) -> GatewayRequest {
         GatewayRequest {

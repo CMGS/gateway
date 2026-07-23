@@ -208,17 +208,18 @@ impl DagNode for CacheLookup {
         &["variant_select"]
     }
     async fn execute(&self, ctx: &mut DagContext) -> GResult<()> {
-        let param = match ctx.request.model_param_v2.as_ref() {
-            Some(p) => p,
-            None => return Ok(()),
+        let Some(param) = ctx.request.model_param_v2.as_ref() else {
+            return Ok(());
         };
         // online non-streaming cache_ttl models only; batch items bypass —
         // a hit is free (unbilled) and batches promise per-item billing
-        let ttl = ctx
+        let Some(ttl) = ctx
             .cfg
             .find_model(&param.model_name)
-            .and_then(|m| m.cache_ttl_seconds);
-        let Some(ttl) = ttl else { return Ok(()) };
+            .and_then(|m| m.cache_ttl_seconds)
+        else {
+            return Ok(());
+        };
         if ctx.request.stream || !ctx.request.is_online {
             return Ok(());
         }

@@ -818,7 +818,10 @@ impl ResponsesEngine {
             } else {
                 Some(Value::Array(tool_calls))
             },
-            model: v["model"].as_str().unwrap_or(&self.model_name()).to_owned(),
+            model: v["model"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.model_name()),
             finish_reason: v["status"].as_str().unwrap_or("completed").to_owned(),
             prompt_tokens: input,
             completion_tokens: output,

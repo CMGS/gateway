@@ -27,6 +27,27 @@ export function useAuth(): AuthState {
   return value;
 }
 
+interface NavItem {
+  to: string;
+  label: string;
+  icon: string;
+  minRole: Role;
+  page: ReactNode;
+  end?: boolean;
+}
+
+const roleRank: Record<Role, number> = { member: 0, tenant_admin: 1, system_admin: 2 };
+
+const navItems: NavItem[] = [
+  { to: "/", label: "Overview", icon: "◫", end: true, minRole: "member", page: <OverviewPage /> },
+  { to: "/usage", label: "Usage & cost", icon: "⌁", minRole: "member", page: <UsagePage /> },
+  { to: "/availability", label: "Availability", icon: "◉", minRole: "member", page: <AvailabilityPage /> },
+  { to: "/keys", label: "Access keys", icon: "⌘", minRole: "tenant_admin", page: <KeysPage /> },
+  { to: "/audit", label: "Audit", icon: "≣", minRole: "tenant_admin", page: <AuditPage /> },
+  { to: "/users", label: "Users & roles", icon: "♙", minRole: "system_admin", page: <UsersPage /> },
+  { to: "/configuration", label: "Configuration", icon: "⌗", minRole: "system_admin", page: <ConfigPage /> },
+];
+
 export default function App() {
   const [session, updateSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
@@ -68,27 +89,6 @@ export default function App() {
     </AuthContext.Provider>
   );
 }
-
-interface NavItem {
-  to: string;
-  label: string;
-  icon: string;
-  minRole: Role;
-  page: ReactNode;
-  end?: boolean;
-}
-
-const roleRank: Record<Role, number> = { member: 0, tenant_admin: 1, system_admin: 2 };
-
-const navItems: NavItem[] = [
-  { to: "/", label: "Overview", icon: "◫", end: true, minRole: "member", page: <OverviewPage /> },
-  { to: "/usage", label: "Usage & cost", icon: "⌁", minRole: "member", page: <UsagePage /> },
-  { to: "/availability", label: "Availability", icon: "◉", minRole: "member", page: <AvailabilityPage /> },
-  { to: "/keys", label: "Access keys", icon: "⌘", minRole: "tenant_admin", page: <KeysPage /> },
-  { to: "/audit", label: "Audit", icon: "≣", minRole: "tenant_admin", page: <AuditPage /> },
-  { to: "/users", label: "Users & roles", icon: "♙", minRole: "system_admin", page: <UsersPage /> },
-  { to: "/configuration", label: "Configuration", icon: "⌗", minRole: "system_admin", page: <ConfigPage /> },
-];
 
 function Shell() {
   const { session, logout } = useAuth();
