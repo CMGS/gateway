@@ -35,7 +35,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true
       - uses: docker/metadata-action@v6
         id: meta-cp
         with:
@@ -48,4 +48,4 @@ jobs:
           tags: ${{ steps.meta-cp.outputs.tags }}
           labels: ${{ steps.meta-cp.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true
